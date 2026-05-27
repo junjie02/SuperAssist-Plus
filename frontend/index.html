@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SuperAssist-Plus Memory Graph</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">SuperAssist-Plus</p>
+            <h1>Memory Graph</h1>
+          </div>
+          <div class="controls" aria-label="Graph controls">
+            <label class="field">
+              <span>User</span>
+              <input id="userId" type="text" value="local-user" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Filter</span>
+              <select id="typeFilter">
+                <option value="all">All nodes</option>
+                <option value="event">Events</option>
+                <option value="concept">Concepts</option>
+                <option value="intent">Intents</option>
+                <option value="time">Time</option>
+              </select>
+            </label>
+            <button id="refreshButton" class="icon-button" type="button" title="Refresh graph" aria-label="Refresh graph">
+              <span aria-hidden="true">↻</span>
+            </button>
+          </div>
+        </header>
+
+        <section class="stats" aria-label="Graph statistics">
+          <article>
+            <span id="nodeCount">0</span>
+            <p>Nodes</p>
+          </article>
+          <article>
+            <span id="edgeCount">0</span>
+            <p>Edges</p>
+          </article>
+          <article>
+            <span id="conceptCount">0</span>
+            <p>Concepts</p>
+          </article>
+          <article>
+            <span id="intentCount">0</span>
+            <p>Intents</p>
+          </article>
+        </section>
+
+        <section class="graph-stage" aria-label="Memory graph visualization">
+          <svg id="graph" role="img" aria-label="Memory graph nodes and edges"></svg>
+          <div id="emptyState" class="empty-state" hidden>
+            <h2>No memory graph yet</h2>
+            <p>Run a few SuperAssist-Plus turns with memory enabled, then refresh.</p>
+          </div>
+          <aside id="detailsPanel" class="details-panel" aria-live="polite">
+            <p class="panel-label">Selected</p>
+            <h2 id="detailsTitle">Nothing selected</h2>
+            <p id="detailsDescription">Click a node or edge to inspect its memory payload.</p>
+          </aside>
+        </section>
+      </section>
+
+      <aside class="updates" aria-label="Recent graph updates">
+        <div class="updates-header">
+          <div>
+            <p class="eyebrow">Live Ledger</p>
+            <h2>Updates</h2>
+          </div>
+          <span id="updatedAt" class="timestamp">Not loaded</span>
+        </div>
+        <div id="updateList" class="update-list"></div>
+      </aside>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

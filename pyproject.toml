@@ -1,0 +1,46 @@
+[project]
+name = "superassist-plus"
+version = "0.1.0"
+description = "LangGraph-based rewrite of SuperAssist with CogniFold-style long-term memory."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "faiss-cpu>=1.8.0",
+    "fastapi>=0.115.0",
+    "langchain>=1.0.0",
+    "langchain-openai>=1.0.0",
+    "langgraph>=1.0.0",
+    "networkx>=3.2.0",
+    "numpy>=1.26.0",
+    "pydantic>=2.8.0",
+    "pydantic-settings>=2.4.0",
+    "python-dotenv>=1.0.0",
+    "sentence-transformers>=3.0.0",
+    "typing-extensions>=4.12.0",
+    "uvicorn>=0.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "ruff>=0.8.0",
+]
+
+[project.scripts]
+superassist-plus = "superassist_plus.cli:main"
+superassist-plus-memory-ui = "superassist_plus.ui.server:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
