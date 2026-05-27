@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+from typing import Any
 from uuid import uuid4
 
 from superassist_plus.agent import AgentRuntime
@@ -15,7 +17,7 @@ def main() -> None:
     parser.add_argument("--flush-memory", action="store_true", help="Flush memory writes before exiting.")
     args = parser.parse_args()
 
-    runtime = AgentRuntime()
+    runtime = AgentRuntime(tool_event_reporter=_print_tool_event)
     if args.interactive:
         _run_interactive(runtime, user_id=args.user_id, thread_id=args.thread_id, flush_memory=args.flush_memory)
         return
@@ -54,6 +56,25 @@ def _run_interactive(
     finally:
         if flush_memory:
             runtime.memory_queue.flush()
+
+
+def _print_tool_event(event: dict[str, Any]) -> None:
+    event_type = event.get("type")
+    tool_name = str(event.get("tool") or "tool")
+    if event_type == "agent_tool_call":
+        content = str(event.get("content") or "").strip()
+        if content:
+            print(content)
+        return
+    if event_type == "tool_start":
+        args = json.dumps(event.get("args") or {}, ensure_ascii=False, default=str)
+        print(f"[tool:start] {tool_name} {args}")
+        return
+    if event_type == "tool_result":
+        status = str(event.get("status") or "success")
+        error = str(event.get("error") or "").strip()
+        suffix = f" error={error}" if error else ""
+        print(f"[tool:{status}] {tool_name}{suffix}")
 
 
 if __name__ == "__main__":

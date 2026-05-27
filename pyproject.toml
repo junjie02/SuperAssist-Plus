@@ -10,6 +10,7 @@ dependencies = [
     "langchain>=1.0.0",
     "langchain-openai>=1.0.0",
     "langgraph>=1.0.0",
+    "lark-oapi>=1.4.0",
     "networkx>=3.2.0",
     "numpy>=1.26.0",
     "pydantic>=2.8.0",
@@ -28,6 +29,7 @@ dev = [
 
 [project.scripts]
 superassist-plus = "superassist_plus.cli:main"
+superassist-plus-feishu = "superassist_plus.channels.feishu:main"
 superassist-plus-memory-ui = "superassist_plus.ui.server:main"
 
 [build-system]

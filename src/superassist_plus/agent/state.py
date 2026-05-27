@@ -15,6 +15,7 @@ class SuperAssistState(TypedDict):
     memory_recall: NotRequired[dict[str, Any]]
     memory_write_context: NotRequired[dict[str, Any]]
     tool_events: NotRequired[list[dict[str, Any]]]
+    loaded_skills: NotRequired[list[str]]
     answer: NotRequired[str]
     metadata: NotRequired[dict[str, Any]]
     history_loaded: NotRequired[bool]

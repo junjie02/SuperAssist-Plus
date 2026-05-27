@@ -19,9 +19,25 @@ class Settings(BaseSettings):
     temperature: float | None = Field(default=None, alias="SUPERASSIST_PLUS_TEMPERATURE")
     max_tokens: int | None = Field(default=None, alias="SUPERASSIST_PLUS_MAX_TOKENS")
     data_dir: Path = Field(default=Path(".superassist-plus"), alias="SUPERASSIST_PLUS_DATA_DIR")
+    tool_workspace_dir: Path | None = Field(default=None, alias="SUPERASSIST_PLUS_TOOL_WORKSPACE_DIR")
+    tool_network_enabled: bool = Field(default=True, alias="SUPERASSIST_PLUS_TOOL_NETWORK_ENABLED")
     max_tool_calls: int = Field(default=8, alias="SUPERASSIST_PLUS_MAX_TOOL_CALLS")
     enable_tools: bool = Field(default=False, alias="SUPERASSIST_PLUS_ENABLE_TOOLS")
+    subagents_enabled: bool = Field(default=True, alias="SUPERASSIST_PLUS_SUBAGENTS_ENABLED")
+    subagent_max_concurrent: int = Field(default=3, alias="SUPERASSIST_PLUS_SUBAGENT_MAX_CONCURRENT")
+    subagent_timeout_seconds: int = Field(default=900, alias="SUPERASSIST_PLUS_SUBAGENT_TIMEOUT_SECONDS")
+    subagent_max_turns: int = Field(default=20, alias="SUPERASSIST_PLUS_SUBAGENT_MAX_TURNS")
     memory_llm_writer_enabled: bool = Field(default=False, alias="SUPERASSIST_PLUS_MEMORY_LLM_WRITER_ENABLED")
+    short_memory_token_limit: int = Field(default=80000, alias="SUPERASSIST_PLUS_SHORT_MEMORY_TOKEN_LIMIT")
+    short_memory_keep_recent_turns: int = Field(default=10, alias="SUPERASSIST_PLUS_SHORT_MEMORY_KEEP_RECENT_TURNS")
+    short_memory_summary_target_tokens: int = Field(
+        default=6000,
+        alias="SUPERASSIST_PLUS_SHORT_MEMORY_SUMMARY_TARGET_TOKENS",
+    )
+    short_memory_enable_tool_events: bool = Field(
+        default=True,
+        alias="SUPERASSIST_PLUS_SHORT_MEMORY_ENABLE_TOOL_EVENTS",
+    )
 
     memory_reinforce_similarity: float = Field(default=0.85, alias="SUPERASSIST_PLUS_MEMORY_REINFORCE_SIMILARITY")
     memory_concept_merge_similarity: float = Field(default=0.85, alias="SUPERASSIST_PLUS_MEMORY_CONCEPT_MERGE_SIMILARITY")
@@ -41,6 +57,11 @@ class Settings(BaseSettings):
     embedding_provider: str = Field(default="bge", alias="SUPERASSIST_PLUS_EMBEDDING_PROVIDER")
     embedding_model: str = Field(default="BAAI/bge-base-zh-v1.5", alias="SUPERASSIST_PLUS_EMBEDDING_MODEL")
     embedding_device: str = Field(default="cpu", alias="SUPERASSIST_PLUS_EMBEDDING_DEVICE")
+    feishu_app_id: str = Field(default="", alias="SUPERASSIST_PLUS_FEISHU_APP_ID")
+    feishu_app_secret: str = Field(default="", alias="SUPERASSIST_PLUS_FEISHU_APP_SECRET")
+    feishu_domain: str = Field(default="https://open.feishu.cn", alias="SUPERASSIST_PLUS_FEISHU_DOMAIN")
+    feishu_allowed_open_ids: str = Field(default="", alias="SUPERASSIST_PLUS_FEISHU_ALLOWED_OPEN_IDS")
+    feishu_mention_only: bool = Field(default=True, alias="SUPERASSIST_PLUS_FEISHU_MENTION_ONLY")
 
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",
@@ -54,12 +75,24 @@ class Settings(BaseSettings):
         return self.data_dir / "superassist_plus.sqlite3"
 
     @property
+    def resolved_tool_workspace_dir(self) -> Path:
+        return self.tool_workspace_dir or self.data_dir / "workspace"
+
+    @property
     def huggingface_cache_dir(self) -> Path:
         return self.data_dir / "huggingface"
 
     @property
     def faiss_dir(self) -> Path:
         return self.data_dir / "faiss"
+
+    @property
+    def feishu_allowed_open_id_set(self) -> set[str]:
+        return {item.strip() for item in self.feishu_allowed_open_ids.split(",") if item.strip()}
+
+    @property
+    def feishu_thread_store_path(self) -> Path:
+        return self.data_dir / "channels" / "feishu_threads.json"
 
 
 @lru_cache(maxsize=1)

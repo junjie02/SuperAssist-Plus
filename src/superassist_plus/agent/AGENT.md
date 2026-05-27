@@ -17,7 +17,10 @@ The `agent` module owns the SuperAssist-Plus execution graph. It combines:
 - `state.py`: `SuperAssistState`, the outer LangGraph state schema.
 - `middleware.py`: LangChain middleware classes and `build_middlewares()`.
 - `runtime.py`: `AgentRuntime`, graph construction, run API, history loading,
-  persistence, and memory queue handoff.
+  channel-facing run-event reporting, persistence, short-memory compression,
+  and memory queue handoff.
+- `short_memory.py`: token-budgeted thread history loading, compact tool-event
+  persistence, and LLM summary compression helpers.
 - `__init__.py`: exports `AgentRuntime`.
 
 ## Outer LangGraph Flow
@@ -45,21 +48,39 @@ START
 - invokes the inner LangChain agent with `messages`, `user_id`, `thread_id`,
   `memory_recall`, `tool_events`, and `metadata`.
 - registers default tools only when `SUPERASSIST_PLUS_ENABLE_TOOLS=true`.
+- injects DeerFlow-style skill metadata for built-in skills. The lead agent sees
+  skill names, descriptions, and `/mnt/skills/.../SKILL.md` locations first; if
+  it reads a skill file, that skill is remembered for the current thread and
+  its full instructions are injected on later model calls.
 - for MiniMax-compatible endpoints, keeps the LangGraph/middleware path active
   and relies on the LLM adapter to add MiniMax `reasoning_split` while retaining
   OpenAI-compatible tool schemas.
 - when tools are disabled, uses a direct model call inside the same outer
   LangGraph node to avoid provider-specific tool/agent parameters rejected by
   MiniMax-style OpenAI-compatible endpoints.
+- uses a structured lead prompt with clarification-first behavior,
+  human-readable progress notes between tool rounds, citation requirements for
+  web-sourced claims, and concise response style rules.
 
 `persist_turn`:
 
-- appends only the current user input and final assistant answer to JSONL.
+- appends the current user input, compact tool events, and final assistant
+  answer to JSONL.
+- compresses older short-memory records into `thread_meta.json` summary when
+  the thread exceeds `SUPERASSIST_PLUS_SHORT_MEMORY_TOKEN_LIMIT`.
 
 `enqueue_memory_write`:
 
 - creates a `MemoryWritePayload` with write-path memory context and queues it
   for debounced background writing.
+
+`AgentRuntime` accepts an optional `run_event_reporter` callback. It reports
+`preparing_context` at turn start and forwards model-authored `agent_text` from
+tool-call messages for external surfaces such as Feishu cards. It intentionally
+does not expose tool names, arguments, results, or finalization boilerplate.
+If a model emits a tool call without assistant text, middleware does not invent
+a fallback progress sentence; Feishu should stay on the previous human-readable
+card text instead of showing raw tool names.
 
 ## Inner LangChain Middleware Chain
 
@@ -70,10 +91,14 @@ START
      model requests as a single system message. The runtime does not pass
      `system_prompt` directly to `create_agent`, because that would create a
      second system message after middleware injection.
+   - Adds available skill metadata and already loaded thread skills.
 2. `ToolErrorMiddleware`
    - Converts tool exceptions into readable `ToolMessage` objects.
 3. `ToolEventMiddleware`
    - Captures normalized tool execution events into state.
+   - Captures assistant text attached to tool-call messages as `agent_tool_call`
+     events, without generating tool-name fallback prose.
+   - Marks a skill as loaded when `read_file` reads its `/mnt/skills` `SKILL.md`.
 4. `MemoryAfterAgentMiddleware`
    - Marks state as memory-ready and records final assistant text.
 
@@ -82,9 +107,16 @@ here rather than scattered through runtime nodes.
 
 ## Continuous Conversation
 
-`AgentRuntime.run()` accepts a `thread_id`. If the thread exists, it loads up to
-20 recent persisted messages and appends the new `HumanMessage`. This gives
-interactive mode continuity across turns.
+`AgentRuntime.run()` accepts a `thread_id`. If the thread exists, it loads a
+token-budgeted short-memory window from `messages.jsonl`, prepending any
+conversation summary from `thread_meta.json`. The default budget is 80K
+estimated tokens. When compression runs, the latest
+`SUPERASSIST_PLUS_SHORT_MEMORY_KEEP_RECENT_TURNS` turns remain as raw JSONL
+records and older records are folded into the summary.
+
+Loaded skill names are stored in `thread_meta.json` beside `messages.jsonl`, so
+skill instructions that were explicitly read remain available in later turns of
+the same thread.
 
 ## Maintenance Notes
 

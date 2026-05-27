@@ -4,10 +4,11 @@ import re
 from collections.abc import Mapping
 import os
 import json
+import time
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import Runnable
 from langchain_openai import ChatOpenAI
@@ -15,6 +16,17 @@ from langchain_openai import ChatOpenAI
 from superassist_plus.config import Settings, get_settings
 
 _THINK_TAG_RE = re.compile(r"<think>\s*(.*?)\s*</think>", re.DOTALL)
+
+
+class OneSecondRetryChatModel(ChatOpenAI):
+    """OpenAI-compatible chat model with one explicit 1s retry around generation."""
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:  # type: ignore[no-untyped-def]
+        try:
+            return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        except Exception:
+            time.sleep(1)
+            return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
 
 
 class FallbackChatModel(BaseChatModel):
@@ -30,6 +42,9 @@ class FallbackChatModel(BaseChatModel):
         return self
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:  # type: ignore[no-untyped-def]
+        if messages and "compress conversation history" in str(messages[0].content).lower():
+            content = self._fallback_summary(messages)
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content=content))])
         last_user = ""
         for message in reversed(messages):
             if getattr(message, "type", "") == "human":
@@ -41,8 +56,25 @@ class FallbackChatModel(BaseChatModel):
         )
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content=content))])
 
+    @staticmethod
+    def _fallback_summary(messages) -> str:  # type: ignore[no-untyped-def]
+        last_human = ""
+        for message in reversed(messages):
+            if getattr(message, "type", "") == "human":
+                last_human = str(message.content)
+                break
+        lines = [line.strip() for line in last_human.splitlines() if line.strip()]
+        useful = [
+            line
+            for line in lines
+            if line.startswith(("user:", "assistant:", "Tool event:", "Loaded skills:", "Previous summary:"))
+        ][:20]
+        if not useful:
+            useful = ["Conversation history was compressed in fallback mode."]
+        return "## Conversation Summary\n" + "\n".join(f"- {line}" for line in useful)
 
-class MiniMaxCompatibleChatModel(ChatOpenAI):
+
+class MiniMaxCompatibleChatModel(OneSecondRetryChatModel):
     """MiniMax adapter for OpenAI-compatible chat with reasoning split support."""
 
     @property
@@ -53,6 +85,7 @@ class MiniMaxCompatibleChatModel(ChatOpenAI):
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)
         if "max_completion_tokens" in payload and "max_tokens" not in payload:
             payload["max_tokens"] = payload.pop("max_completion_tokens")
+        _strip_message_names(payload)
         extra_body = payload.get("extra_body")
         if isinstance(extra_body, dict):
             payload["extra_body"] = {**extra_body, "reasoning_split": True}
@@ -99,7 +132,7 @@ def create_chat_model(settings: Settings | None = None) -> BaseChatModel:
         kwargs["temperature"] = temperature
     if settings.max_tokens is not None:
         kwargs["max_tokens"] = settings.max_tokens
-    model_class = MiniMaxCompatibleChatModel if is_minimax_model(settings.model, settings.base_url) else ChatOpenAI
+    model_class = MiniMaxCompatibleChatModel if is_minimax_model(settings.model, settings.base_url) else OneSecondRetryChatModel
     return model_class(
         **kwargs,
     )
@@ -107,6 +140,17 @@ def create_chat_model(settings: Settings | None = None) -> BaseChatModel:
 
 def is_minimax_model(model: str, base_url: str = "") -> bool:
     return "minimax" in model.lower() or "minimax" in base_url.lower()
+
+
+def _strip_message_names(payload: dict[str, Any]) -> None:
+    """MiniMax's OpenAI-compatible endpoint rejects named chat messages."""
+
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return
+    for message in messages:
+        if isinstance(message, dict):
+            message.pop("name", None)
 
 
 def _message_with_minimax_reasoning(message: AIMessage, choice: Any) -> AIMessage:

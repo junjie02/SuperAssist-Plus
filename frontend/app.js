@@ -12,6 +12,8 @@ const SVG_NS = "http://www.w3.org/2000/svg";
 const MIN_ZOOM = 0.35;
 const MAX_ZOOM = 3;
 const DRAG_THRESHOLD = 3;
+const LAYOUT_MARGIN = 96;
+const TYPE_ORDER = ["event", "concept", "intent", "time"];
 
 const typeColors = {
   event: "#64748b",
@@ -30,6 +32,7 @@ let nodeLayer = null;
 let renderedNodeMap = new Map();
 let dragState = null;
 let panState = null;
+let pinnedNodes = new Set();
 
 function formatTime(value) {
   if (!value) return "";
@@ -108,36 +111,200 @@ function pruneNodePositions(nodes) {
   for (const id of nodePositions.keys()) {
     if (!currentIds.has(id)) nodePositions.delete(id);
   }
+  for (const id of pinnedNodes.keys()) {
+    if (!currentIds.has(id)) pinnedNodes.delete(id);
+  }
 }
 
-function layoutNodes(nodes, width, height) {
+function hashNumber(value) {
+  let hash = 2166136261;
+  const text = String(value || "");
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function typeAnchor(node, centerX, centerY, spreadX, spreadY) {
+  switch (node.type) {
+    case "event":
+      return { x: centerX - spreadX * 0.34, y: centerY + spreadY * 0.08 };
+    case "concept":
+      return { x: centerX - spreadX * 0.04, y: centerY };
+    case "intent":
+      return { x: centerX + spreadX * 0.32, y: centerY + spreadY * 0.04 };
+    case "time":
+      return { x: centerX + spreadX * 0.18, y: centerY - spreadY * 0.32 };
+    default:
+      return { x: centerX, y: centerY };
+  }
+}
+
+function initialNodePosition(node, index, centerX, centerY, spreadX, spreadY) {
+  const saved = nodePositions.get(node.id);
+  if (saved) return { x: saved.x, y: saved.y };
+
+  const anchor = typeAnchor(node, centerX, centerY, spreadX, spreadY);
+  const hash = hashNumber(`${node.type}:${node.id}`);
+  const angle = ((hash % 360) * Math.PI) / 180;
+  const ring = 42 + (index % 9) * 18 + (hash % 31);
+  return {
+    x: anchor.x + Math.cos(angle) * ring,
+    y: anchor.y + Math.sin(angle) * ring,
+  };
+}
+
+function edgeGeometry(source, target, curveOffset = 0) {
+  const dx = target.x - source.x;
+  const dy = target.y - source.y;
+  const distance = Math.max(1, Math.hypot(dx, dy));
+  const normalX = -dy / distance;
+  const normalY = dx / distance;
+  const midX = (source.x + target.x) / 2;
+  const midY = (source.y + target.y) / 2;
+  const controlX = midX + normalX * curveOffset;
+  const controlY = midY + normalY * curveOffset;
+
+  return {
+    path: `M ${source.x} ${source.y} Q ${controlX} ${controlY} ${target.x} ${target.y}`,
+    labelX: midX + normalX * curveOffset * 0.72,
+    labelY: midY + normalY * curveOffset * 0.72 - 8,
+  };
+}
+
+function edgePairKey(edge) {
+  return [edge.source_id, edge.target_id].sort().join("::");
+}
+
+function edgeCurveOffsets(edges) {
+  const totals = new Map();
+  const seen = new Map();
+  const offsets = new Map();
+
+  for (const edge of edges) {
+    const key = edgePairKey(edge);
+    totals.set(key, (totals.get(key) || 0) + 1);
+  }
+
+  for (const edge of edges) {
+    const key = edgePairKey(edge);
+    const total = totals.get(key) || 1;
+    const index = seen.get(key) || 0;
+    seen.set(key, index + 1);
+    const baseOffset = total > 1 ? (index - (total - 1) / 2) * 28 : ((hashNumber(edge.id) % 5) - 2) * 5;
+    offsets.set(edge.id, baseOffset);
+  }
+
+  return offsets;
+}
+
+function layoutNodes(nodes, edges, width, height) {
   if (!nodes.length) return [];
   const centerX = width / 2;
   const centerY = height / 2;
-  const radius = Math.max(120, Math.min(width, height) * 0.34);
-  const grouped = ["event", "concept", "intent", "time"].flatMap((type) =>
+  const graphScale = Math.sqrt(Math.max(nodes.length, 1));
+  const spreadX = Math.max(width * 0.84, graphScale * 250, 760);
+  const spreadY = Math.max(height * 0.82, graphScale * 210, 560);
+  const minX = centerX - spreadX / 2 + LAYOUT_MARGIN;
+  const maxX = centerX + spreadX / 2 - LAYOUT_MARGIN;
+  const minY = centerY - spreadY / 2 + LAYOUT_MARGIN;
+  const maxY = centerY + spreadY / 2 - LAYOUT_MARGIN;
+  const grouped = TYPE_ORDER.flatMap((type) =>
     nodes.filter((node) => node.type === type),
   );
-  return grouped.map((node, index) => {
-    const angle = (Math.PI * 2 * index) / grouped.length - Math.PI / 2;
-    const ring = radius * (0.72 + (index % 3) * 0.14);
-    const saved = nodePositions.get(node.id);
-    if (saved) {
-      return {
-        ...node,
-        x: saved.x,
-        y: saved.y,
-      };
-    }
-    const x = centerX + Math.cos(angle) * ring;
-    const y = centerY + Math.sin(angle) * ring;
-    nodePositions.set(node.id, { x, y });
+  const laidOut = grouped.map((node, index) => {
+    const initial = initialNodePosition(node, index, centerX, centerY, spreadX, spreadY);
     return {
       ...node,
-      x,
-      y,
+      x: clamp(initial.x, minX, maxX),
+      y: clamp(initial.y, minY, maxY),
+      vx: 0,
+      vy: 0,
     };
   });
+  const nodeMap = new Map(laidOut.map((node) => [node.id, node]));
+  const graphEdges = edges
+    .map((edge) => ({
+      ...edge,
+      source: nodeMap.get(edge.source_id),
+      target: nodeMap.get(edge.target_id),
+    }))
+    .filter((edge) => edge.source && edge.target);
+
+  const iterations = Math.min(280, 80 + nodes.length * 7 + graphEdges.length * 2);
+  const repulsion = 32000 + Math.min(nodes.length, 120) * 420;
+  const springLength = clamp(185 + nodes.length * 1.4, 175, 260);
+  const springStrength = 0.018;
+  const anchorStrength = 0.008;
+  const centerStrength = 0.003;
+
+  for (let iteration = 0; iteration < iterations; iteration += 1) {
+    const forces = new Map(laidOut.map((node) => [node.id, { x: 0, y: 0 }]));
+
+    for (let a = 0; a < laidOut.length; a += 1) {
+      for (let b = a + 1; b < laidOut.length; b += 1) {
+        const source = laidOut[a];
+        const target = laidOut[b];
+        let dx = target.x - source.x;
+        let dy = target.y - source.y;
+        let distanceSq = dx * dx + dy * dy;
+        if (distanceSq < 1) {
+          const angle = ((hashNumber(`${source.id}:${target.id}`) % 360) * Math.PI) / 180;
+          dx = Math.cos(angle);
+          dy = Math.sin(angle);
+          distanceSq = 1;
+        }
+        const distance = Math.sqrt(distanceSq);
+        const force = repulsion / Math.max(distanceSq, 900);
+        const fx = (dx / distance) * force;
+        const fy = (dy / distance) * force;
+        forces.get(source.id).x -= fx;
+        forces.get(source.id).y -= fy;
+        forces.get(target.id).x += fx;
+        forces.get(target.id).y += fy;
+      }
+    }
+
+    for (const edge of graphEdges) {
+      const source = edge.source;
+      const target = edge.target;
+      const dx = target.x - source.x;
+      const dy = target.y - source.y;
+      const distance = Math.max(1, Math.hypot(dx, dy));
+      const weight = clamp(Number(edge.weight) || 0.5, 0.2, 1.4);
+      const force = (distance - springLength) * springStrength * weight;
+      const fx = (dx / distance) * force;
+      const fy = (dy / distance) * force;
+      forces.get(source.id).x += fx;
+      forces.get(source.id).y += fy;
+      forces.get(target.id).x -= fx;
+      forces.get(target.id).y -= fy;
+    }
+
+    for (const node of laidOut) {
+      const force = forces.get(node.id);
+      const anchor = typeAnchor(node, centerX, centerY, spreadX, spreadY);
+      force.x += (anchor.x - node.x) * anchorStrength;
+      force.y += (anchor.y - node.y) * anchorStrength;
+      force.x += (centerX - node.x) * centerStrength;
+      force.y += (centerY - node.y) * centerStrength;
+
+      if (pinnedNodes.has(node.id)) continue;
+      node.vx = (node.vx + force.x) * 0.72;
+      node.vy = (node.vy + force.y) * 0.72;
+      node.x = clamp(node.x + node.vx, minX, maxX);
+      node.y = clamp(node.y + node.vy, minY, maxY);
+    }
+  }
+
+  for (const node of laidOut) {
+    nodePositions.set(node.id, { x: node.x, y: node.y });
+    delete node.vx;
+    delete node.vy;
+  }
+
+  return laidOut;
 }
 
 function updateGraphPositions() {
@@ -153,14 +320,12 @@ function updateGraphPositions() {
     const source = renderedNodeMap.get(group.dataset.sourceId);
     const target = renderedNodeMap.get(group.dataset.targetId);
     if (!source || !target) return;
-    const line = group.querySelector(".edge-line");
+    const path = group.querySelector(".edge-line");
     const label = group.querySelector(".edge-label");
-    line.setAttribute("x1", source.x);
-    line.setAttribute("y1", source.y);
-    line.setAttribute("x2", target.x);
-    line.setAttribute("y2", target.y);
-    label.setAttribute("x", String((source.x + target.x) / 2));
-    label.setAttribute("y", String((source.y + target.y) / 2 - 6));
+    const geometry = edgeGeometry(source, target, Number(group.dataset.curveOffset) || 0);
+    path.setAttribute("d", geometry.path);
+    label.setAttribute("x", String(geometry.labelX));
+    label.setAttribute("y", String(geometry.labelY));
   });
 }
 
@@ -168,8 +333,9 @@ function renderGraph() {
   const { nodes, edges } = visibleGraph();
   const width = Math.max(graphSvg.clientWidth, 720);
   const height = Math.max(graphSvg.clientHeight, 520);
-  const laidOut = layoutNodes(nodes, width, height);
+  const laidOut = layoutNodes(nodes, edges, width, height);
   const nodeMap = new Map(laidOut.map((node) => [node.id, node]));
+  const curveOffsets = edgeCurveOffsets(edges);
   renderedNodeMap = nodeMap;
 
   emptyState.hidden = nodes.length > 0;
@@ -198,23 +364,25 @@ function renderGraph() {
     if (!source || !target) continue;
     const group = createSvgElement("g");
     group.classList.add("edge");
+    if (selectedId === edge.id) group.classList.add("selected");
+    if (selectedId === edge.source_id || selectedId === edge.target_id) group.classList.add("connected");
     group.dataset.id = edge.id;
     group.dataset.sourceId = edge.source_id;
     group.dataset.targetId = edge.target_id;
+    group.dataset.curveOffset = String(curveOffsets.get(edge.id) || 0);
 
-    const line = createSvgElement("line");
+    const geometry = edgeGeometry(source, target, curveOffsets.get(edge.id) || 0);
+    const line = createSvgElement("path");
     line.classList.add("edge-line");
     if (selectedId === edge.id) line.classList.add("selected");
-    line.setAttribute("x1", source.x);
-    line.setAttribute("y1", source.y);
-    line.setAttribute("x2", target.x);
-    line.setAttribute("y2", target.y);
-    line.setAttribute("stroke-width", String(1.2 + edge.weight * 2.4));
+    line.setAttribute("d", geometry.path);
+    line.setAttribute("fill", "none");
+    line.setAttribute("stroke-width", String(1.1 + edge.weight * 2.3));
 
     const label = createSvgElement("text");
     label.classList.add("edge-label");
-    label.setAttribute("x", String((source.x + target.x) / 2));
-    label.setAttribute("y", String((source.y + target.y) / 2 - 6));
+    label.setAttribute("x", String(geometry.labelX));
+    label.setAttribute("y", String(geometry.labelY));
     label.setAttribute("text-anchor", "middle");
     label.textContent = edge.edge_type;
 
@@ -299,6 +467,7 @@ function handlePointerMove(event) {
     node.x = dragState.nodeStartX + deltaX;
     node.y = dragState.nodeStartY + deltaY;
     nodePositions.set(node.id, { x: node.x, y: node.y });
+    if (dragState.moved) pinnedNodes.add(node.id);
     updateGraphPositions();
     return;
   }

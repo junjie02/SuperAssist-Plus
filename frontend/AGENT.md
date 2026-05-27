@@ -40,8 +40,13 @@ through the `superassist-plus-memory-ui` command. It expects the local API endpo
 - Keep the UI dense and operational rather than marketing-oriented.
 - Use restrained color, clear hierarchy, and stable graph dimensions.
 - The graph canvas supports pointer-drag panning, wheel zooming, and direct node
-  dragging. Node positions are kept in browser state across graph rerenders and
-  filters until the page is reloaded.
+  dragging. Layout uses a deterministic force-directed pass over the visible
+  graph: typed anchors spread event/concept/intent/time nodes into readable
+  regions, edges act as springs, and node repulsion reduces overlap. Node
+  positions are kept in browser state across graph rerenders and filters until
+  the page is reloaded; manually dragged nodes are pinned for the session.
+- Graph edges are rendered as lightly curved paths. Selecting a node highlights
+  its connected edges so dense neighborhoods remain inspectable.
 - Nodes selected for the latest main-agent read recall are highlighted. Their
   circle size and detail panel score use the latest dynamic `Score(v)`, while
   non-highlighted nodes continue to show static `importance`.

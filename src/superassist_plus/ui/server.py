@@ -4,13 +4,14 @@ import argparse
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from superassist_plus.config import PROJECT_ROOT, Settings
 from superassist_plus.memory.service import MemoryService
 from superassist_plus.models import MemoryEdge, MemoryNode, NodeType
+from superassist_plus.subagents import TASK_STORE
 
 FRONTEND_DIR = PROJECT_ROOT / "frontend"
 
@@ -22,6 +23,23 @@ def create_app(settings: Settings | None = None, default_user_id: str = "local-u
     @app.get("/api/graph")
     def get_graph(user_id: str = Query(default_user_id), update_limit: int = Query(80, ge=1, le=500)) -> dict[str, Any]:
         return graph_payload(service, user_id, update_limit=update_limit)
+
+    @app.get("/api/subagents/tasks")
+    def list_subagent_tasks(limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
+        return {"tasks": [task.to_dict() for task in TASK_STORE.list(limit)]}
+
+    @app.get("/api/subagents/tasks/{task_id}")
+    def get_subagent_task(task_id: str) -> dict[str, Any]:
+        task = TASK_STORE.get(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Subagent task not found")
+        return task.to_dict()
+
+    @app.delete("/api/subagents/tasks/{task_id}")
+    def delete_subagent_task(task_id: str) -> dict[str, Any]:
+        if not TASK_STORE.delete(task_id):
+            raise HTTPException(status_code=404, detail="Subagent task not found")
+        return {"deleted": True}
 
     @app.get("/")
     def index() -> FileResponse:

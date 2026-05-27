@@ -20,7 +20,10 @@ factory, command-line interface, tools, agent graph, and memory system.
   compatibility adapter, and local fallback.
 - `cli.py`: command-line entrypoint for single-turn and interactive operation.
 - `agent/`: LangGraph runtime and LangChain middleware.
+- `channels/`: lightweight Feishu/Lark IM control entrypoint.
 - `memory/`: CogniFold-style long-term memory with FAISS dense retrieval.
+- `skills/`: lightweight DeerFlow-style built-in skill discovery and prompt
+  injection.
 - `tools/`: LangChain tool adapters.
 - `ui/`: FastAPI server for the memory graph viewer.
 
@@ -38,11 +41,17 @@ variables use the `SUPERASSIST_PLUS_` prefix. The important runtime values are:
 - `SUPERASSIST_PLUS_MAX_TOKENS`
 - `SUPERASSIST_PLUS_DATA_DIR`
 - `SUPERASSIST_PLUS_ENABLE_TOOLS`
+- short-memory token limit, recent-turn retention, and summary target settings
 - `SUPERASSIST_PLUS_MEMORY_LLM_WRITER_ENABLED`
 - memory thresholds and debounce settings
 - `SUPERASSIST_PLUS_EMBEDDING_PROVIDER`
 - `SUPERASSIST_PLUS_EMBEDDING_MODEL`
 - `SUPERASSIST_PLUS_EMBEDDING_DEVICE`
+- `SUPERASSIST_PLUS_FEISHU_APP_ID`
+- `SUPERASSIST_PLUS_FEISHU_APP_SECRET`
+- `SUPERASSIST_PLUS_FEISHU_DOMAIN`
+- `SUPERASSIST_PLUS_FEISHU_ALLOWED_OPEN_IDS`
+- `SUPERASSIST_PLUS_FEISHU_MENTION_ONLY`
 
 `Settings.db_path` derives the SQLite database path from `data_dir`.
 
@@ -81,6 +90,11 @@ authoritative copy for rebuilding and audit.
 `superassist-plus --interactive` starts a continuous REPL using one thread id.
 
 `--flush-memory` forces queued memory writes to complete before process exit.
+
+`superassist-plus-feishu` starts the Feishu WebSocket control channel. It maps
+Feishu users to `feishu:<open_id>`, persists chat/topic to thread mappings under
+`data_dir/channels/`, and patches one Feishu interactive card with the initial
+context-preparation status, model-authored text progress, and the final answer.
 
 ## Tool Calling
 

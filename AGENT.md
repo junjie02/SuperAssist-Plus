@@ -42,6 +42,8 @@ The Python package is `superassist_plus` under `src/`.
 - `cli.py`: single-turn and interactive command-line entrypoint.
 - `agent/`: outer LangGraph runtime, inner LangChain agent, middleware chain,
   and graph state schema.
+- `channels/`: lightweight IM channel integrations. The Feishu channel uses a
+  WebSocket long connection and calls `AgentRuntime` directly.
 - `memory/`: CogniFold-style typed graph memory, SQLite persistence, FAISS dense
   vector recall over BGE embeddings, consolidation, deterministic writer, optional
   LLM-assisted UpdatePlan writer, and debounced write queue.
@@ -57,7 +59,7 @@ Outer LangGraph flow:
 
 1. `prepare_context`
    - Loads recent persisted thread history from `messages.jsonl`.
-   - Creates an `Event` node for the current user turn.
+   - Creates the current user turn event after read/write context assembly.
    - Recalls relevant long-term memory into immediate/working/background tiers.
 2. `agent`
    - Invokes a LangChain `create_agent` graph.
@@ -73,6 +75,11 @@ Outer LangGraph flow:
 
 The inner LangChain agent owns tool routing. SuperAssist-Plus must not recreate
 the old manual tool-call loop.
+
+`AgentRuntime` can optionally report channel-facing run events. It emits
+`preparing_context` when a turn starts and forwards model-authored
+`agent_text` from tool-call messages. It does not expose tool names, arguments,
+tool results, or token streaming to the Feishu channel.
 
 ## LangChain Middleware Chain
 
@@ -195,6 +202,23 @@ superassist-plus-memory-ui --user-id local-user --port 8765
 
 Open the printed local URL to inspect nodes, typed edges, graph statistics, and
 the right-side update ledger.
+
+Feishu control entry:
+
+```powershell
+superassist-plus-feishu
+```
+
+This starts a Feishu/Lark WebSocket long-connection bot. Configure
+`SUPERASSIST_PLUS_FEISHU_APP_ID`, `SUPERASSIST_PLUS_FEISHU_APP_SECRET`, and
+optionally `SUPERASSIST_PLUS_FEISHU_DOMAIN`,
+`SUPERASSIST_PLUS_FEISHU_ALLOWED_OPEN_IDS`, and
+`SUPERASSIST_PLUS_FEISHU_MENTION_ONLY`. Private chats trigger directly; group
+chats trigger on @ when mention-only mode is enabled. Feishu users map to
+`feishu:<open_id>`, and conversation mappings are stored under
+`{SUPERASSIST_PLUS_DATA_DIR}/channels/feishu_threads.json`. The Feishu service
+creates and caches `AgentRuntime` at startup so the configured embedder, such as
+BGE, is loaded before the first message arrives.
 
 If PowerShell reports that `superassist-plus-memory-ui` is not recognized,
 activate the `CF` conda environment or call the script by absolute path:

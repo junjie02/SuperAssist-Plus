@@ -17,7 +17,7 @@ conda run -n CF python -B -m pytest
 Expected current result:
 
 ```text
-38 passed
+66 passed
 ```
 
 ## Files
@@ -65,6 +65,22 @@ Expected current result:
     OpenAI-compatible binding path.
   - Verifies runtime context is merged with the lead prompt into one system
     message.
+  - Verifies runtime events expose context preparation and model-authored
+    progress text for channel surfaces.
+- `test_subagents.py`
+  - Verifies built-in `general-purpose` and `research` subagent prompts.
+  - Verifies subagent tool filtering removes recursive `task` access.
+  - Verifies FastAPI subagent task status endpoints.
+- `test_task_tool.py`
+  - Verifies the `task` tool rejects unknown subagent types.
+  - Verifies task success/failure/timeout result formatting.
+  - Verifies subagent concurrency middleware keeps only the first 3 task calls.
+- `test_feishu_channel.py`
+  - Verifies Feishu text/rich-text parsing and mention cleanup.
+  - Verifies Feishu private/group trigger rules and allowed-open-id filtering.
+  - Verifies the Feishu channel caches one runtime so startup can preload BGE.
+  - Verifies chat/topic to thread mapping persistence.
+  - Verifies running card creation, stage patching, and final answer patching.
 - `test_llm.py`
   - Verifies MiniMax model names default to `temperature=1.0`.
   - Verifies explicit temperature settings override the MiniMax default.
