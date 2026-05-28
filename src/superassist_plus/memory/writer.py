@@ -116,8 +116,8 @@ class MemoryWriter:
                                 {
                                     "user_message": payload.user_message,
                                     "assistant_answer": payload.assistant_answer,
-                                    "tool_events": payload.tool_events,
-                                    "memory_context": payload.memory_context or {},
+                                    "tool_events": _compact_tool_events(payload.tool_events),
+                                    "memory_context": _compact_memory_context(payload.memory_context or {}),
                                 },
                                 ensure_ascii=False,
                             ),
@@ -160,6 +160,59 @@ class MemoryWriter:
             cleaned = cleaned[start : end + 1]
         value = json.loads(cleaned)
         return value if isinstance(value, dict) else {"nodes": [], "edges": []}
+
+
+def _compact_tool_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    for event in events[:20]:
+        compact.append(
+            {
+                "name": event.get("name") or event.get("tool") or "",
+                "content": _preview(str(event.get("content") or event.get("error") or ""), 1000),
+                "status": event.get("status", "success"),
+            }
+        )
+    return compact
+
+
+def _compact_memory_context(memory_context: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    compact: dict[str, list[dict[str, Any]]] = {}
+    for tier in ("immediate", "working", "background", "buffer"):
+        nodes = memory_context.get(tier) or []
+        if not isinstance(nodes, list):
+            compact[tier] = []
+            continue
+        compact[tier] = [_compact_memory_node(node) for node in nodes[:5]]
+    return compact
+
+
+def _compact_memory_node(node: Any) -> dict[str, Any]:
+    if hasattr(node, "model_dump"):
+        raw = node.model_dump(mode="json")
+    elif isinstance(node, dict):
+        raw = node
+    else:
+        raw = {}
+    metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+    return {
+        "id": raw.get("id", ""),
+        "type": raw.get("type", ""),
+        "title": _preview(str(raw.get("title") or ""), 160),
+        "description": _preview(str(raw.get("description") or ""), 1200),
+        "importance": raw.get("importance", 0.5),
+        "access_count": raw.get("access_count", 0),
+        "reasoning": _preview(str(raw.get("reasoning") or ""), 500),
+        "grounded_in": list(raw.get("grounded_in") or [])[:10],
+        "source": metadata.get("source", ""),
+        "thread_id": metadata.get("thread_id", ""),
+    }
+
+
+def _preview(text: str, limit: int) -> str:
+    value = text.strip()
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}..."
 
 
 class MemoryWriteQueue:

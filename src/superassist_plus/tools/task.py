@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from threading import BoundedSemaphore
 
 from langchain_core.tools import tool
 
 from superassist_plus.config import get_settings
+from superassist_plus.models import AgentRunEvent
+from superassist_plus.observability import trace_extra, traceable
+from superassist_plus.run_events import current_run_event_reporter
 from superassist_plus.subagents import SubagentExecutor, get_available_subagent_names, get_subagent_config
 
 logger = logging.getLogger(__name__)
@@ -23,6 +27,56 @@ def task(description: str, prompt: str, subagent_type: str = "general-purpose") 
         subagent_type: Subagent type, either general-purpose or research.
     """
 
+    return run_task(description, prompt, subagent_type=subagent_type)
+
+
+def make_task_tool(run_event_reporter: Callable[[AgentRunEvent], None] | None = None):
+    @tool("task")
+    def bound_task(description: str, prompt: str, subagent_type: str = "general-purpose") -> str:
+        """Delegate a complex task to a subagent and wait for its result.
+
+        Args:
+            description: Short 3-8 word description for tracking.
+            prompt: Full task instructions for the subagent.
+            subagent_type: Subagent type, either general-purpose or research.
+        """
+
+        return run_task(description, prompt, subagent_type=subagent_type, run_event_reporter=run_event_reporter)
+
+    return bound_task
+
+
+def run_task(
+    description: str,
+    prompt: str,
+    *,
+    subagent_type: str = "general-purpose",
+    run_event_reporter: Callable[[AgentRunEvent], None] | None = None,
+) -> str:
+    return _run_task_traced(
+        description,
+        prompt,
+        subagent_type=subagent_type,
+        run_event_reporter=run_event_reporter,
+        **trace_extra(
+            metadata={
+                "description": description,
+                "prompt_preview": prompt,
+                "subagent_type": subagent_type,
+            },
+            tags=["tool", "task", "subagent"],
+        ),
+    )
+
+
+@traceable(name="task.dispatch", run_type="tool")
+def _run_task_traced(
+    description: str,
+    prompt: str,
+    *,
+    subagent_type: str = "general-purpose",
+    run_event_reporter: Callable[[AgentRunEvent], None] | None = None,
+) -> str:
     settings = get_settings()
     if not settings.subagents_enabled:
         return "Error: Subagents are disabled by SUPERASSIST_PLUS_SUBAGENTS_ENABLED=false"
@@ -44,7 +98,12 @@ def task(description: str, prompt: str, subagent_type: str = "general-purpose") 
     try:
         from superassist_plus.tools import default_tools
 
-        executor = SubagentExecutor(config=config, tools=default_tools(include_task=False), settings=settings)
+        executor = SubagentExecutor(
+            config=config,
+            tools=default_tools(include_task=False),
+            settings=settings,
+            run_event_reporter=run_event_reporter or current_run_event_reporter(),
+        )
         result = executor.run(prompt, description=description)
         logger.info(
             "Task finished: task_id=%s description=%s subagent_type=%s status=%s error=%s",

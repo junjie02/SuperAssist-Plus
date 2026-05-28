@@ -75,12 +75,15 @@ START
   for debounced background writing.
 
 `AgentRuntime` accepts an optional `run_event_reporter` callback. It reports
-`preparing_context` at turn start and forwards model-authored `agent_text` from
-tool-call messages for external surfaces such as Feishu cards. It intentionally
-does not expose tool names, arguments, results, or finalization boilerplate.
-If a model emits a tool call without assistant text, middleware does not invent
-a fallback progress sentence; Feishu should stay on the previous human-readable
-card text instead of showing raw tool names.
+`preparing_context` at turn start, `thinking` before the model step, and forwards
+model-authored `agent_text` from streamed messages and tool-call messages for
+external surfaces such as Feishu cards. During a run, the callback is also
+available to the `task` tool through a context variable so subagents can report
+their own model-authored `subagent_text`. It intentionally does not expose tool
+names, arguments, results, or finalization boilerplate. If a model emits a tool
+call without assistant text, middleware does not invent a fallback progress
+sentence; Feishu should stay on the previous human-readable card text instead
+of showing raw tool names.
 
 ## Inner LangChain Middleware Chain
 

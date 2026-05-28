@@ -3,17 +3,20 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime
+from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
 from langchain.agents import create_agent
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
 from langgraph.errors import GraphRecursionError
 
 from superassist_plus.config import Settings, get_settings
 from superassist_plus.llm import create_chat_model
+from superassist_plus.models import AgentRunEvent
+from superassist_plus.observability import runnable_trace_config, trace_extra, traceable, without_self
 
 from .config import SubagentConfig
 from .store import TASK_STORE, SubagentResult, SubagentStatus
@@ -27,9 +30,12 @@ class SubagentExecutor:
         config: SubagentConfig,
         tools: list[BaseTool],
         settings: Settings | None = None,
+        run_event_reporter: Callable[[AgentRunEvent], None] | None = None,
     ) -> None:
         self.config = config
         self.settings = settings or get_settings()
+        self._run_event_reporter = run_event_reporter
+        self._reported_subagent_text_seen: set[str] = set()
         self.tools = _filter_tools(tools, config.allowed_tools)
         self.model = create_chat_model(self.settings)
         self.graph = self._build_graph()
@@ -43,6 +49,27 @@ class SubagentExecutor:
 
     def run(self, prompt: str, *, task_id: str | None = None, description: str = "") -> SubagentResult:
         resolved_task_id = task_id or f"subagent_{uuid4().hex[:12]}"
+        return self._run_traced(
+            prompt,
+            task_id=resolved_task_id,
+            description=description,
+            **trace_extra(
+                metadata={
+                    "task_id": resolved_task_id,
+                    "description": description,
+                    "prompt_preview": prompt,
+                    "subagent_type": self.config.name,
+                    "allowed_tools": [tool.name for tool in self.tools],
+                    "max_turns": self.config.max_turns,
+                    "timeout_seconds": self.config.timeout_seconds,
+                },
+                tags=["subagent", self.config.name],
+            ),
+        )
+
+    @traceable(name="subagent.run", run_type="chain", process_inputs=without_self)
+    def _run_traced(self, prompt: str, *, task_id: str, description: str = "") -> SubagentResult:
+        resolved_task_id = task_id
         holder = SubagentResult(
             task_id=resolved_task_id,
             description=description,
@@ -85,6 +112,15 @@ class SubagentExecutor:
                         "messages": [],
                         "result": holder,
                     },
+                    runnable_trace_config(
+                        run_name="subagent.graph",
+                        tags=["subagent", self.config.name, "graph"],
+                        metadata={
+                            "task_id": holder.task_id,
+                            "description": holder.description,
+                            "subagent_type": holder.subagent_type,
+                        },
+                    ),
                 )
             updated = output.get("result", holder)
             if isinstance(updated, SubagentResult):
@@ -136,7 +172,7 @@ class SubagentExecutor:
             tools=self.tools,
         )
         try:
-            result = agent.invoke({"messages": state["messages"]}, {"recursion_limit": self.config.max_turns})
+            result = self._invoke_agent(agent, state["messages"], holder)
         except GraphRecursionError:
             logger.warning("Subagent reached max recursion: task_id=%s max_turns=%s", holder.task_id, self.config.max_turns)
             messages = list(state["messages"])
@@ -156,8 +192,79 @@ class SubagentExecutor:
                 if text:
                     holder.ai_messages.append(text)
                     TASK_STORE.put(holder)
+                    self._report_subagent_text(text, holder=holder)
                     logger.info("Subagent AI message: task_id=%s chars=%d", holder.task_id, len(text))
         return {"prompt": state.get("prompt", ""), "messages": messages, "result": holder}
+
+    def _invoke_agent(self, agent: Any, messages: list[BaseMessage], holder: SubagentResult) -> dict[str, Any]:
+        if not hasattr(agent, "stream"):
+            return agent.invoke(
+                {"messages": messages},
+                runnable_trace_config(
+                    run_name="subagent.agent",
+                    tags=["subagent", self.config.name, "agent"],
+                    metadata={
+                        "task_id": holder.task_id,
+                        "description": holder.description,
+                        "subagent_type": holder.subagent_type,
+                        "max_turns": self.config.max_turns,
+                    },
+                )
+                | {"recursion_limit": self.config.max_turns},
+            )
+        last_values: dict[str, Any] | None = None
+        text_buffers: dict[str, str] = {}
+        current_message_id: str | None = None
+        for item in agent.stream(
+            {"messages": messages},
+            runnable_trace_config(
+                run_name="subagent.agent.streaming",
+                tags=["subagent", self.config.name, "agent", "streaming"],
+                metadata={
+                    "task_id": holder.task_id,
+                    "description": holder.description,
+                    "subagent_type": holder.subagent_type,
+                    "max_turns": self.config.max_turns,
+                },
+            )
+            | {"recursion_limit": self.config.max_turns},
+            stream_mode=["messages", "values"],
+        ):
+            if isinstance(item, tuple) and len(item) == 2:
+                mode, chunk = str(item[0]), item[1]
+            else:
+                mode, chunk = "values", item
+            if mode == "messages":
+                text, current_message_id = _accumulate_stream_text(text_buffers, current_message_id, chunk)
+                if text:
+                    self._report_subagent_text(text, holder=holder)
+                continue
+            if mode == "values" and isinstance(chunk, dict):
+                last_values = chunk
+        if last_values is None:
+            return {"messages": messages}
+        return last_values
+
+    def _report_subagent_text(self, text: str, *, holder: SubagentResult) -> None:
+        content = text.strip()
+        if not content or self._run_event_reporter is None:
+            return
+        if content in self._reported_subagent_text_seen or any(
+            previous.startswith(content) for previous in self._reported_subagent_text_seen
+        ):
+            return
+        self._reported_subagent_text_seen.add(content)
+        self._run_event_reporter(
+            AgentRunEvent(
+                type="subagent_text",
+                message=content,
+                metadata={
+                    "task_id": holder.task_id,
+                    "description": holder.description,
+                    "subagent_type": holder.subagent_type,
+                },
+            )
+        )
 
     def _summarize_after_recursion_limit(self, messages: list[BaseMessage]) -> str:
         summary_prompt = SystemMessage(
@@ -207,6 +314,55 @@ def _last_ai_text(messages: list[Any]) -> str:
         if isinstance(message, AIMessage):
             return str(message.content or "").strip()
     return ""
+
+
+def _accumulate_stream_text(
+    buffers: dict[str, str],
+    current_message_id: str | None,
+    chunk: Any,
+) -> tuple[str | None, str | None]:
+    message = chunk[0] if isinstance(chunk, tuple) and chunk else chunk
+    if not isinstance(message, (AIMessage, AIMessageChunk)):
+        return None, current_message_id
+    text = _message_text(getattr(message, "content", ""))
+    if not text:
+        return None, current_message_id
+    message_id = str(getattr(message, "id", "") or current_message_id or "__default__")
+    buffers[message_id] = _merge_stream_text(buffers.get(message_id, ""), text)
+    return buffers[message_id], message_id
+
+
+def _message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        pending: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                pending.append(item)
+                continue
+            if pending:
+                parts.append("".join(pending))
+                pending.clear()
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        if pending:
+            parts.append("".join(pending))
+        return "\n".join(part for part in parts if part)
+    return str(content) if content else ""
+
+
+def _merge_stream_text(existing: str, incoming: str) -> str:
+    if not existing:
+        return incoming
+    if incoming.startswith(existing):
+        return incoming
+    if existing.endswith(incoming):
+        return existing
+    return f"{existing}{incoming}"
 
 
 def _run_coro_sync(coro):

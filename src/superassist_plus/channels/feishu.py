@@ -10,6 +10,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from dotenv import load_dotenv
+
 from superassist_plus.agent import AgentRuntime
 from superassist_plus.config import Settings, get_settings
 from superassist_plus.memory.embedding import get_embedder
@@ -148,9 +150,11 @@ class FeishuChannel:
 
         def report(event: AgentRunEvent) -> None:
             if event.type == "thinking":
-                text = "Thinking..."
+                text = event.message.strip() or "Thinking..."
             elif event.type == "agent_text":
                 text = event.message.strip()
+            elif event.type == "subagent_text":
+                text = format_subagent_card_text(event)
             else:
                 return
             if not text:
@@ -358,6 +362,17 @@ def build_card_content(text: str) -> str:
     )
 
 
+def format_subagent_card_text(event: AgentRunEvent) -> str:
+    text = event.message.strip()
+    if not text:
+        return ""
+    metadata = event.metadata or {}
+    description = str(metadata.get("description") or "").strip()
+    subagent_type = str(metadata.get("subagent_type") or "subagent").strip()
+    label = description or subagent_type
+    return f"Subagent [{label}]: {text}"
+
+
 def _coerce_mentions(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
@@ -373,5 +388,6 @@ def _coerce_mentions(value: Any) -> list[dict[str, Any]]:
 
 
 def main() -> None:
+    load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     asyncio.run(FeishuChannelService().run_forever())

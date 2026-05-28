@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from fastapi.testclient import TestClient
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
 from langgraph.errors import GraphRecursionError
 
 from superassist_plus.config import Settings
@@ -42,6 +42,36 @@ def test_subagent_executor_runs_fallback_agent(tmp_path) -> None:
     assert result.status == SubagentStatus.COMPLETED
     assert "fallback mode" in result.result
     assert result.ai_messages
+
+
+def test_subagent_executor_reports_streamed_ai_text(tmp_path, monkeypatch) -> None:
+    class StreamingAgent:
+        def stream(self, state, config=None, stream_mode=None):
+            yield ("messages", (AIMessageChunk(content="I am checking", id="sub_msg_1"), {}))
+            yield ("values", {"messages": [*state["messages"], AIMessage(content="done")]})
+
+    settings = Settings(
+        SUPERASSIST_PLUS_DATA_DIR=tmp_path,
+        SUPERASSIST_PLUS_API_KEY="",
+        SUPERASSIST_PLUS_EMBEDDING_PROVIDER="hash",
+    )
+    events = []
+    config = build_builtin_subagents(timeout_seconds=30, max_turns=10)["general-purpose"]
+    monkeypatch.setattr(executor_module, "create_agent", lambda **kwargs: StreamingAgent())
+    executor = SubagentExecutor(
+        config=config,
+        tools=default_tools(include_task=False),
+        settings=settings,
+        run_event_reporter=events.append,
+    )
+
+    result = executor.run("Do a streamed check.", description="stream check")
+
+    assert result.status == SubagentStatus.COMPLETED
+    assert result.result == "done"
+    assert [event.type for event in events] == ["subagent_text", "subagent_text"]
+    assert events[0].message == "I am checking"
+    assert events[0].metadata["description"] == "stream check"
 
 
 def test_subagent_executor_summarizes_when_recursion_limit_is_reached(tmp_path, monkeypatch) -> None:

@@ -133,6 +133,12 @@ conda activate CF
 cd C:\Users\15746\Desktop\CODE\SuperAssist-Plus
 ```
 
+If PowerShell blocks conda activation scripts, use `conda run` instead:
+
+```powershell
+conda run -n CF superassist-plus "hello" --flush-memory
+```
+
 If the command-line scripts are missing after editing `pyproject.toml`, refresh
 the editable install:
 
@@ -177,3 +183,25 @@ Run tests:
 ```powershell
 python -B -m pytest
 ```
+
+## LangSmith Tracing
+
+Set these in `.env` to send traces to LangSmith:
+
+```env
+LANGSMITH_TRACING=true
+LANGSMITH_TRACING_V2=true
+LANGSMITH_API_KEY=lsv2_...
+LANGSMITH_PROJECT=superassist-plus-dev
+```
+
+Then run through the `CF` environment:
+
+```powershell
+conda run -n CF superassist-plus "用 task 分发两个检查并汇总" --flush-memory
+```
+
+The trace includes `superassist.turn`, the lead LangChain agent, tool calls,
+`task.dispatch`, and `subagent.run` spans with task description, subagent type,
+task id, allowed tools, status, and prompt previews. Model token usage is shown
+on LangSmith model spans when the provider returns usage metadata.

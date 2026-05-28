@@ -14,6 +14,8 @@ from superassist_plus.llm import create_chat_model, is_minimax_model
 from superassist_plus.memory.service import MemoryService, MemoryWritePayload
 from superassist_plus.memory.writer import MemoryWriteQueue, MemoryWriter
 from superassist_plus.models import AgentRunEvent, AgentRunResult
+from superassist_plus.observability import runnable_trace_config, traceable, without_self
+from superassist_plus.run_events import run_event_reporter_context
 from superassist_plus.tools import default_tools
 
 from .middleware import SuperAssistAgentState, build_middlewares
@@ -112,7 +114,14 @@ class AgentRuntime:
             ),
             debounce_seconds=self.settings.memory_debounce_seconds,
         )
-        tools = default_tools(include_task=self.settings.subagents_enabled) if self.settings.enable_tools else []
+        tools = (
+            default_tools(
+                include_task=self.settings.subagents_enabled,
+                run_event_reporter=self._run_event_reporter,
+            )
+            if self.settings.enable_tools
+            else []
+        )
         prompt = SYSTEM_PROMPT
         if self.settings.enable_tools and self.settings.subagents_enabled:
             prompt = f"{prompt}\n\n{subagent_prompt_section(self.settings.subagent_max_concurrent)}"
@@ -140,8 +149,28 @@ class AgentRuntime:
         user_id: str = "local-user",
         thread_id: str | None = None,
     ) -> AgentRunResult:
+        return self._run_traced(message, user_id=user_id, thread_id=thread_id)
+
+    @traceable(name="superassist.turn", run_type="chain", process_inputs=without_self)
+    def _run_traced(
+        self,
+        message: str,
+        *,
+        user_id: str = "local-user",
+        thread_id: str | None = None,
+    ) -> AgentRunResult:
         initial_state = self._initial_state(message, user_id=user_id, thread_id=thread_id)
-        final_state = self.graph.invoke(initial_state)
+        with run_event_reporter_context(self._run_event_reporter):
+            final_state = self.graph.invoke(
+                initial_state,
+                runnable_trace_config(
+                    run_name="superassist.graph",
+                    user_id=user_id,
+                    thread_id=initial_state["thread_id"],
+                    tags=["agent", "graph"],
+                    metadata={"streaming": False},
+                ),
+            )
         return AgentRunResult(
             thread_id=initial_state["thread_id"],
             answer=str(final_state.get("answer") or ""),
@@ -149,6 +178,16 @@ class AgentRuntime:
         )
 
     def run_streaming(
+        self,
+        message: str,
+        *,
+        user_id: str = "local-user",
+        thread_id: str | None = None,
+    ) -> AgentRunResult:
+        return self._run_streaming_traced(message, user_id=user_id, thread_id=thread_id)
+
+    @traceable(name="superassist.turn.streaming", run_type="chain", process_inputs=without_self)
+    def _run_streaming_traced(
         self,
         message: str,
         *,
@@ -164,11 +203,12 @@ class AgentRuntime:
         """
 
         state = self._initial_state(message, user_id=user_id, thread_id=thread_id)
-        state.update(self._prepare_context(state))
-        self._report_run_event("thinking", "Thinking...", thread_id=state["thread_id"])
-        state.update(self._run_agent_streaming(state))
-        state.update(self._persist_turn(state))
-        state.update(self._enqueue_memory_write(state))
+        with run_event_reporter_context(self._run_event_reporter):
+            state.update(self._prepare_context(state))
+            self._report_run_event("thinking", "Thinking...", thread_id=state["thread_id"])
+            state.update(self._run_agent_streaming(state))
+            state.update(self._persist_turn(state))
+            state.update(self._enqueue_memory_write(state))
         return AgentRunResult(
             thread_id=state["thread_id"],
             answer=str(state.get("answer") or ""),
@@ -226,7 +266,17 @@ class AgentRuntime:
             if not self.settings.enable_tools:
                 return self._run_direct_model(state)
             result = self.agent.invoke(
-                self._agent_input(state)
+                self._agent_input(state),
+                runnable_trace_config(
+                    run_name="superassist.lead_agent",
+                    user_id=state["user_id"],
+                    thread_id=state["thread_id"],
+                    tags=["agent", "lead"],
+                    metadata={
+                        "enable_tools": self.settings.enable_tools,
+                        "subagents_enabled": self.settings.subagents_enabled,
+                    },
+                ),
             )
         except Exception as exc:
             return self._model_error_response(state, exc)
@@ -244,6 +294,16 @@ class AgentRuntime:
             try:
                 for item in self.agent.stream(
                     self._agent_input(state),
+                    runnable_trace_config(
+                        run_name="superassist.lead_agent.streaming",
+                        user_id=state["user_id"],
+                        thread_id=state["thread_id"],
+                        tags=["agent", "lead", "streaming"],
+                        metadata={
+                            "enable_tools": self.settings.enable_tools,
+                            "subagents_enabled": self.settings.subagents_enabled,
+                        },
+                    ),
                     stream_mode=["messages", "values"],
                 ):
                     if isinstance(item, tuple) and len(item) == 2:

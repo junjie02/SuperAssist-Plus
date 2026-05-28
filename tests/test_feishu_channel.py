@@ -11,6 +11,7 @@ from superassist_plus.channels.feishu import (
     FeishuInboundMessage,
     build_card_content,
     clean_mention_text,
+    format_subagent_card_text,
     parse_feishu_content,
     parse_feishu_event,
     should_trigger_agent,
@@ -129,6 +130,16 @@ def test_build_card_content_uses_update_multi() -> None:
     assert card["elements"][0]["content"] == "hello"
 
 
+def test_format_subagent_card_text_uses_description() -> None:
+    event = AgentRunEvent(
+        type="subagent_text",
+        message="checking files",
+        metadata={"description": "repo scan", "subagent_type": "general-purpose"},
+    )
+
+    assert format_subagent_card_text(event) == "Subagent [repo scan]: checking files"
+
+
 def test_feishu_channel_requires_credentials(tmp_path) -> None:
     channel = FeishuChannel(_settings(tmp_path))
 
@@ -184,7 +195,14 @@ def test_feishu_channel_shows_agent_text_and_final_card(tmp_path) -> None:
             assert message == "做个计划"
             assert user_id == "feishu:ou_1"
             assert thread_id.startswith("feishu_")
-            self.reporter(AgentRunEvent(type="thinking", message="Thinking...", metadata={}))
+            self.reporter(AgentRunEvent(type="thinking", message="Inspecting the request...", metadata={}))
+            self.reporter(
+                AgentRunEvent(
+                    type="subagent_text",
+                    message="subagent progress",
+                    metadata={"description": "plan check", "subagent_type": "general-purpose"},
+                )
+            )
             self.reporter(AgentRunEvent(type="agent_text", message="agent text", metadata={}))
             return AgentRunResult(thread_id=thread_id, answer="完成", metadata={})
 
@@ -220,7 +238,8 @@ def test_feishu_channel_shows_agent_text_and_final_card(tmp_path) -> None:
 
         assert len([entry for entry in sent if entry[0] == "reply"]) == 1
         assert sent[0] == ("reply", "Preparing context...")
-        assert ("patch", "Thinking...") in sent
+        assert ("patch", "Inspecting the request...") in sent
+        assert ("patch", "Subagent [plan check]: subagent progress") in sent
         assert ("patch", "agent text") in sent
         assert sent[-1] == ("patch", "完成")
 

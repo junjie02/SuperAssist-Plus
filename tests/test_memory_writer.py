@@ -1,4 +1,5 @@
 from langchain_core.messages import AIMessage
+import json
 
 from superassist_plus.config import Settings
 from superassist_plus.memory.service import MemoryService, MemoryWritePayload
@@ -107,6 +108,47 @@ def test_memory_writer_can_opt_into_llm_plan(tmp_path) -> None:
 
     assert result["nodes"] == 1
     assert "memory_context" in str(model.calls[0][0])
+
+
+def test_memory_writer_llm_payload_omits_embeddings(tmp_path) -> None:
+    service = make_service(tmp_path)
+    event_id, _ = service.prepare_turn("u", "t", "Prepare an interview answer.")
+    raw_context = {
+        "immediate": [
+            {
+                "id": "node_1",
+                "type": "concept",
+                "title": "Interview prep",
+                "description": "Useful context.",
+                "importance": 0.7,
+                "access_count": 3,
+                "embedding": [0.1, 0.2, 0.3],
+                "metadata": {"thread_id": "t", "source": "test"},
+            }
+        ],
+        "working": [],
+        "background": [],
+        "buffer": [],
+    }
+    assert "embedding" in str(raw_context)
+    payload = MemoryWritePayload(
+        user_id="u",
+        thread_id="t",
+        event_id=event_id,
+        user_message="Prepare an interview answer.",
+        assistant_answer="Drafted.",
+        tool_events=[{"name": "task", "content": "x" * 2000}],
+        memory_context=raw_context,
+    )
+    model = JsonModel()
+    writer = MemoryWriter(service, model, llm_enabled=True)
+
+    writer.write(payload)
+
+    human_message = model.calls[0][0][0][1]
+    sent_payload = json.loads(human_message[1])
+    assert "embedding" not in human_message[1]
+    assert len(sent_payload["tool_events"][0]["content"]) < 1100
 
 
 def test_memory_writer_prompt_uses_cognifold_update_plan() -> None:

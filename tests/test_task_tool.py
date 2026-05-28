@@ -10,8 +10,10 @@ from superassist_plus.agent import AgentRuntime
 from superassist_plus.agent.middleware import SubagentLimitMiddleware
 from superassist_plus.config import Settings
 from superassist_plus.llm import FallbackChatModel
+from superassist_plus.models import AgentRunEvent
+from superassist_plus.run_events import run_event_reporter_context
 from superassist_plus.subagents.store import SubagentResult, SubagentStatus
-from superassist_plus.tools.task import task
+from superassist_plus.tools.task import make_task_tool, task
 
 
 def test_task_rejects_unknown_subagent(tmp_path, monkeypatch) -> None:
@@ -58,6 +60,64 @@ def test_task_formats_success_failure_and_timeout(tmp_path, monkeypatch) -> None
     assert task.invoke(args) == "Task Succeeded. Result: ok"
     assert task.invoke(args) == "Task failed. Error: boom"
     assert task.invoke(args) == "Task timed out. Error: slow"
+
+
+def test_task_passes_current_run_event_reporter_to_subagent(tmp_path, monkeypatch) -> None:
+    task_module = importlib.import_module("superassist_plus.tools.task")
+    settings = Settings(
+        SUPERASSIST_PLUS_DATA_DIR=tmp_path,
+        SUPERASSIST_PLUS_EMBEDDING_PROVIDER="hash",
+        SUPERASSIST_PLUS_SUBAGENTS_ENABLED=True,
+    )
+    captured = {}
+    events = []
+    monkeypatch.setattr(task_module, "get_settings", lambda: settings)
+
+    class FakeExecutor:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self, prompt, *, description):
+            captured["run_event_reporter"](
+                AgentRunEvent(type="subagent_text", message="working", metadata={"description": description})
+            )
+            return SubagentResult("t1", description, "general-purpose", status=SubagentStatus.COMPLETED, result="ok")
+
+    monkeypatch.setattr(task_module, "SubagentExecutor", FakeExecutor)
+
+    with run_event_reporter_context(events.append):
+        result = task.invoke({"description": "demo", "prompt": "do it", "subagent_type": "general-purpose"})
+
+    assert result == "Task Succeeded. Result: ok"
+    assert [event.message for event in events] == ["working"]
+
+
+def test_bound_task_tool_uses_explicit_run_event_reporter(tmp_path, monkeypatch) -> None:
+    task_module = importlib.import_module("superassist_plus.tools.task")
+    settings = Settings(
+        SUPERASSIST_PLUS_DATA_DIR=tmp_path,
+        SUPERASSIST_PLUS_EMBEDDING_PROVIDER="hash",
+        SUPERASSIST_PLUS_SUBAGENTS_ENABLED=True,
+    )
+    captured = {}
+    events = []
+    monkeypatch.setattr(task_module, "get_settings", lambda: settings)
+
+    class FakeExecutor:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self, prompt, *, description):
+            return SubagentResult("t1", description, "general-purpose", status=SubagentStatus.COMPLETED, result="ok")
+
+    monkeypatch.setattr(task_module, "SubagentExecutor", FakeExecutor)
+
+    bound = make_task_tool(events.append)
+    result = bound.invoke({"description": "demo", "prompt": "do it", "subagent_type": "general-purpose"})
+
+    assert result == "Task Succeeded. Result: ok"
+    captured["run_event_reporter"](AgentRunEvent(type="subagent_text", message="bound", metadata={}))
+    assert [event.message for event in events] == ["bound"]
 
 
 def test_subagent_limit_middleware_keeps_first_three_task_calls() -> None:

@@ -88,6 +88,9 @@ CogniFold's event/context-triggered intent semantics.
 10. When LLM planning is enabled, the memory writer prompt asks for a
    CogniFold-style `UpdatePlan` with `operations`, including `ADD_NODE`,
    `ADD_EDGE`, `UPDATE_NODE`, `REMOVE_NODE`, `REMOVE_EDGE`, and `MERGE_NODES`.
+   The payload sent to the LLM uses a compact memory-context summary: embeddings
+   are omitted, tool outputs are truncated, and each recall tier is capped so
+   tracing and model inputs do not contain huge vector arrays.
 11. `MemoryService.apply_structured_memory()` validates and executes operations.
    It creates nodes first, resolves short refs such as `current_event`, applies
    updates/edges/merges, and uses `grounded_in` to add missing grounding edges

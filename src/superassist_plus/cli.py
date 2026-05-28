@@ -5,10 +5,13 @@ import json
 from typing import Any
 from uuid import uuid4
 
+from dotenv import load_dotenv
+
 from superassist_plus.agent import AgentRuntime
 
 
 def main() -> None:
+    load_dotenv()
     parser = argparse.ArgumentParser(description="Run SuperAssist-Plus locally.")
     parser.add_argument("message", nargs="*", help="User message to send to the agent.")
     parser.add_argument("--user-id", default="local-user")
