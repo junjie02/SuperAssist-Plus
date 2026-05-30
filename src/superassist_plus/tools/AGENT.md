@@ -14,6 +14,8 @@ LangChain agent. Tools should be simple, typed, testable units.
 - `files.py`: workspace-scoped file listing, reading, writing, and deletion,
   plus read-only `/mnt/skills` access for built-in skill files.
 - `web.py`: DuckDuckGo HTML search and HTTP/HTTPS fetch helpers.
+- `shell.py`: gated local shell command execution scoped to the project root.
+- `team.py`: persistent external agent-team task delegation.
 - `__init__.py`: `default_tools()` returns the tools registered with the agent.
 
 ## Current Tools
@@ -35,11 +37,22 @@ LangChain agent. Tools should be simple, typed, testable units.
   - Searches DuckDuckGo HTML results when network tools are enabled.
 - `web_fetch(url, max_chars=12000)`
   - Fetches HTTP/HTTPS pages and returns readable text.
+- `shell(command, cwd=".")`
+  - Runs a non-interactive command under the project root when
+    `SUPERASSIST_PLUS_TOOL_SHELL_ENABLED=true`.
+  - Uses PowerShell/cmd fallback on Windows and POSIX shells elsewhere.
+  - Blocks obvious destructive commands and truncates long output.
+- `team_task(agent, description, prompt, wait=true)`
+  - Delegates work to a persistent ACP-backed external team agent configured in
+    `agent_team.toml`.
+  - Requires an active SuperAssist thread context and agent teams to be enabled.
+  - Writes auditable task/result records through the agent-team JSONL ledger.
 
 ## Registration
 
 `default_tools()` is used by `AgentRuntime` when building the LangChain agent.
-New default tools should be added there deliberately.
+New default tools should be added there deliberately. `team_task` is included
+only when the runtime has an enabled agent-team supervisor.
 `AgentRuntime` also passes `SUPERASSIST_PLUS_MAX_TOOL_CALLS` into the tool-call
 limit middleware so one turn cannot execute unbounded tool loops.
 Current time is not exposed as a tool; it is injected by
@@ -55,4 +68,6 @@ Current time is not exposed as a tool; it is injected by
   traversal outside it. The only exception is read-only `/mnt/skills` access in
   `read_file`; mutation tools must continue rejecting skill paths.
 - Network tools must respect `SUPERASSIST_PLUS_TOOL_NETWORK_ENABLED`.
+- Shell execution must respect `SUPERASSIST_PLUS_TOOL_SHELL_ENABLED`, keep cwd
+  inside the project root, and block obviously destructive commands.
 - Add tests when introducing tools with nontrivial behavior.

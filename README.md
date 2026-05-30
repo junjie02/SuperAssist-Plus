@@ -139,6 +139,17 @@ If PowerShell blocks conda activation scripts, use `conda run` instead:
 conda run -n CF superassist-plus "hello" --flush-memory
 ```
 
+Local shell command execution is available as the `shell` tool only when tools
+and shell access are explicitly enabled:
+
+```env
+SUPERASSIST_PLUS_ENABLE_TOOLS=true
+SUPERASSIST_PLUS_TOOL_SHELL_ENABLED=true
+```
+
+The shell tool runs under the project root, rejects cwd escapes, blocks obvious
+destructive commands, and truncates long output.
+
 If the command-line scripts are missing after editing `pyproject.toml`, refresh
 the editable install:
 

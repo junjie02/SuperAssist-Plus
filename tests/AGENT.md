@@ -17,7 +17,7 @@ conda run -n CF python -B -m pytest
 Expected current result:
 
 ```text
-66 passed
+125 passed
 ```
 
 ## Files
@@ -75,6 +75,12 @@ Expected current result:
   - Verifies the `task` tool rejects unknown subagent types.
   - Verifies task success/failure/timeout result formatting.
   - Verifies subagent concurrency middleware keeps only the first 3 task calls.
+- `test_agent_teams.py`
+  - Verifies `agent_team.toml` loading and validation.
+  - Verifies append-only team ledgers, hash-chain tamper checks, and concurrent
+    append locking.
+  - Verifies `TeamSupervisor` reuses member sessions per thread and `team_task`
+    error/success formatting.
 - `test_feishu_channel.py`
   - Verifies Feishu text/rich-text parsing and mention cleanup.
   - Verifies Feishu private/group trigger rules and allowed-open-id filtering.
@@ -86,6 +92,9 @@ Expected current result:
   - Verifies explicit temperature settings override the MiniMax default.
   - Verifies MiniMax detection, OpenAI tool-binding payload preservation,
     `reasoning_split`, and reasoning content preservation.
+- `test_tools.py`
+  - Verifies default tool registration, workspace-scoped file tools, network
+    gating, shell gating, shell cwd scoping, and destructive-command blocking.
 - `test_ui.py`
   - Verifies the memory graph API payload contains nodes, edges, update ledger
     entries, and aggregate stats.

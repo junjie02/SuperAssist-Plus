@@ -47,6 +47,9 @@ The Python package is `superassist_plus` under `src/`.
 - `memory/`: CogniFold-style typed graph memory, SQLite persistence, FAISS dense
   vector recall over BGE embeddings, consolidation, deterministic writer, optional
   LLM-assisted UpdatePlan writer, and debounced write queue.
+- `agent_teams/`: persistent external ACP-backed coding agents with project-root
+  `agent_team.toml` membership, per-thread sessions, and append-only JSONL audit
+  ledgers protected by cross-platform file locks.
 - `tools/`: LangChain tool adapters.
 - `ui/`: FastAPI local server for the memory graph viewer.
 - `frontend/`: static memory graph visualization UI.
@@ -239,7 +242,7 @@ conda run -n CF python -B -m pytest
 Current expected result:
 
 ```text
-33 passed
+125 passed
 ```
 
 ## Maintenance Rules

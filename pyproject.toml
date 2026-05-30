@@ -5,8 +5,10 @@ description = "LangGraph-based rewrite of SuperAssist with CogniFold-style long-
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "agent-client-protocol>=0.4.0",
     "faiss-cpu>=1.8.0",
     "fastapi>=0.115.0",
+    "filelock>=3.15.0",
     "langchain>=1.0.0",
     "langchain-openai>=1.0.0",
     "langgraph>=1.0.0",

@@ -24,6 +24,8 @@ factory, command-line interface, tools, agent graph, and memory system.
 - `memory/`: CogniFold-style long-term memory with FAISS dense retrieval.
 - `skills/`: lightweight DeerFlow-style built-in skill discovery and prompt
   injection.
+- `agent_teams/`: persistent external ACP-backed coding agents, append-only
+  JSONL team ledger, and team supervisor.
 - `tools/`: LangChain tool adapters.
 - `ui/`: FastAPI server for the memory graph viewer.
 
@@ -41,6 +43,9 @@ variables use the `SUPERASSIST_PLUS_` prefix. The important runtime values are:
 - `SUPERASSIST_PLUS_MAX_TOKENS`
 - `SUPERASSIST_PLUS_DATA_DIR`
 - `SUPERASSIST_PLUS_ENABLE_TOOLS`
+- `SUPERASSIST_PLUS_TOOL_SHELL_ENABLED`
+- `SUPERASSIST_PLUS_TOOL_SHELL_TIMEOUT_SECONDS`
+- `SUPERASSIST_PLUS_TOOL_SHELL_OUTPUT_MAX_CHARS`
 - short-memory token limit, recent-turn retention, and summary target settings
 - `SUPERASSIST_PLUS_MEMORY_LLM_WRITER_ENABLED`
 - memory thresholds and debounce settings
@@ -54,6 +59,11 @@ variables use the `SUPERASSIST_PLUS_` prefix. The important runtime values are:
 - `SUPERASSIST_PLUS_FEISHU_MENTION_ONLY`
 
 `Settings.db_path` derives the SQLite database path from `data_dir`.
+
+Agent team membership is intentionally configured in project-root
+`agent_team.toml`, not environment variables. The file contains `enabled`,
+`idle_ttl_seconds`, and one or more `[[agents]]` entries with `name`, `command`,
+`args`, and `description`.
 
 ## LLM Behavior
 

@@ -10,6 +10,9 @@ from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, Huma
 from langgraph.graph import END, START, StateGraph
 
 from superassist_plus.config import Settings, get_settings
+from superassist_plus.agent_teams import AgentTeamConfig, TeamSupervisor, set_team_supervisor
+from superassist_plus.agent_teams.config import AgentTeamConfigError
+from superassist_plus.agent_teams.context import team_thread_context
 from superassist_plus.llm import create_chat_model, is_minimax_model
 from superassist_plus.memory.service import MemoryService, MemoryWritePayload
 from superassist_plus.memory.writer import MemoryWriteQueue, MemoryWriter
@@ -88,6 +91,23 @@ Rules:
 """
 
 
+def team_prompt_section(agents_text: str) -> str:
+    return f"""
+<agent_team_system>
+You can delegate repository and implementation work to persistent external team agents using the `team_task` tool.
+
+Available team agents:
+{agents_text}
+
+Rules:
+- Use `team_task` for work that benefits from a persistent external coding-agent context.
+- Keep prompts self-contained and include the concrete outcome you need.
+- Do not use `team_task` for simple one-step actions that direct tools can handle.
+- After a team agent returns, synthesize its result into your own final answer.
+</agent_team_system>
+"""
+
+
 class AgentRuntime:
     """LangGraph runtime wrapper for SuperAssist-Plus."""
 
@@ -103,6 +123,9 @@ class AgentRuntime:
         self._run_event_reporter = run_event_reporter
         self._active_agent_text_seen: set[str] | None = None
         self.settings.data_dir.mkdir(parents=True, exist_ok=True)
+        self.team_config_error: str | None = None
+        self.team_supervisor = self._build_team_supervisor()
+        set_team_supervisor(self.team_supervisor)
         self.model = create_chat_model(self.settings)
         self.memory = MemoryService(self.settings.db_path, self.settings)
         self.memory.preload_embedder()
@@ -117,6 +140,7 @@ class AgentRuntime:
         tools = (
             default_tools(
                 include_task=self.settings.subagents_enabled,
+                include_team_task=bool(self.team_supervisor and self.team_supervisor.enabled),
                 run_event_reporter=self._run_event_reporter,
             )
             if self.settings.enable_tools
@@ -125,6 +149,10 @@ class AgentRuntime:
         prompt = SYSTEM_PROMPT
         if self.settings.enable_tools and self.settings.subagents_enabled:
             prompt = f"{prompt}\n\n{subagent_prompt_section(self.settings.subagent_max_concurrent)}"
+        if self.settings.enable_tools and self.team_supervisor and self.team_supervisor.enabled:
+            prompt = f"{prompt}\n\n{team_prompt_section(self.team_supervisor.available_agents_text())}"
+        elif self.team_config_error:
+            prompt = f"{prompt}\n\nAgent team config error: {self.team_config_error}"
         self.agent = create_agent(
             model=self.model,
             tools=tools,
@@ -138,6 +166,12 @@ class AgentRuntime:
             state_schema=SuperAssistAgentState,
         )
         self.graph = self._build_graph()
+
+    def close(self) -> None:
+        if self.team_supervisor is not None:
+            self.team_supervisor.close()
+            if _is_current_team_supervisor(self.team_supervisor):
+                set_team_supervisor(None)
 
     def set_run_event_reporter(self, reporter: Callable[[AgentRunEvent], None] | None) -> None:
         self._run_event_reporter = reporter
@@ -265,19 +299,21 @@ class AgentRuntime:
         try:
             if not self.settings.enable_tools:
                 return self._run_direct_model(state)
-            result = self.agent.invoke(
-                self._agent_input(state),
-                runnable_trace_config(
-                    run_name="superassist.lead_agent",
-                    user_id=state["user_id"],
-                    thread_id=state["thread_id"],
-                    tags=["agent", "lead"],
-                    metadata={
-                        "enable_tools": self.settings.enable_tools,
-                        "subagents_enabled": self.settings.subagents_enabled,
-                    },
-                ),
-            )
+            with team_thread_context(state["thread_id"]):
+                result = self.agent.invoke(
+                    self._agent_input(state),
+                    runnable_trace_config(
+                        run_name="superassist.lead_agent",
+                        user_id=state["user_id"],
+                        thread_id=state["thread_id"],
+                        tags=["agent", "lead"],
+                        metadata={
+                            "enable_tools": self.settings.enable_tools,
+                            "subagents_enabled": self.settings.subagents_enabled,
+                            "agent_teams_enabled": bool(self.team_supervisor and self.team_supervisor.enabled),
+                        },
+                    ),
+                )
         except Exception as exc:
             return self._model_error_response(state, exc)
         return self._finalize_agent_result(state, result)
@@ -292,36 +328,38 @@ class AgentRuntime:
             previous_seen = self._active_agent_text_seen
             self._active_agent_text_seen = set()
             try:
-                for item in self.agent.stream(
-                    self._agent_input(state),
-                    runnable_trace_config(
-                        run_name="superassist.lead_agent.streaming",
-                        user_id=state["user_id"],
-                        thread_id=state["thread_id"],
-                        tags=["agent", "lead", "streaming"],
-                        metadata={
-                            "enable_tools": self.settings.enable_tools,
-                            "subagents_enabled": self.settings.subagents_enabled,
-                        },
-                    ),
-                    stream_mode=["messages", "values"],
-                ):
-                    if isinstance(item, tuple) and len(item) == 2:
-                        mode, chunk = item
-                        mode = str(mode)
-                    else:
-                        mode, chunk = "values", item
-                    if mode == "messages":
-                        text, current_message_id = self._accumulate_stream_text(
-                            text_buffers,
-                            current_message_id,
-                            chunk,
-                        )
-                        if text:
-                            self._report_agent_text(text, thread_id=state["thread_id"])
-                        continue
-                    if mode == "values" and isinstance(chunk, dict):
-                        last_values = chunk
+                with team_thread_context(state["thread_id"]):
+                    for item in self.agent.stream(
+                        self._agent_input(state),
+                        runnable_trace_config(
+                            run_name="superassist.lead_agent.streaming",
+                            user_id=state["user_id"],
+                            thread_id=state["thread_id"],
+                            tags=["agent", "lead", "streaming"],
+                            metadata={
+                                "enable_tools": self.settings.enable_tools,
+                                "subagents_enabled": self.settings.subagents_enabled,
+                                "agent_teams_enabled": bool(self.team_supervisor and self.team_supervisor.enabled),
+                            },
+                        ),
+                        stream_mode=["messages", "values"],
+                    ):
+                        if isinstance(item, tuple) and len(item) == 2:
+                            mode, chunk = item
+                            mode = str(mode)
+                        else:
+                            mode, chunk = "values", item
+                        if mode == "messages":
+                            text, current_message_id = self._accumulate_stream_text(
+                                text_buffers,
+                                current_message_id,
+                                chunk,
+                            )
+                            if text:
+                                self._report_agent_text(text, thread_id=state["thread_id"])
+                            continue
+                        if mode == "values" and isinstance(chunk, dict):
+                            last_values = chunk
             finally:
                 self._active_agent_text_seen = previous_seen
             if last_values is None:
@@ -594,3 +632,19 @@ class AgentRuntime:
         if not isinstance(raw, list):
             return []
         return sorted({str(item) for item in raw if str(item)})
+
+    def _build_team_supervisor(self) -> TeamSupervisor | None:
+        try:
+            config = AgentTeamConfig.from_file()
+        except AgentTeamConfigError as exc:
+            self.team_config_error = str(exc)
+            return None
+        if not config.enabled or not config.agents:
+            return None
+        return TeamSupervisor(config, settings=self.settings)
+
+
+def _is_current_team_supervisor(supervisor: TeamSupervisor) -> bool:
+    from superassist_plus.agent_teams import get_team_supervisor
+
+    return get_team_supervisor() is supervisor

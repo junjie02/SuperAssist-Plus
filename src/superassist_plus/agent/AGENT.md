@@ -48,6 +48,9 @@ START
 - invokes the inner LangChain agent with `messages`, `user_id`, `thread_id`,
   `memory_recall`, `tool_events`, and `metadata`.
 - registers default tools only when `SUPERASSIST_PLUS_ENABLE_TOOLS=true`.
+- when project-root `agent_team.toml` enables agent teams, registers
+  `team_task`, starts a `TeamSupervisor`, and exposes persistent external team
+  agents in the lead prompt.
 - injects DeerFlow-style skill metadata for built-in skills. The lead agent sees
   skill names, descriptions, and `/mnt/skills/.../SKILL.md` locations first; if
   it reads a skill file, that skill is remembered for the current thread and
@@ -84,6 +87,11 @@ names, arguments, results, or finalization boilerplate. If a model emits a tool
 call without assistant text, middleware does not invent a fallback progress
 sentence; Feishu should stay on the previous human-readable card text instead
 of showing raw tool names.
+
+During model/tool execution, the active `thread_id` is also exposed through an
+agent-team context variable so `team_task` can route work to the correct
+per-thread persistent external session without adding internal arguments to the
+tool schema.
 
 ## Inner LangChain Middleware Chain
 
