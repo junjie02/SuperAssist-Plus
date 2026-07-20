@@ -1,0 +1,41 @@
+# CogniFold Trajectory Dataset Generation — Default Configuration
+#
+# All values can be overridden via CLI arguments.
+# Usage:
+#   python dataset/generate_musique.py --max-trajectories 10
+#   python dataset/generate_musique.py --max-trajectories 10000 --resume
+
+# --- LLM configuration ---
+model:
+  name: "deepseek:deepseek-v4-pro"
+  temperature: 0.0
+  max_tokens: 8192
+  max_exploration_steps: 1
+
+# --- Output ---
+output:
+  dir: "dataset/output"
+  file: "musique_trajectories.jsonl"
+  flush_every: 10
+
+# --- Sampling ---
+sampling:
+  max_examples: 0          # 0 = all examples
+  max_trajectories: 10000  # 0 = no limit
+  start_example_index: 0   # for resume
+  limit_dataset: "answerable"  # "answerable" | "all"
+
+# --- Benchmark ---
+benchmark:
+  profile: "configs/musique_profile.yaml"
+  data_path: ""            # empty = default download location
+
+# --- Graph context ---
+context:
+  max_nodes: 60
+  max_chars: 20000
+
+# --- Quality filters ---
+quality:
+  include_parse_errors: true
+  min_operations: 0

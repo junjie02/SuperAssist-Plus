@@ -1,0 +1,58 @@
+"""Enqueue a memory write payload after the agent finishes.
+
+Replaces the standalone ``enqueue_memory_write`` graph node. Runs after
+``ShortMemoryMiddleware`` so the durable JSONL is already on disk before the
+write queue fires.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from langchain.agents.middleware import AgentMiddleware
+from langchain_core.messages import AIMessage
+from langgraph.runtime import Runtime
+
+from superassist.agent.state import SuperAssistState
+from superassist.memory.service import MemoryWritePayload
+from superassist.memory.writer import MemoryWriteQueue
+
+
+class MemoryWriterMiddleware(AgentMiddleware[SuperAssistState]):
+    """Submit the completed turn to the debounced memory write queue."""
+
+    state_schema = SuperAssistState
+
+    def __init__(self, queue: MemoryWriteQueue) -> None:
+        super().__init__()
+        self._queue = queue
+
+    def after_agent(self, state: SuperAssistState, runtime: Runtime) -> dict[str, Any] | None:
+        event_id = str(state.get("memory_event_id") or "")
+        if not event_id:
+            return None
+        assistant_answer = _last_ai_text(state.get("messages") or [])
+        self._queue.add(
+            MemoryWritePayload(
+                user_id=state["user_id"],
+                thread_id=state["thread_id"],
+                event_id=event_id,
+                user_message=state.get("input") or "",
+                assistant_answer=assistant_answer,
+                tool_events=list(state.get("tool_events") or []),
+                memory_context=dict(state.get("memory_write_context") or {}),
+            )
+        )
+        return None
+
+
+def _last_ai_text(messages: list[Any]) -> str:
+    for message in reversed(messages):
+        if isinstance(message, AIMessage):
+            text = str(message.content or "").strip()
+            if text:
+                return text
+    return ""
+
+
+__all__ = ["MemoryWriterMiddleware"]

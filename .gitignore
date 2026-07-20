@@ -1,0 +1,81 @@
+# Environment variables and local secrets
+.env
+.env.*
+!.env.example
+
+# SuperAssist runtime data (databases, vector indexes, model caches, threads)
+.superassist/
+**/.superassist/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Node.js / Vite
+node_modules/
+.vite/
+coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tsbuildinfo
+
+# Go build and test artifacts
+*.exe
+*.test
+*.out
+bin/
+
+# Local databases
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Generated benchmark and dataset artifacts
+MuSiQue/benchmark_results.json
+MuSiQue/wrong_cases.json
+MuSiQue/dataset/output/*
+!MuSiQue/dataset/output/*.py
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# IDE settings
+.idea/
+.vscode/
+*.code-workspace
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
