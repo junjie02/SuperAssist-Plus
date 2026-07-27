@@ -24,6 +24,10 @@ class SuperAssistState(AgentState):
     memory_write_context: NotRequired[dict[str, Any]]
     tool_events: NotRequired[list[dict[str, Any]]]
     loaded_skills: NotRequired[list[str]]
+    rag_mode: NotRequired[bool]
+    rag_context: NotRequired[str]
+    rag_sources: NotRequired[list[str]]
+    rag_retrieval: NotRequired[dict[str, Any]]
     metadata: NotRequired[dict[str, Any]]
 
 

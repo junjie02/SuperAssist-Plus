@@ -1,8 +1,10 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import useWebSocket from '../hooks/useWebSocket'
 import { api } from '../lib/api'
+import { TURN_COMPLETED_EVENT } from '../lib/events'
+import { BookOpen, Send } from 'lucide-react'
 
 const THINKING_DOTS = ['  Thinking .', '  Thinking ..', '  Thinking ...']
 
@@ -14,6 +16,7 @@ export default function ChatPage() {
   const [threadId, setThreadId] = useState(null)
   const [threads, setThreads] = useState([])
   const [toolCalls, setToolCalls] = useState([])
+  const [ragMode, setRagMode] = useState(() => localStorage.getItem('superassist_rag_mode') === 'true')
   const messagesEnd = useRef(null)
   const { send, on, connect, ready } = useWebSocket()
   const pendingRef = useRef(null)
@@ -69,11 +72,12 @@ export default function ChatPage() {
       setMessages(prev => [...prev, { role: 'assistant', content: answer, thread_id: tid, toolCalls: [...toolCalls] }])
       setCurrentAI('')
       setToolCalls([])
-      if (tid && tid !== threadId) {
+      if (tid) {
         setThreadId(tid)
         loadedThreadRef.current = tid
-        api.get('/threads').then(setThreads).catch(() => {})
       }
+      api.get('/threads').then(setThreads).catch(() => {})
+      window.dispatchEvent(new CustomEvent(TURN_COMPLETED_EVENT, { detail: { threadId: tid } }))
     })
 
     on('error', (data) => {
@@ -92,15 +96,15 @@ export default function ChatPage() {
     setCurrentAI('')
     setToolCalls([])
     setThinking(true)
-    const ok = send(text, tid)
-    if (!ok) { pendingRef.current = { text, tid }; connect() }
-  }, [send, connect])
+    const ok = send(text, tid, ragMode)
+    if (!ok) { pendingRef.current = { text, tid, ragMode }; connect() }
+  }, [send, connect, ragMode])
 
   useEffect(() => {
     if (ready && pendingRef.current) {
-      const { text, tid } = pendingRef.current
+      const { text, tid, ragMode: pendingRagMode } = pendingRef.current
       pendingRef.current = null
-      send(text, tid)
+      send(text, tid, pendingRagMode)
       setThinking(true)
     }
   }, [ready, send])
@@ -173,7 +177,15 @@ export default function ChatPage() {
           <div ref={messagesEnd} />
         </div>
 
-        <ChatInput onSend={(text) => doSend(text, threadId)} disabled={thinking} />
+        <ChatInput
+          onSend={(text) => doSend(text, threadId)}
+          disabled={thinking}
+          ragMode={ragMode}
+          onRagModeChange={(enabled) => {
+            setRagMode(enabled)
+            localStorage.setItem('superassist_rag_mode', String(enabled))
+          }}
+        />
       </div>
 
       {/* ---- Thread list panel ---- */}
@@ -249,6 +261,7 @@ function toolSummary(tool) {
     case 'write_file': return `写入: ${(args.path || '').split('/').pop() || args.path || ''}`
     case 'shell': return `执行: ${(args.command || '').slice(0, 40)}`
     case 'task': return `${args.description || '子任务'}`
+    case 'rag_search': return `Knowledge: ${args.query || ''}`
     default: return ''
   }
 }
@@ -280,8 +293,26 @@ function ToolCallCard({ tool }) {
   )
 }
 
-function ChatInput({ onSend, disabled }) {
+function ChatInput({ onSend, disabled, ragMode, onRagModeChange }) {
   const [text, setText] = useState('')
+  const inputRef = useRef(null)
+
+  useLayoutEffect(() => {
+    const input = inputRef.current
+    if (!input) return
+
+    input.style.height = 'auto'
+    const styles = window.getComputedStyle(input)
+    const lineHeight = Number.parseFloat(styles.lineHeight) || 22
+    const padding = Number.parseFloat(styles.paddingTop) + Number.parseFloat(styles.paddingBottom)
+    const border = Number.parseFloat(styles.borderTopWidth) + Number.parseFloat(styles.borderBottomWidth)
+    const contentHeight = input.scrollHeight + border
+    const maxHeight = lineHeight * 5 + padding + border
+
+    input.style.height = `${Math.min(contentHeight, maxHeight)}px`
+    input.style.overflowY = contentHeight > maxHeight ? 'auto' : 'hidden'
+    if (!text) input.scrollTop = 0
+  }, [text])
 
   const handleSubmit = (e) => {
     e.preventDefault()
@@ -294,7 +325,22 @@ function ChatInput({ onSend, disabled }) {
 
   return (
     <form className="chat-input" onSubmit={handleSubmit}>
+      <div className="rag-mode-control">
+        <BookOpen size={16} aria-hidden="true" />
+        <span>RAG</span>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={ragMode}
+          aria-label="Use uploaded knowledge"
+          className={`composer-switch ${ragMode ? 'on' : ''}`}
+          onClick={() => onRagModeChange(!ragMode)}
+          disabled={disabled}
+          title="Use uploaded knowledge"
+        ><span /></button>
+      </div>
       <textarea
+        ref={inputRef}
         value={text}
         onChange={e => setText(e.target.value)}
         onKeyDown={handleKeyDown}
@@ -302,7 +348,9 @@ function ChatInput({ onSend, disabled }) {
         rows={1}
         disabled={disabled}
       />
-      <button type="submit" disabled={!text.trim() || disabled}>{disabled ? '...' : 'Send'}</button>
+      <button className="chat-send-btn" type="submit" disabled={!text.trim() || disabled} title="Send message">
+        {disabled ? <span>...</span> : <Send size={18} aria-hidden="true" />}
+      </button>
     </form>
   )
 }

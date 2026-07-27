@@ -4,7 +4,12 @@ import { layoutNodes, edgeGeometry, edgeCurveOffsets, displayScore, shortText, T
 const SVG_NS = 'http://www.w3.org/2000/svg'
 const MIN_ZOOM = 0.35; const MAX_ZOOM = 3
 
-export default function GraphCanvas({ nodes, edges }) {
+export default function GraphCanvas({
+  nodes,
+  edges,
+  emptyMessage = 'No nodes yet. Send a message to start building the memory graph.',
+  showEdgeLabels = true,
+}) {
   const svgRef = useRef(null)
   const [selected, setSelected] = useState(null)
   const posRef = useRef(new Map())
@@ -14,7 +19,12 @@ export default function GraphCanvas({ nodes, edges }) {
   // Rebuild layout only when data changes (NOT on selection)
   useEffect(() => {
     const svg = svgRef.current
-    if (!svg || !nodes.length) return
+    if (!svg) return
+    if (!nodes.length) {
+      svg.innerHTML = ''
+      stRef.current = { ...stRef.current, laidOut: [], edgeState: null }
+      return
+    }
     const w = Math.max(svg.clientWidth, 720)
     const h = Math.max(svg.clientHeight, 560)
 
@@ -25,8 +35,13 @@ export default function GraphCanvas({ nodes, edges }) {
     const laidOut = layoutNodes(nodes, edges, w, h, { savedPositions: posRef.current, pinned: pinnedRef.current })
     const es = buildEdgeState(edges, laidOut)
     stRef.current = { ...stRef.current, laidOut, edgeState: es }
-    fullRender(svg, laidOut, edges, w, h)
-  }, [nodes, edges])
+    fullRender(svg, laidOut, edges, w, h, setSelected, showEdgeLabels)
+  }, [nodes, edges, showEdgeLabels])
+
+  useEffect(() => {
+    if (selected?.kind === 'node' && !nodes.some(node => node.id === selected.id)) setSelected(null)
+    if (selected?.kind === 'edge' && !edges.some(edge => edge.id === selected.id)) setSelected(null)
+  }, [nodes, edges, selected])
 
   // Update selection highlight without re-layout
   useEffect(() => {
@@ -147,15 +162,17 @@ export default function GraphCanvas({ nodes, edges }) {
       <svg ref={svgRef} style={{ width: '100%', height: '100%', cursor: 'grab', touchAction: 'none' }}
         onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp} />
       {nodes.length === 0 && (
-        <div className="empty-graph">No nodes yet. Send a message to start building the memory graph.</div>
+        <div className="empty-graph">{emptyMessage}</div>
       )}
       {selected && (
         <div className="graph-detail-panel">
-          <button className="detail-close" onClick={() => setSelected(null)}>✕</button>
-          <h4>{selected.kind === 'node' ? selected.title : `${selected.edge_type} · ${selected.weight?.toFixed(2)}`}</h4>
+          <button className="detail-close" onClick={() => setSelected(null)} title="Close">x</button>
+          <h4>{selected.kind === 'node'
+            ? selected.title
+            : `${selected.edge_type} - weight ${(selected.raw_weight ?? selected.weight ?? 0).toFixed(2)}`}</h4>
           <p>{selected.kind === 'node'
-            ? `${selected.type} · score ${displayScore(selected).toFixed(2)} · ${selected.description || ''}`
-            : `${selected.sourceTitle || selected.source_id} → ${selected.targetTitle || selected.target_id}`}</p>
+            ? `${selected.entity_type || selected.type} - score ${(displayScore(selected) || 0).toFixed(2)} - ${selected.description || ''}`
+            : `${selected.sourceTitle || selected.source_id} -> ${selected.targetTitle || selected.target_id}${selected.description ? ` - ${selected.description}` : ''}`}</p>
           {selected.recall_components && (
             <div className="detail-scores" style={{ display: 'flex', gap: 10, fontSize: '0.78rem', color: 'var(--muted)', marginTop: 4 }}>
               <span>PR {selected.recall_components.pagerank?.toFixed(2)}</span>
@@ -184,7 +201,7 @@ function zoom(e, stRef, toSvgPt, applyVp) {
 
 // ---- Rendering ----
 
-function fullRender(svg, laidOut, edges, w, h) {
+function fullRender(svg, laidOut, edges, w, h, onSelect, showEdgeLabels) {
   const nodeMap = new Map(laidOut.map(n => [n.id, n]))
   const offsets = edgeCurveOffsets(edges)
   const validEdges = edges.filter(e => nodeMap.has(e.source_id) && nodeMap.has(e.target_id))
@@ -200,14 +217,14 @@ function fullRender(svg, laidOut, edges, w, h) {
     const s = nodeMap.get(e.source_id), t = nodeMap.get(e.target_id)
     const off = offsets.get(e.id) || 0; const geo = edgeGeometry(s, t, off)
     const g = mk('g', { class: 'edge', 'data-id': e.id, 'data-source-id': e.source_id, 'data-target-id': e.target_id, 'data-curve-offset': String(off) })
-    g.append(
-      mk('path', { class: 'edge-line', d: geo.path, fill: 'none', 'stroke-width': String(1.1 + e.weight * 2.3) }),
-      txt('text', { class: 'edge-label', x: String(geo.labelX), y: String(geo.labelY), 'text-anchor': 'middle' }, e.edge_type || '')
-    )
-    g.addEventListener('click', () => {
-      // use a custom event or direct callback
+    g.append(mk('path', { class: 'edge-line', d: geo.path, fill: 'none', 'stroke-width': String(1.1 + e.weight * 2.3) }))
+    if (showEdgeLabels) {
+      g.append(txt('text', { class: 'edge-label', x: String(geo.labelX), y: String(geo.labelY), 'text-anchor': 'middle' }, e.edge_type || ''))
+    }
+    g.addEventListener('click', (event) => {
+      event.stopPropagation()
       const detail = { kind: 'edge', ...e, sourceTitle: s.title, targetTitle: t.title }
-      window.__graphSelect?.(detail)
+      onSelect(detail)
     })
     elL.append(g)
   }

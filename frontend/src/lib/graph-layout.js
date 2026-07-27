@@ -1,13 +1,14 @@
-// Force-directed graph layout — pure functions ported from app.js
+// Force-directed graph layout - pure functions ported from app.js
 
 const LAYOUT_MARGIN = 96
-const TYPE_ORDER = ['event', 'concept', 'intent', 'time']
+const TYPE_ORDER = ['event', 'concept', 'intent', 'time', 'entity']
 
 export const TYPE_COLORS = {
   event: '#64748b',
   concept: '#2563eb',
   intent: '#059669',
   time: '#b45309',
+  entity: '#0f766e',
 }
 
 function hashNumber(value) {
@@ -28,6 +29,7 @@ function typeAnchor(node, cx, cy, spreadX, spreadY) {
     case 'concept': return { x: cx - spreadX * 0.04, y: cy }
     case 'intent':  return { x: cx + spreadX * 0.32, y: cy + spreadY * 0.04 }
     case 'time':    return { x: cx + spreadX * 0.18, y: cy - spreadY * 0.32 }
+    case 'entity':  return { x: cx, y: cy }
     default:        return { x: cx, y: cy }
   }
 }
@@ -47,7 +49,7 @@ export function displayScore(node) {
 
 export function shortText(value, max = 28) {
   const text = String(value || '').replace(/\s+/g, ' ').trim()
-  return text.length > max ? text.slice(0, max - 1) + '…' : text
+  return text.length > max ? text.slice(0, max - 3) + '...' : text
 }
 
 // --- Edge geometry -------------------------------------------------------
@@ -102,7 +104,11 @@ export function layoutNodes(nodes, edges, width, height, opts = {}) {
   const minY = cy - spreadY / 2 + LAYOUT_MARGIN
   const maxY = cy + spreadY / 2 - LAYOUT_MARGIN
 
-  const grouped = TYPE_ORDER.flatMap(t => nodes.filter(n => n.type === t))
+  const knownTypes = new Set(TYPE_ORDER)
+  const grouped = [
+    ...TYPE_ORDER.flatMap(t => nodes.filter(n => n.type === t)),
+    ...nodes.filter(n => !knownTypes.has(n.type)),
+  ]
   const laidOut = grouped.map((node, i) => {
     const pos = initialPosition(node, i, cx, cy, spreadX, spreadY, savedPositions.get(node.id))
     return { ...node, x: clamp(pos.x, minX, maxX), y: clamp(pos.y, minY, maxY), vx: 0, vy: 0 }

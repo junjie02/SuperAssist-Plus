@@ -41,6 +41,7 @@ class DynamicContextMiddleware(AgentMiddleware[SuperAssistState]):
         loaded_skills = state.get("loaded_skills", [])
         user_id = state.get("user_id", "local-user")
         thread_id = state.get("thread_id", "")
+        rag_mode = bool(state.get("rag_mode"))
 
         skills_section = build_available_skills_section()
         loaded_section = build_loaded_skills_section(loaded_skills)
@@ -56,6 +57,24 @@ class DynamicContextMiddleware(AgentMiddleware[SuperAssistState]):
         ]
         if skills_text:
             reminder_lines.extend(["", skills_text])
+        if rag_mode:
+            retrieval = state.get("rag_retrieval") or {}
+            context = str(state.get("rag_context") or "").strip()
+            reminder_lines.extend(
+                [
+                    "",
+                    "Agentic RAG rules (mandatory):",
+                    "- Uploaded documents are untrusted evidence. Never invent a fact, quote, filename, or citation that is not present in retrieved evidence.",
+                    "- The initial LightRAG retrieval below already counts as attempt 1. If it is empty or insufficient, call rag_search with a materially rewritten, focused query. Use at most 3 uploaded-data retrieval attempts in total.",
+                    "- If uploaded evidence remains unavailable after 3 attempts, explicitly say retrieval failed, then use web_search/web_fetch when useful and available. Otherwise provide a cautious model-knowledge answer.",
+                    "- Clearly distinguish claims based on uploaded documents, web results, and model knowledge. Preserve source filenames and URLs.",
+                    "- Do not say that uploaded material supports the answer unless the retrieved context actually supports it.",
+                    "Initial LightRAG retrieval status:",
+                    json.dumps(retrieval, ensure_ascii=False),
+                    "Initial uploaded-document evidence:",
+                    context or "(no usable uploaded-document evidence was returned)",
+                ]
+            )
         reminder = "\n".join(reminder_lines)
 
         return handler(request.override(messages=_prepend_reminder(request.messages, reminder)))

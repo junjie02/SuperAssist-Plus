@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { api } from '../lib/api'
+import { TURN_COMPLETED_EVENT } from '../lib/events'
 import GraphCanvas from '../components/GraphCanvas'
 
 export default function GraphPage() {
@@ -9,10 +10,18 @@ export default function GraphPage() {
   const [filter, setFilter] = useState('all')
 
   const load = useCallback(() => {
-    api.get('/graph').then(setData).catch(e => setError(e.message))
+    api.get('/graph')
+      .then(result => { setData(result); setError('') })
+      .catch(e => setError(e.message))
   }, [])
 
   useEffect(() => { load() }, [load])
+
+  useEffect(() => {
+    const refreshAfterTurn = () => load()
+    window.addEventListener(TURN_COMPLETED_EVENT, refreshAfterTurn)
+    return () => window.removeEventListener(TURN_COMPLETED_EVENT, refreshAfterTurn)
+  }, [load])
 
   if (error) return <div className="graph-page"><p className="error">Failed to load graph: {error}</p></div>
   if (!data) return <div className="graph-page"><p>Loading graph...</p></div>

@@ -21,6 +21,7 @@ var upgrader = websocket.Upgrader{
 type ChatMessage struct {
 	Message  string `json:"message"`
 	ThreadID string `json:"thread_id,omitempty"`
+	RAGMode  bool   `json:"rag_mode"`
 }
 
 // ChatHandler manages WebSocket chat connections.
@@ -78,7 +79,7 @@ func (h *ChatHandler) Handle(c *gin.Context) {
 		}
 
 		// Call Python AI engine
-		resp, err := h.client.Chat(userID, msg.ThreadID, msg.Message)
+		resp, err := h.client.Chat(userID, msg.ThreadID, msg.Message, msg.RAGMode)
 		if err != nil {
 			log.Printf("ws: python error: %v", err)
 			conn.WriteJSON(map[string]any{

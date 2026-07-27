@@ -1,0 +1,23 @@
+[project]
+name = "rag-eval"
+version = "0.1.0"
+description = "Reproducible Vector RAG vs LightRAG evaluation over SuperAssist uploads"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26.0",
+]
+
+[project.scripts]
+rag-eval-generate = "rag_eval.generate_questions:main"
+rag-eval-run = "rag_eval.evaluate:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

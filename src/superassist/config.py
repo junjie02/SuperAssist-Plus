@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     embedding_provider: str = Field(default="bge", alias="SUPERASSIST_EMBEDDING_PROVIDER")
     embedding_model: str = Field(default="BAAI/bge-base-zh-v1.5", alias="SUPERASSIST_EMBEDDING_MODEL")
     embedding_device: str = Field(default="cpu", alias="SUPERASSIST_EMBEDDING_DEVICE")
+    rag_max_file_size_mb: int = Field(default=25, alias="SUPERASSIST_RAG_MAX_FILE_SIZE_MB")
+    rag_max_files_per_batch: int = Field(default=20, alias="SUPERASSIST_RAG_MAX_FILES_PER_BATCH")
+    rag_max_attempts: int = Field(default=3, alias="SUPERASSIST_RAG_MAX_ATTEMPTS")
+    rag_top_k: int = Field(default=20, alias="SUPERASSIST_RAG_TOP_K")
+    rag_chunk_top_k: int = Field(default=10, alias="SUPERASSIST_RAG_CHUNK_TOP_K")
+    rag_context_max_chars: int = Field(default=24000, alias="SUPERASSIST_RAG_CONTEXT_MAX_CHARS")
     feishu_app_id: str = Field(default="", alias="SUPERASSIST_FEISHU_APP_ID")
     feishu_app_secret: str = Field(default="", alias="SUPERASSIST_FEISHU_APP_SECRET")
     feishu_domain: str = Field(default="https://open.feishu.cn", alias="SUPERASSIST_FEISHU_DOMAIN")
@@ -89,6 +95,10 @@ class Settings(BaseSettings):
     @property
     def faiss_dir(self) -> Path:
         return self.data_dir / "faiss"
+
+    @property
+    def rag_dir(self) -> Path:
+        return self.data_dir / "rag"
 
     @property
     def feishu_allowed_open_id_set(self) -> set[str]:

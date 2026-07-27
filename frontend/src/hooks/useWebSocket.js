@@ -51,11 +51,11 @@ export default function useWebSocket() {
     wsRef.current = ws
   }, [])
 
-  const send = useCallback((message, threadId = null) => {
+  const send = useCallback((message, threadId = null, ragMode = false) => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
       return false
     }
-    wsRef.current.send(JSON.stringify({ message, thread_id: threadId }))
+    wsRef.current.send(JSON.stringify({ message, thread_id: threadId, rag_mode: ragMode }))
     return true
   }, [])
 

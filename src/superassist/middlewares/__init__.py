@@ -10,6 +10,9 @@ from superassist.middlewares.dynamic_context_middleware import DynamicContextMid
 from superassist.middlewares.final_text_middleware import FinalTextMiddleware
 from superassist.middlewares.memory_recall_middleware import MemoryRecallMiddleware
 from superassist.middlewares.memory_writer_middleware import MemoryWriterMiddleware
+from superassist.middlewares.rag_attribution_middleware import RagAttributionMiddleware
+from superassist.middlewares.rag_retrieval_middleware import RagRetrievalMiddleware
+from superassist.middlewares.rag_retry_middleware import RagRetryMiddleware
 from superassist.middlewares.short_memory_middleware import ShortMemoryMiddleware
 from superassist.middlewares.subagent_limit_middleware import SubagentLimitMiddleware
 from superassist.middlewares.tool_call_limit_middleware import ToolCallLimitMiddleware
@@ -21,6 +24,9 @@ __all__ = [
     "FinalTextMiddleware",
     "MemoryRecallMiddleware",
     "MemoryWriterMiddleware",
+    "RagAttributionMiddleware",
+    "RagRetrievalMiddleware",
+    "RagRetryMiddleware",
     "ShortMemoryMiddleware",
     "SubagentLimitMiddleware",
     "ToolCallLimitMiddleware",

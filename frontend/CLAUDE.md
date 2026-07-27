@@ -1,56 +1,75 @@
 # Frontend Technical Documentation
 
-IMPORTANT: Any change to the memory graph viewer UI, its data contract, visual
-layout, interaction behavior, or local serving assumptions must update this
-document.
+IMPORTANT: Any change to the frontend data contracts, visual layout,
+interaction behavior, or local serving assumptions must update this document.
 
 ## Purpose
 
-The `frontend` directory contains the static memory graph viewer for
-SuperAssist-Plus. It visualizes the SQLite-backed long-term memory graph as
-nodes and typed edges, with a right-side scrolling activity panel showing recent
-node and edge updates.
-
-## Files
-
-- `index.html`: application shell and semantic regions.
-- `styles.css`: visual system, responsive layout, graph styling, and update
-  panel styling.
-- `app.js`: API loading, graph layout, SVG rendering, selection behavior,
-  filtering, graph pan/zoom/node dragging, and update feed rendering.
+The `frontend` directory contains the React application for SuperAssist. It
+provides authenticated chat, memory graph inspection, per-user LightRAG
+document management, and runtime settings for memory and Feishu integration.
 
 ## Runtime
 
-The frontend is served by the FastAPI app in `superassist_plus.ui.server`
-through the `superassist-plus-memory-ui` command. It expects the local API endpoint
-`/api/graph?user_id=<id>` to return:
+- Vite serves the application during development and proxies `/api` and `/ws`
+  to the Go server on `127.0.0.1:8080`.
+- Production assets are built into `frontend/dist` and served by the Go server.
+- The Go server owns authentication and proxies AI operations to the Python
+  engine. Browser code never accesses `.env` or the Python internal API.
+- Icons come from the locally bundled `lucide-react` dependency; no frontend
+  assets are loaded from a CDN.
 
-- `nodes`: memory nodes with id, type, title, description, importance, metadata,
-  and timestamps.
-- Active read-recall nodes also include `active_recall`, `recall_tier`,
-  `recall_score`, `recall_components`, and `recall_updated_at`. The graph uses
-  `recall_score` as the displayed node score for highlighted nodes.
-- `edges`: typed memory edges with source, target, weight, metadata, and
-  timestamps.
-- `updates`: recent node/edge updates sorted newest-first.
-- `stats`: aggregate counts for the current user graph.
+## Main Files
+
+- `src/layouts/MainLayout.jsx`: persistent navigation and page switching.
+- `src/pages/ChatPage.jsx`: streamed chat and thread history.
+- `src/pages/GraphPage.jsx`: graph/list memory views.
+- `src/pages/SettingsPage.jsx`: memory and Feishu settings editor.
+- `src/pages/KnowledgePage.jsx`: batch upload and LightRAG indexing status.
+- `src/components/GraphCanvas.jsx`: interactive graph rendering.
+- `src/lib/api.js`: authenticated JSON API client.
+- `src/App.css`: shared visual system and responsive layouts.
+
+## API Contracts
+
+`GET /api/graph` returns `nodes`, `edges`, `updates`, and aggregate `stats`.
+Active recall nodes also expose `active_recall`, `recall_tier`, `recall_score`,
+`recall_components`, and `recall_updated_at`.
+
+`GET /api/settings` returns:
+
+- `memory`: all editable long-memory and short-memory values.
+- `feishu`: App ID, domain, allowed Open IDs, mention-only mode, and
+  `app_secret_configured`. The App Secret itself is never returned.
+- `meta`: runtime application status.
+
+`PUT /api/settings` accepts the `memory` and `feishu` groups. Omitting
+`feishu.app_secret` preserves the current secret; an empty string clears it.
+The Python engine validates related numeric values, writes the corresponding
+`SUPERASSIST_*` keys to the project `.env`, and applies memory changes to new
+requests. Feishu connection changes require the Feishu channel to restart.
+
+`GET /api/rag/documents` returns the authenticated user's documents, supported
+extensions, and upload limits. `POST /api/rag/documents` accepts multipart
+`files` and returns queued documents; `DELETE /api/rag/documents/:id` starts an
+asynchronous index deletion. The page polls while any item is queued, parsing,
+indexing, or deleting.
+
+WebSocket chat messages include `rag_mode: boolean`. In RAG mode the Python
+agent performs LightRAG retrieval, may rewrite and retry queries up to the
+configured limit, and appends explicit uploaded/web/model provenance.
 
 ## Design Notes
 
-- Keep the UI dense and operational rather than marketing-oriented.
-- Use restrained color, clear hierarchy, and stable graph dimensions.
-- The graph canvas supports pointer-drag panning, wheel zooming, and direct node
-  dragging. Layout uses a deterministic force-directed pass over the visible
-  graph: typed anchors spread event/concept/intent/time nodes into readable
-  regions, edges act as springs, and node repulsion reduces overlap. Node
-  positions are kept in browser state across graph rerenders and filters until
-  the page is reloaded; manually dragged nodes are pinned for the session.
-- Graph edges are rendered as lightly curved paths. Selecting a node highlights
-  its connected edges so dense neighborhoods remain inspectable.
-- Nodes selected for the latest main-agent read recall are highlighted. Their
-  circle size and detail panel score use the latest dynamic `Score(v)`, while
-  non-highlighted nodes continue to show static `importance`.
-- Avoid frontend build tooling unless the UI becomes complex enough to justify
-  it.
-- Do not introduce network-loaded assets; the viewer should work offline once
-  the Python server is running.
+- Keep the interface dense and operational, with stable control dimensions.
+- Chat remains mounted while users inspect graph, knowledge, or settings so its in-memory
+  state is preserved during navigation.
+- The chat composer grows with wrapped or explicit new lines up to five text
+  lines, then keeps a stable height and enables vertical scrolling.
+- A completed chat turn refreshes the conversation list and dispatches the
+  `superassist:turn-completed` browser event. The mounted graph page listens for
+  that event and reloads the shared Graph/List payload after memory is flushed.
+- On narrow screens the sidebar becomes a compact icon navigation bar and the
+  settings form changes from two columns to one.
+- Graph node positions remain in browser state across rerenders and filters;
+  manually dragged nodes are pinned for the session.

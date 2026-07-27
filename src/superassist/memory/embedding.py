@@ -21,6 +21,9 @@ class Embedder(Protocol):
     def preload(self) -> None:
         ...
 
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        ...
+
 
 def tokenize(text: str) -> list[str]:
     return [token.casefold() for token in TOKEN_RE.findall(text or "")]
@@ -43,6 +46,9 @@ class HashEmbedder:
 
     def preload(self) -> None:
         return None
+
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        return [self.embed(text) for text in texts]
 
 
 class BGEEmbedder:
@@ -72,12 +78,15 @@ class BGEEmbedder:
         _ = self.model
 
     def embed(self, text: str) -> list[float]:
-        vector = self.model.encode(
-            [text or ""],
+        return self.embed_many([text])[0]
+
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        vectors = self.model.encode(
+            [text or "" for text in texts],
             normalize_embeddings=True,
             show_progress_bar=False,
-        )[0]
-        return [float(value) for value in vector.tolist()]
+        )
+        return [[float(value) for value in vector.tolist()] for vector in vectors]
 
 
 def normalize(vector: list[float]) -> list[float]:

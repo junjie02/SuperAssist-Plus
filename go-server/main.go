@@ -6,8 +6,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/glebarez/sqlite"
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 
@@ -39,6 +39,8 @@ func main() {
 	// ---- Handlers ----------------------------------------------------------
 	authH := handler.NewAuthHandler(authSvc)
 	graphH := handler.NewGraphHandler(pythonClient)
+	settingsH := handler.NewSettingsHandler(pythonClient)
+	ragH := handler.NewRAGHandler(pythonClient)
 	threadH := handler.NewThreadHandler(db, cfg.DataDir)
 	chatH := ws.NewChatHandler(pythonClient, cfg.JWTSecret)
 
@@ -62,6 +64,12 @@ func main() {
 		api.GET("/threads/:id/history", threadH.GetHistory)
 		api.DELETE("/threads/:id", threadH.DeleteThread)
 		api.GET("/graph", graphH.Get)
+		api.GET("/settings", settingsH.Get)
+		api.PUT("/settings", settingsH.Update)
+		api.GET("/rag/documents", ragH.List)
+		api.GET("/rag/graph", ragH.Graph)
+		api.POST("/rag/documents", ragH.Upload)
+		api.DELETE("/rag/documents/:id", ragH.Delete)
 	}
 
 	// WebSocket (auth via query param)

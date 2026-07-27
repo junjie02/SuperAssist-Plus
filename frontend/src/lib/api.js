@@ -17,13 +17,14 @@ export function clearToken() {
 }
 
 async function request(method, path, body) {
-  const headers = { 'Content-Type': 'application/json' }
+  const isFormData = body instanceof FormData
+  const headers = isFormData ? {} : { 'Content-Type': 'application/json' }
   if (token) headers['Authorization'] = `Bearer ${token}`
 
   const res = await fetch(`${BASE}${path}`, {
     method,
     headers,
-    body: body ? JSON.stringify(body) : undefined,
+    body: body ? (isFormData ? body : JSON.stringify(body)) : undefined,
   })
 
   if (res.status === 401) {
@@ -32,17 +33,35 @@ async function request(method, path, body) {
     return
   }
 
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    throw new Error(err.detail || `HTTP ${res.status}`)
+  const contentType = res.headers.get('content-type') || ''
+  const responseText = await res.text()
+  let data = {}
+  if (responseText) {
+    if (!contentType.includes('application/json')) {
+      throw new Error(`Unexpected non-JSON response from server (HTTP ${res.status}).`)
+    }
+    try {
+      data = JSON.parse(responseText)
+    } catch {
+      throw new Error(`Invalid JSON response from server (HTTP ${res.status}).`)
+    }
   }
 
-  return res.json()
+  if (!res.ok) {
+    const err = data
+    const detail = Array.isArray(err.detail)
+      ? err.detail.map(item => item.msg || item.error || String(item)).join('; ')
+      : err.detail
+    throw new Error(detail || `HTTP ${res.status}`)
+  }
+
+  return data
 }
 
 export const api = {
   get: (path) => request('GET', path),
   post: (path, body) => request('POST', path, body),
+  put: (path, body) => request('PUT', path, body),
   del: (path) => request('DELETE', path),
 }
 

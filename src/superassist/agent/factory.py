@@ -38,6 +38,9 @@ from superassist.middlewares import (
     FinalTextMiddleware,
     MemoryRecallMiddleware,
     MemoryWriterMiddleware,
+    RagAttributionMiddleware,
+    RagRetrievalMiddleware,
+    RagRetryMiddleware,
     ShortMemoryMiddleware,
     SubagentLimitMiddleware,
     ToolCallLimitMiddleware,
@@ -45,6 +48,8 @@ from superassist.middlewares import (
     ToolEventMiddleware,
 )
 from superassist.models import AgentRunEvent
+from superassist.rag.service import LightRAGService
+from superassist.rag.tools import rag_search
 from superassist.teams import AgentTeamConfig, TeamSupervisor, set_team_supervisor
 from superassist.teams.config import AgentTeamConfigError
 from superassist.tools import default_tools
@@ -63,6 +68,7 @@ class AgentBundle:
         memory_queue: MemoryWriteQueue,
         team_supervisor: TeamSupervisor | None,
         team_config_error: str | None,
+        rag_service: LightRAGService | None,
     ) -> None:
         self.agent = agent
         self.settings = settings
@@ -71,6 +77,7 @@ class AgentBundle:
         self.memory_queue = memory_queue
         self.team_supervisor = team_supervisor
         self.team_config_error = team_config_error
+        self.rag_service = rag_service
 
 
 def build_agent(
@@ -78,6 +85,8 @@ def build_agent(
     *,
     tool_event_reporter: Callable[[dict[str, Any]], None] | None = None,
     run_event_reporter: Callable[[AgentRunEvent], None] | None = None,
+    rag_mode: bool = False,
+    rag_service: LightRAGService | None = None,
 ) -> AgentBundle:
     settings = settings or get_settings()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -102,6 +111,11 @@ def build_agent(
         if settings.enable_tools
         else []
     )
+    if rag_mode:
+        from superassist.tools.web import web_fetch, web_search
+
+        by_name = {tool.name: tool for tool in [*tools, rag_search, web_search, web_fetch]}
+        tools = list(by_name.values())
 
     middlewares = _build_middleware_chain(
         settings,
@@ -109,6 +123,7 @@ def build_agent(
         memory_queue=memory_queue,
         model=model,
         tool_event_reporter=tool_event_reporter,
+        rag_mode=rag_mode,
     )
 
     if settings.enable_tools:
@@ -135,6 +150,7 @@ def build_agent(
         memory_queue=memory_queue,
         team_supervisor=team_supervisor,
         team_config_error=team_config_error,
+        rag_service=rag_service,
     )
 
 
@@ -145,15 +161,23 @@ def _build_middleware_chain(
     memory_queue: MemoryWriteQueue,
     model: BaseChatModel,
     tool_event_reporter: Callable[[dict[str, Any]], None] | None,
+    rag_mode: bool,
 ) -> list[AgentMiddleware]:
     chain: list[AgentMiddleware] = [
         ToolErrorMiddleware(),
         ToolCallLimitMiddleware(settings.max_tool_calls),
         MemoryRecallMiddleware(memory),
-        DynamicContextMiddleware(),
-        ShortMemoryMiddleware(settings, model),
-        ToolEventMiddleware(tool_event_reporter),
     ]
+    if rag_mode:
+        chain.append(RagRetrievalMiddleware())
+        chain.append(RagRetryMiddleware())
+    chain.extend(
+        [
+            DynamicContextMiddleware(),
+            ShortMemoryMiddleware(settings, model),
+            ToolEventMiddleware(tool_event_reporter),
+        ]
+    )
     if settings.subagents_enabled:
         chain.append(SubagentLimitMiddleware(settings.subagent_max_concurrent))
     chain.extend(
@@ -162,6 +186,8 @@ def _build_middleware_chain(
             FinalTextMiddleware(),
         ]
     )
+    if rag_mode:
+        chain.append(RagAttributionMiddleware())
     return chain
 
 

@@ -5,6 +5,8 @@ import asyncio
 import json
 import logging
 import threading
+from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import uvicorn
@@ -17,7 +19,10 @@ from superassist.agent.runtime import AgentRuntime
 from superassist.config import PROJECT_ROOT, Settings, get_settings
 from superassist.memory.service import MemoryService
 from superassist.models import AgentRunEvent, AgentRunResult, MemoryEdge, MemoryNode, NodeType
+from superassist.rag.service import LightRAGService
 from superassist.subagents import TASK_STORE
+from superassist.ui.rag import register_rag_routes
+from superassist.ui.settings import register_settings_routes
 
 logger = logging.getLogger(__name__)
 FRONTEND_DIR = PROJECT_ROOT / "frontend"
@@ -41,6 +46,7 @@ class ChatRequest(BaseModel):
     user_id: str
     message: str
     thread_id: str | None = None
+    rag_mode: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +54,11 @@ class ChatRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-async def _sse_chat_stream(request: ChatRequest, settings: Settings) -> StreamingResponse:
+async def _sse_chat_stream(
+    request: ChatRequest,
+    settings: Settings,
+    rag_service: LightRAGService | None = None,
+) -> StreamingResponse:
     """Handle POST /internal/chat — return a truly-streaming SSE response.
 
     Events are pushed through an ``asyncio.Queue`` so that the browser sees
@@ -80,6 +90,8 @@ async def _sse_chat_stream(request: ChatRequest, settings: Settings) -> Streamin
             settings=resolved,
             tool_event_reporter=tool_reporter,
             run_event_reporter=run_reporter,
+            rag_mode=request.rag_mode,
+            rag_service=rag_service,
         )
 
         # ---- run the agent in a background thread so we can stream ----
@@ -171,13 +183,14 @@ def create_app(settings: Settings | None = None, default_user_id: str = "local-u
 # ---------------------------------------------------------------------------
 
 
-def create_ai_engine_app(settings: Settings | None = None) -> FastAPI:
+def create_ai_engine_app(settings: Settings | None = None, settings_env_path: Path | None = None) -> FastAPI:
     """Create the AI-engine FastAPI app.
 
     This app exposes internal endpoints consumed by the Go web server.
     It listens on ``127.0.0.1`` only — never public-facing.
     """
     resolved = settings or get_settings()
+    resolved_env_path = settings_env_path or PROJECT_ROOT / ".env"
     service = _build_memory_service(resolved)
 
     # Preload the embedding model at startup so the first chat request
@@ -185,8 +198,16 @@ def create_ai_engine_app(settings: Settings | None = None) -> FastAPI:
     logger.info("Preloading embedding model (%s)...", resolved.embedding_model)
     service.preload_embedder()
     logger.info("Embedding model ready.")
+    rag_service = LightRAGService(resolved)
 
-    app = FastAPI(title="SuperAssist AI Engine", version="0.1.0")
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        try:
+            yield
+        finally:
+            rag_service.close()
+
+    app = FastAPI(title="SuperAssist AI Engine", version="0.1.0", lifespan=lifespan)
 
     # -- Health ----------------------------------------------------------
 
@@ -194,11 +215,16 @@ def create_ai_engine_app(settings: Settings | None = None) -> FastAPI:
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    # -- Runtime settings ------------------------------------------------
+
+    register_settings_routes(app, resolved, resolved_env_path)
+    register_rag_routes(app, rag_service, resolved)
+
     # -- Chat (SSE streaming) --------------------------------------------
 
     @app.post("/internal/chat")
     async def internal_chat(request: ChatRequest) -> StreamingResponse:
-        return await _sse_chat_stream(request, resolved)
+        return await _sse_chat_stream(request, resolved, rag_service)
 
     # -- Memory graph (proxied by Go) ------------------------------------
 
