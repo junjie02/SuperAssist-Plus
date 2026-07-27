@@ -1,75 +1,107 @@
 # Frontend Technical Documentation
 
-IMPORTANT: Any change to the frontend data contracts, visual layout,
-interaction behavior, or local serving assumptions must update this document.
+Update this document whenever frontend routes, API contracts, refresh events, chat streaming, graph behavior, responsive layout, or serving assumptions change.
 
-## Purpose
+## Purpose And Runtime
 
-The `frontend` directory contains the React application for SuperAssist. It
-provides authenticated chat, memory graph inspection, per-user LightRAG
-document management, and runtime settings for memory and Feishu integration.
+`frontend/` is the authenticated React 18 + Vite application for SuperAssist. It provides Chat, Memory Graph, Knowledge, and Settings views.
 
-## Runtime
+- Development: Vite serves `http://localhost:5173` and proxies `/api` plus `/ws` to Go at `127.0.0.1:8080`.
+- Production: `npm run build` writes `frontend/dist`; Go serves those assets and handles SPA fallback.
+- Trust boundary: browser code only calls Go. It never reads `.env`, the SQLite database, local RAG files, or Python `/internal/*` routes.
+- Icons come from the bundled `lucide-react` package. Do not add CDN dependencies.
 
-- Vite serves the application during development and proxies `/api` and `/ws`
-  to the Go server on `127.0.0.1:8080`.
-- Production assets are built into `frontend/dist` and served by the Go server.
-- The Go server owns authentication and proxies AI operations to the Python
-  engine. Browser code never accesses `.env` or the Python internal API.
-- Icons come from the locally bundled `lucide-react` dependency; no frontend
-  assets are loaded from a CDN.
+Commands:
+
+```powershell
+npm install
+npm run dev
+npm run build
+```
+
+## Navigation And Lifetime
+
+[src/layouts/MainLayout.jsx](src/layouts/MainLayout.jsx) owns persistent navigation:
+
+| Path | View | Lifetime |
+| --- | --- | --- |
+| `/` | Chat | Always mounted after login; hidden with CSS on other pages |
+| `/graph` | Memory Graph | Always mounted; reloads on turn-completed events |
+| `/knowledge` | Uploaded documents and LightRAG graph | Mounted while selected |
+| `/settings` | Memory and Feishu configuration | Mounted while selected |
+| `/login` | Login/register | Public route |
+
+Keeping Chat mounted is intentional: WebSocket, selected thread, draft state, and conversation history must survive navigation.
 
 ## Main Files
 
-- `src/layouts/MainLayout.jsx`: persistent navigation and page switching.
-- `src/pages/ChatPage.jsx`: streamed chat and thread history.
-- `src/pages/GraphPage.jsx`: graph/list memory views.
-- `src/pages/SettingsPage.jsx`: memory and Feishu settings editor.
-- `src/pages/KnowledgePage.jsx`: batch upload and LightRAG indexing status.
-- `src/components/GraphCanvas.jsx`: interactive graph rendering.
-- `src/lib/api.js`: authenticated JSON API client.
-- `src/App.css`: shared visual system and responsive layouts.
+- `src/pages/ChatPage.jsx`: thread list, history, streaming chat, RAG toggle, and autosizing composer.
+- `src/pages/GraphPage.jsx`: CogniFold memory graph/list modes and refresh behavior.
+- `src/pages/KnowledgePage.jsx`: multipart upload, document state polling, deletion, and LightRAG graph.
+- `src/pages/SettingsPage.jsx`: validated Memory and Feishu settings editor.
+- `src/components/GraphCanvas.jsx`: shared canvas renderer for both graph domains.
+- `src/hooks/useAuth.jsx`: token and authenticated-user lifecycle.
+- `src/hooks/useWebSocket.js`: reconnectable chat transport.
+- `src/lib/api.js`: authenticated JSON/multipart API client.
+- `src/lib/events.js`: cross-view event names.
+- `src/lib/graph-layout.js`: stable force-layout helpers.
+- `src/App.css`: design tokens, page layout, controls, and responsive rules.
 
-## API Contracts
+## Public Go API Contracts
 
-`GET /api/graph` returns `nodes`, `edges`, `updates`, and aggregate `stats`.
-Active recall nodes also expose `active_recall`, `recall_tier`, `recall_score`,
-`recall_components`, and `recall_updated_at`.
+All protected HTTP calls use `Authorization: Bearer <token>`. The WebSocket sends the token as a query parameter because browser WebSocket construction cannot set an Authorization header.
 
-`GET /api/settings` returns:
+### Chat And Threads
 
-- `memory`: all editable long-memory and short-memory values.
-- `feishu`: App ID, domain, allowed Open IDs, mention-only mode, and
-  `app_secret_configured`. The App Secret itself is never returned.
-- `meta`: runtime application status.
+- `GET /api/threads`: conversation list derived from persisted thread files.
+- `GET /api/threads/:id/history`: stored conversation records.
+- `DELETE /api/threads/:id`: deletes the selected thread.
+- `GET /ws/chat?token=...`: WebSocket chat transport.
 
-`PUT /api/settings` accepts the `memory` and `feishu` groups. Omitting
-`feishu.app_secret` preserves the current secret; an empty string clears it.
-The Python engine validates related numeric values, writes the corresponding
-`SUPERASSIST_*` keys to the project `.env`, and applies memory changes to new
-requests. Feishu connection changes require the Feishu channel to restart.
+Outgoing chat messages include `message`, optional `thread_id`, and `rag_mode: boolean`. Incoming events may include `preparing_context`, `thinking`, `agent_text`, tool/subagent events, `done`, or `error`.
 
-`GET /api/rag/documents` returns the authenticated user's documents, supported
-extensions, and upload limits. `POST /api/rag/documents` accepts multipart
-`files` and returns queued documents; `DELETE /api/rag/documents/:id` starts an
-asynchronous index deletion. The page polls while any item is queued, parsing,
-indexing, or deleting.
+The composer grows with explicit and wrapped lines through five visual lines, then keeps a stable maximum height and enables vertical scrolling. Reset its measured height after a message is sent or the input is cleared.
 
-WebSocket chat messages include `rag_mode: boolean`. In RAG mode the Python
-agent performs LightRAG retrieval, may rewrite and retry queries up to the
-configured limit, and appends explicit uploaded/web/model provenance.
+### Memory Graph
 
-## Design Notes
+`GET /api/graph` returns:
 
-- Keep the interface dense and operational, with stable control dimensions.
-- Chat remains mounted while users inspect graph, knowledge, or settings so its in-memory
-  state is preserved during navigation.
-- The chat composer grows with wrapped or explicit new lines up to five text
-  lines, then keeps a stable height and enables vertical scrolling.
-- A completed chat turn refreshes the conversation list and dispatches the
-  `superassist:turn-completed` browser event. The mounted graph page listens for
-  that event and reloads the shared Graph/List payload after memory is flushed.
-- On narrow screens the sidebar becomes a compact icon navigation bar and the
-  settings form changes from two columns to one.
-- Graph node positions remain in browser state across rerenders and filters;
-  manually dragged nodes are pinned for the session.
+```text
+nodes[]  id/type/title/description/importance/access_count/metadata/recall fields
+edges[]  source_id/target_id/edge_type/weight/metadata
+updates[]
+stats    nodes/edges/by_type
+```
+
+Active recall fields are `active_recall`, `recall_tier`, `recall_score`, `recall_components`, and `recall_updated_at`.
+
+### Knowledge
+
+- `GET /api/rag/documents`: per-user documents, supported extensions, and upload limits.
+- `POST /api/rag/documents`: multipart `files`; returns 202 with queued documents.
+- `DELETE /api/rag/documents/:id`: returns 202 and starts asynchronous deletion.
+- `GET /api/rag/graph`: current user's LightRAG nodes, edges, stats, and `updated_at`.
+
+Document states are `queued`, `parsing`, `indexing`, `ready`, `failed`, and `deleting`. Poll while any document is in a transient state. Do not infer LightRAG internal progress percentages from these states.
+
+### Settings
+
+`GET /api/settings` returns `memory`, `feishu`, and `meta`. The actual Feishu App Secret is never returned; only `app_secret_configured` is exposed.
+
+`PUT /api/settings` accepts both groups. Omitting `feishu.app_secret` preserves it, sending `""` clears it. The Python engine validates related numeric constraints and atomically updates the root `.env`. Memory values apply to newly created runtimes; Feishu connection changes set a restart-required flag.
+
+## Refresh And Error Semantics
+
+- A completed chat turn reloads the conversation list and dispatches `superassist:turn-completed`.
+- Memory Graph listens for that event and reloads graph/list data after the Python chat path flushes memory writes.
+- Knowledge polls documents while indexing/deleting and reloads the LightRAG graph after state changes.
+- `api.js` checks content type before JSON parsing. An HTML SPA/error response must surface as an HTTP/API error, not `Unexpected token '<'`.
+- A chat transport error must leave the current thread and composer usable for retry.
+
+## Graph And Responsive Invariants
+
+- Graph positions remain stable across rerenders and filters; dragged nodes are pinned for the browser session.
+- Canvas dimensions must be stable so labels, loading states, and controls do not resize the graph container.
+- Memory and knowledge graphs use the same renderer but different data semantics; never merge their node sets in frontend state.
+- Desktop navigation is a left sidebar. Narrow screens use compact icon navigation and one-column settings fields.
+- Labels and action controls must not overlap at supported mobile and desktop widths.

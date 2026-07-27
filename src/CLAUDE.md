@@ -20,7 +20,7 @@
 4. [`observability.py` / `run_events.py` — Trace 与运行事件总线](#4-observability--run_events)
 5. [`memory/` — CogniFold 类型图记忆](#5-memory)
 6. [`agent/` — runtime / factory / state / prompts / streaming / short_memory](#6-agent)
-7. [`middlewares/` — 9 条 middleware 的契约](#7-middlewares)
+7. [`middlewares/` — 9 条基础 middleware + 3 条 RAG middleware](#7-middlewares)
 8. [`subagents/` — in-process `task` 子智能体](#8-subagents)
 9. [`acp_client/` — ACP 协议客户端](#9-acp_client)
 10. [`teams/` — `team_task` 监督器与哈希链 ledger](#10-teams)
@@ -30,6 +30,7 @@
 14. [`ui/server.py` — FastAPI 记忆图查看器后端](#14-uiserverpy)
 15. [`cli.py` — `superassist` 命令入口](#15-clipy)
 16. [跨模块时序：一条用户消息从进入到落库](#16-cross-module-sequence)
+17. [`rag/` — LightRAG 文档知识库与 Agentic RAG](#17-rag)
 
 ---
 
@@ -42,7 +43,7 @@
 
 | 值 | 语义 | 写入主体 |
 | --- | --- | --- |
-| `event` | 一次用户/助手 turn 的原始事件节点 | 仅由 runtime（`MemoryService.prepare_turn_contexts`）写入；`AddNodeOp` 的 `_reject_event_creation` 校验器会拒绝 LLM writer 创建 event。 |
+| `event` | 一次用户/助手 turn 的原始事件节点 | runtime 预分配 ID，LLM/fallback Memory writer 通过 `ADD_NODE(ref="current_event")` 创建。 |
 | `concept` | 反复出现的稳定模式、用户偏好、复用上下文 | LLM writer / fallback writer |
 | `intent` | 未达成目标、待办、跟进项 | LLM writer |
 | `time` | 截止时间或时间锚点 | LLM writer；其 embedding 强制为 `None`（见 `_embed_for`）。 |
@@ -199,6 +200,17 @@
 | `embedding_model` | `BAAI/bge-base-zh-v1.5` | 仅 BGE 使用。 |
 | `embedding_device` | `cpu` | sentence-transformers `device` 参数。 |
 
+**LightRAG 知识库**
+
+| 字段 | 默认 | 备注 |
+| --- | --- | --- |
+| `rag_max_file_size_mb` | `25` | Python 单文件大小上限；Go 代理还会按批次数量计算请求体上限。 |
+| `rag_max_files_per_batch` | `20` | 单次 multipart 上传文件数上限。 |
+| `rag_max_attempts` | `3` | 一轮 Agentic RAG 中 `RagTurnSession` 允许的检索次数。 |
+| `rag_top_k` | `20` | LightRAG 实体/关系向量候选数。 |
+| `rag_chunk_top_k` | `10` | 原文 chunk 向量候选数。 |
+| `rag_context_max_chars` | `24000` | 结构化检索结果注入 Agent 前的字符硬上限。 |
+
 **飞书**
 
 | 字段 | 默认 | 备注 |
@@ -216,6 +228,7 @@
 | `resolved_tool_workspace_dir` | `tool_workspace_dir or data_dir / "workspace"` |
 | `huggingface_cache_dir` | `data_dir / "huggingface"` |
 | `faiss_dir` | `data_dir / "faiss"` |
+| `rag_dir` | `data_dir / "rag"` |
 | `feishu_thread_store_path` | `data_dir / "channels" / "feishu_threads.json"` |
 
 `PROJECT_ROOT` 同时被 [`teams/config.py`](superassist/teams/config.py) 用来定位 `agent_team.toml`、被 [`skills/registry.py`](superassist/skills/registry.py) 定位 `skills/`、被 [`tools/shell.py`](superassist/tools/shell.py) 限制 `cwd` 不可越界、被 [`ui/server.py`](superassist/ui/server.py) 定位 `frontend/`。
@@ -426,7 +439,7 @@ RunEventReporter = Callable[[AgentRunEvent], None]
 
 | op | 关键字段 | 拒绝条件 |
 | --- | --- | --- |
-| `ADD_NODE` | `node_type: NodeType`, `data: NodeData`, `grounded_in`, `reasoning` | `node_type == EVENT` 直接抛 ValueError。 |
+| `ADD_NODE` | `node_type: NodeType`, `data: NodeData`, `grounded_in`, `reasoning` | description 为空时 apply 阶段跳过；EVENT 允许且每轮 writer 应创建一个。 |
 | `ADD_EDGE` | `source_id`, `target_id`, `edge_type=RELATED_TO`, `weight?: float`, `reasoning` | source/target 解析为空时静默跳过。 |
 | `UPDATE_NODE` | `node_id`, `data`, `update_reasoning` | 节点不存在 → 跳过。 |
 | `REMOVE_NODE` | `node_id` | 节点不存在 → 跳过。 |
@@ -435,7 +448,7 @@ RunEventReporter = Callable[[AgentRunEvent], None]
 
 #### 5.5.3 兼容旧 schema
 
-`UpdatePlan.from_legacy({"nodes":[...], "edges":[...]})`：把旧的 `{nodes, edges}` 平铺结构翻译成 ADD_NODE/ADD_EDGE 操作；event 节点跳过（由 runtime 写）；如果旧 node 给了 `ref`，会自动追加一条 `current_event -GROUNDS-> ref` 的 ADD_EDGE。`UpdatePlan.parse(raw)` 优先用新 schema，缺失时回退 legacy。
+`UpdatePlan.from_legacy({"nodes":[...], "edges":[...]})`：把旧的 `{nodes, edges}` 平铺结构翻译成 ADD_NODE/ADD_EDGE 操作；EVENT 与其它节点都会转换。如果旧 node 给了 `ref`，会自动追加一条 `current_event -GROUNDS-> ref` 的 ADD_EDGE。`UpdatePlan.parse(raw)` 优先用新 schema，缺失时回退 legacy。
 
 ### 5.6 `operations.apply_plan`
 
@@ -493,9 +506,8 @@ RunEventReporter = Callable[[AgentRunEvent], None]
 5. `write_context = ranker.assemble_context(probe, limit=memory_top_k)` —— 喂给 memory writer。
 6. `replace_recall_snapshot(user_id, _recall_snapshot_items(read_context))` —— 仅写读路径桶到快照表。
 7. `touch_nodes(user_id, read+write 节点 IDs)` 提升 `access_count`。
-8. 创建本 turn 的 EVENT 节点，metadata `{thread_id, source: "user_turn"}`，title 自动截 80 字。
-9. `best_concept_match`：FAISS 检索最相似 concept；若 score ≥ `memory_reinforce_similarity`，加 `event -REINFORCES-> concept` 边，metadata 带 `similarity` 与 `mechanic="accumulation"`。
-10. 返回 `TurnMemoryContexts(event_id, read_recall, write_recall)`。
+8. `new_id("event")` 只预分配本 turn 的 EVENT ID，不立即写节点或边。
+9. 返回 `TurnMemoryContexts(event_id, read_recall, write_recall)`；后续 `MemoryWriter` 的 plan 负责创建真实 EVENT 及其 grounding。
 
 #### 5.7.3 巩固（`consolidate`）
 
@@ -515,9 +527,9 @@ RunEventReporter = Callable[[AgentRunEvent], None]
 
 - `write(payload)`: `_build_plan(payload)` → `apply_structured_memory(payload, plan)` → `consolidate(payload.user_id)`，结果合并返回。
 - `_build_plan`: 仅当 `llm_enabled=True` **且** `model._llm_type != "superassist-fallback"` 才走 LLM；任何异常回退 `_fallback_plan`。
-- `_fallback_plan`: 用户消息 < 12 字直接返回空 `UpdatePlan()`；否则用 legacy 形状造一条 concept "User discussed: ..."（前 500 字）。
+- `_fallback_plan`: 用户消息 < 12 字直接返回空 `UpdatePlan()`；否则用 legacy 形状创建一个 `current_event` EVENT（记录 user/assistant 摘要）和一个 concept `User discussed: ...`。
 - LLM prompt 见模块顶部的 `MEMORY_WRITER_PROMPT`，强约束：
-  - 输出纯 JSON，不要 event 节点（因为 runtime 已经写过）。
+  - 输出纯 JSON，并创建恰好一个 `ref="current_event"` 的 EVENT 概括本轮对话。
   - 边类型默认权重表与 §1.2 一致。
   - 8 条规则，覆盖"只存持久化偏好/目标/事实/概念/截止"、"不存秘密/瞬态工具输出/闲聊"、"相似已有上下文用 UPDATE/MERGE 而非新建"、"中文事件用中文 title/description"。
 
@@ -549,6 +561,10 @@ RunEventReporter = Callable[[AgentRunEvent], None]
 | `memory_event_id` | `NotRequired[str]` | `MemoryRecallMiddleware` | `MemoryWriterMiddleware` |
 | `memory_recall` | `NotRequired[dict]` | `MemoryRecallMiddleware` (read 桶) | `DynamicContextMiddleware` |
 | `memory_write_context` | `NotRequired[dict]` | `MemoryRecallMiddleware` (write 桶) | `MemoryWriterMiddleware` |
+| `rag_mode` | `NotRequired[bool]` | `AgentRuntime._initial_state` | 三条 RAG middleware 与动态提示 |
+| `rag_context` | `NotRequired[str]` | `RagRetrievalMiddleware` / `RagRetryMiddleware` | `DynamicContextMiddleware` |
+| `rag_sources` | `NotRequired[list[str]]` | 同上 | `RagAttributionMiddleware` |
+| `rag_retrieval` | `NotRequired[dict]` | `RagRetrievalMiddleware` | 调试首轮 mode/query/attempt/message |
 | `tool_events` | `NotRequired[list[dict]]` | `ToolEventMiddleware`、`SubagentLimitMiddleware` | `ShortMemoryMiddleware`、`MemoryWriterMiddleware`、`ToolCallLimitMiddleware`（计数）|
 | `loaded_skills` | `NotRequired[list[str]]` | `ToolEventMiddleware`（探测 read_file 路径）、`ShortMemoryMiddleware`（持久化） | `DynamicContextMiddleware`（注入 SKILL.md 内容）、运行时初始化 |
 | `metadata` | `NotRequired[dict]` | 多方更新；运行时初始化时塞入 `history_loaded` / `history_message_count` / `short_memory_summary_loaded` / `loaded_skills` / `tool_calling_enabled` / `tool_schema_binding` | runtime 返回值组装 |
@@ -561,10 +577,12 @@ RunEventReporter = Callable[[AgentRunEvent], None]
 - `model_error` / `model_error_message` — `_error_result` 路径下的失败信息。
 - `dynamic_context_injected` — `DynamicContextMiddleware.before_model` 烟测标记。
 - `memory_ready` — `FinalTextMiddleware` 标识可以发起持久化写入。
+- `rag_trace` — 当轮上传资料检索次数、查询、来源与是否命中证据。
+- `answer_provenance` — 最终回答使用的上传文件、网页 URL 与模型知识标记。
 
 ### 6.2 `agent/factory.build_agent`
 
-返回 `AgentBundle(agent, settings, model, memory, memory_queue, team_supervisor, team_config_error)`。流程：
+返回 `AgentBundle(agent, settings, model, memory, memory_queue, team_supervisor, team_config_error, rag_service)`。流程：
 
 1. `settings.data_dir.mkdir(...)` 兜底创建目录。
 2. `_build_team_supervisor(settings)`：尝试 `AgentTeamConfig.from_file()`，失败即把异常字符串挂在 `team_config_error`。空配置或 `enabled=False` → 返回 `(None, None)`。
@@ -572,22 +590,23 @@ RunEventReporter = Callable[[AgentRunEvent], None]
 4. `create_chat_model(settings)`。
 5. `MemoryService(...)` + `preload_embedder()`（提前热 BGE）。
 6. `MemoryWriteQueue(MemoryWriter(...), debounce_seconds=settings.memory_debounce_seconds)`。
-7. `default_tools(...)` 仅在 `enable_tools=True` 时挂载工具集合；`include_team_task` 取决于 supervisor 是否启用。
-8. `_build_middleware_chain` 按本文档顶部的固定顺序拼接 middleware 列表。
+7. `default_tools(...)` 仅在 `enable_tools=True` 时挂载常规工具；`include_team_task` 取决于 supervisor 是否启用。`rag_mode=True` 时额外挂载 `rag_search`、`web_search`、`web_fetch`，网络工具仍检查自己的配置开关。
+8. `_build_middleware_chain` 按本文档顶部的固定顺序拼接 middleware；RAG 模式在 recall 后插入 retrieval/retry，在链尾插入 attribution。
 9. `compose_system_prompt`（开工具时）或 `SYSTEM_PROMPT` 静态字符串（关工具时）。
 10. `create_agent(model, tools, middleware, system_prompt, state_schema=SuperAssistState)`。
 
-`_build_middleware_chain` 对 `subagents_enabled=False` 的情况，不会插入 `SubagentLimitMiddleware`。
+`_build_middleware_chain` 对 `subagents_enabled=False` 的情况，不会插入 `SubagentLimitMiddleware`。非 RAG 模式不会构造任何 RAG middleware，保持普通聊天路径不变。
 
 ### 6.3 `agent/runtime.AgentRuntime`
 
-- 持有 `_bundle` (AgentBundle)、`_run_event_reporter`、`_tool_event_reporter`、`_active_agent_text_seen`（防重复发同一段流式文本）。
+- 持有 `_bundle` (AgentBundle)、`rag_mode`、`_run_event_reporter`、`_tool_event_reporter`、`_active_agent_text_seen`（防重复发同一段流式文本）。
 - `run(message, *, user_id, thread_id)` 同步路径；`run_streaming(...)` 流式路径，二者都被 `@traceable` 装饰，`process_inputs=without_self`。
 - `_initial_state(message, user_id, thread_id)`:
   - thread_id 缺省时生成 `thread_<12hex>`。
   - `_load_thread_metadata` 读 `data_dir/threads/<thread_id>/thread_meta.json`，失败返回 `{}`。
   - `_load_history` 调 `load_short_memory(messages_path, metadata, token_limit)`。
-  - 把消息 + 一条新 `HumanMessage(message)` 拼成 `messages` 列表写入初始 state。
+  - 把消息 + 一条新 `HumanMessage(message)` 拼成 `messages` 列表写入初始 state，并初始化 `rag_mode` / `rag_context` / `rag_sources`。
+- `run` 与 `run_streaming` 都用 `rag_turn_context(rag_service, user_id, rag_mode, max_attempts)` 包住整个 Agent 循环，使 `rag_search` 工具和 middleware 共享同一个并发安全的尝试计数器。
 - `_stream_agent`: 用 `agent.stream(state, ..., stream_mode=["messages","values"])` 同时收文本块和 state 快照；`accumulate_stream_text` 处理多种 chunk 形态；最终 state 取最后一个 `values` 模式 chunk 或退回初始 state。
 - `_report_agent_text`: 用 `_active_agent_text_seen: set[str]` 与 `startswith` 判定避免重复推送同一段渐进文本。
 - `_report_tool_event`: 把工具事件透传给 caller 提供的 reporter；同时把 `agent_tool_call` 事件里的 content（即模型在调用工具前的进度说明）当作 `agent_text` 也推一份。
@@ -673,11 +692,12 @@ LangChain 1.x middleware 的钩子分类：`before_agent` / `after_agent`（agen
 
 - 钩子：`before_model`（写入 `metadata["dynamic_context_injected"]=True` 用作 trace 烟测）+ `wrap_model_call`（核心）。
 - `wrap_model_call`：
-  1. 从 state 抽 `memory_recall` / `loaded_skills` / `user_id` / `thread_id`。
+  1. 从 state 抽 `memory_recall` / `loaded_skills` / `user_id` / `thread_id`；RAG 模式同时读取 `rag_context` 与本轮 session trace。
   2. `build_available_skills_section()` —— 列出全部 public skills（`<skill_system>` XML 段）。
   3. `build_loaded_skills_section(loaded_skills)` —— 把已读过 SKILL.md 的全文塞回 system 末尾，跨 turn 持久化技能上下文。
   4. 拼装 `Runtime context:` 块（带 `current_time_utc`、`json.dumps(memory_recall)` 全量）。
-  5. `_prepend_reminder`：若 `messages[0]` 已是 `SystemMessage` → 合并 content；否则 prepend 新 `SystemMessage`。
+  5. RAG 模式加入封闭证据规则：上传文件是不可信资料，不得虚构引文；证据不足应继续 `rag_search`；耗尽上传检索后才按联网开关降级，并区分资料/网页/模型知识。
+  6. `_prepend_reminder`：若 `messages[0]` 已是 `SystemMessage` → 合并 content；否则 prepend 新 `SystemMessage`。
 
 ### 7.5 `ShortMemoryMiddleware`
 
@@ -712,6 +732,25 @@ LangChain 1.x middleware 的钩子分类：`before_agent` / `after_agent`（agen
 
 - 钩子：`after_agent`。
 - 行为：从 `state.messages` 末尾找第一条非空 `AIMessage`，将其文本写到 `metadata.final_assistant_text` 并设 `metadata.memory_ready=True`。`AgentRuntime._result_from` 优先读 `metadata.final_assistant_text` 作为 `AgentRunResult.answer`。
+
+### 7.10 `RagRetrievalMiddleware`
+
+- 仅在 `rag_mode=True` 时注册，钩子为 `before_agent`，注册在 `MemoryRecallMiddleware` 之后，因此每轮只执行一次首检。
+- 使用原始 `state.input` 执行 `mix` 检索；没有活动 session 时写入明确的 unavailable 状态。
+- 成功时把结构化实体、关系和原文证据写入 `rag_context`，来源文件写入 `rag_sources`，并把首轮结果摘要写入 `rag_retrieval`；失败不会抛出到整轮聊天，而是保留 session trace 给重试链。
+
+### 7.11 `RagRetryMiddleware`
+
+- 仅在 RAG 模式注册，钩子为 `after_model`。
+- 当模型准备直接结束、当前 session 尚无成功证据且未耗尽次数时，把最后一条 AIMessage 改为强制 `rag_search` 工具调用。
+- attempt 2 使用 `naive` 和面向关键术语/直接证据的确定性改写；attempt 3 使用 `global` 和面向实体/别名/关系的改写。模型主动调用 `rag_search` 也消耗同一额度。
+- 达到 `SUPERASSIST_RAG_MAX_ATTEMPTS` 后不再注入调用，允许模型按动态提示执行联网或保守知识降级。
+
+### 7.12 `RagAttributionMiddleware`
+
+- 仅在 RAG 模式注册，钩子为 `after_agent`；因注册在链尾，反向执行时先生成确定性的来源尾注，再由其它 after-agent middleware 持久化最终文本。
+- 汇总 session 中成功的上传文件和 `web_search` / `web_fetch` 工具结果中的 URL，过滤错误输出。
+- 在最终回答末尾追加“回答依据”，并写入 `metadata.rag_trace` 与 `metadata.answer_provenance`；没有上传或联网证据时显式标记模型自身知识及上传检索次数。
 
 ---
 
@@ -1036,6 +1075,10 @@ LangChain `@tool("team_task")`：
 
 见 §10.4。
 
+### 11.7 `rag/tools.py`
+
+`rag_search(query, mode="mix")` 从当前 `ContextVar` 获取 `RagTurnSession`，不接受调用方传入 `user_id`，因此模型无法越权检索其他用户目录。模式白名单最终由 `LightRAGService.retrieve` 校验为 `mix|hybrid|local|global|naive`，非法值回退到 `mix`。成功返回 `RAG_RETRIEVAL_SUCCESS + Sources + context`，失败返回 `RAG_RETRIEVAL_FAILED + attempts`，不抛出工具异常。
+
 ---
 
 <a id="12-skills"></a>
@@ -1150,7 +1193,7 @@ JSON 文件，路径来自 `Settings.feishu_thread_store_path`。
 <a id="14-uiserverpy"></a>
 ## 14. `ui/server.py`
 
-FastAPI 应用名 `SuperAssist Memory Graph`，挂载 `frontend/` 静态站点；为单用户（默认 `local-user`）服务。
+该模块同时保留两个 FastAPI app factory：`create_app` 是向后兼容的独立记忆图查看器；`create_ai_engine_app` 是 Go 调用的内部 AI Engine。产品路径使用后者，浏览器不应直接访问内部路由。
 
 ### 14.1 路由
 
@@ -1163,6 +1206,19 @@ FastAPI 应用名 `SuperAssist Memory Graph`，挂载 `frontend/` 静态站点�
 | `GET /` | 返回 `frontend/index.html`。 |
 | 静态挂载 `/` | `frontend/` 目录全量。 |
 
+AI Engine 内部路由：
+
+| 路径 | 行为 |
+| --- | --- |
+| `GET /internal/health` | Go 健康检查。 |
+| `POST /internal/chat` | 接收 `user_id/message/thread_id/rag_mode`，返回 SSE 事件流。 |
+| `GET /internal/graph` | 按 Go 注入的 `user_id` 返回长期记忆图。 |
+| `GET/PUT /internal/settings` | 读取、校验并写回 Memory/飞书配置；secret 只写不回显。 |
+| `GET/POST/DELETE /internal/rag/documents...` | LightRAG 文档列表、上传和删除。 |
+| `GET /internal/rag/graph` | 当前用户知识图。 |
+
+`_sse_chat_stream` 在线程中运行同步 `AgentRuntime.run_streaming`，通过 `asyncio.Queue` 把回调事件桥接回 FastAPI 事件循环；`finally` 中 flush Memory queue、关闭 runtime，并发送 sentinel，保证每个请求只有一个终止事件。
+
 ### 14.2 `graph_payload`
 
 - 节点列表通过 `_node_payload(node, recall_snapshot.get(node.id))` 序列化；命中 recall 的节点附带 `active_recall=True` + `recall_tier` + `recall_score` + `recall_components` + `recall_updated_at`。
@@ -1172,7 +1228,7 @@ FastAPI 应用名 `SuperAssist Memory Graph`，挂载 `frontend/` 静态站点�
 
 ### 14.3 启动
 
-`run_server(host, port, user_id)` 打印 `SuperAssist memory graph UI: http://host:port/?user_id=...` 后调 `uvicorn.run(...)`。
+`run_server(host, port, user_id)` 对应兼容命令 `superassist-memory-ui`。`serve_ai_engine(host, port)` 对应产品命令 `superassist-ai-engine`，默认只监听 `127.0.0.1:8765`，由 Go 的 `SUPERASSIST_PYTHON_HOST` 指向它。
 
 ---
 
@@ -1198,20 +1254,23 @@ FastAPI 应用名 `SuperAssist Memory Graph`，挂载 `frontend/` 静态站点�
 
 下面以 lead agent 一次同步 `run(message, user_id, thread_id)` 为例，把上述所有模块的协作顺序串清楚：
 
-1. **CLI / 飞书 channel** 调 `AgentRuntime.run` → `_initial_state(message, user_id, thread_id)` 加载 `messages.jsonl` 与 `thread_meta.json`，组装初始 `SuperAssistState`。
+1. **CLI / 飞书 / Python SSE 入口** 调 `AgentRuntime.run*` → `_initial_state(message, user_id, thread_id)` 加载 `messages.jsonl` 与 `thread_meta.json`，组装初始 `SuperAssistState`；Web 路径还携带 `rag_mode`。
 2. **`team_thread_context(thread_id)`** 写入 `ContextVar`，使 `team_task` 后续可拿到 thread。
 3. **`agent.invoke(state, ...)`** 进入 LangChain 内核：
-   - `before_agent`：`MemoryRecallMiddleware` 调 `MemoryService.prepare_turn_contexts(...)`：embed 用户消息 → 重建 FAISS → 算 read/write 桶 → 写 recall snapshot → touch 节点 → 创建本 turn EVENT 节点 → 与最相似 concept 试图加 REINFORCES 边 → 把 read/write recall 写回 state。
+   - `before_agent`：`MemoryRecallMiddleware` 调 `MemoryService.prepare_turn_contexts(...)`：embed 用户消息 → 重建 FAISS → 算 read/write 桶 → 写 recall snapshot → touch 节点 → **预分配**本 turn EVENT ID（实际节点由 writer 创建）→ 把 read/write recall 写回 state。
+   - RAG 模式第二个 `before_agent`：`RagRetrievalMiddleware` 用原问题执行 `mix`，把结构化证据和来源写入 state/session。
 4. 模型循环（每次模型调用前后会触发 wrap_*/before_*/after_*）：
-   - `wrap_model_call`（`DynamicContextMiddleware`）拼 system prompt 前缀（recall + skills + time）；`ToolEventMiddleware` 在 model 返回后扫 `tool_calls` 并报 `agent_tool_call` 事件。
+   - `wrap_model_call`（`DynamicContextMiddleware`）拼 system prompt 前缀（recall + skills + time + 可选 RAG 证据/规则）；`ToolEventMiddleware` 在 model 返回后扫 `tool_calls` 并报 `agent_tool_call` 事件。
    - 模型若提出工具调用：`wrap_tool_call` 链由外向内 `ToolErrorMiddleware → ToolCallLimitMiddleware → ToolEventMiddleware` 包裹真正的工具实现。
-   - `after_model`：`SubagentLimitMiddleware` 修剪超过 `max_concurrent` 的 `task` 调用。
+   - `after_model`：`SubagentLimitMiddleware` 修剪超过 `max_concurrent` 的 `task` 调用；RAG 模式下 `RagRetryMiddleware` 在无证据且模型准备结束时注入下一次 `rag_search`。
 5. **工具实现**：
    - `task` → `SubagentExecutor` 起 graph → 内部 `create_agent`（无 middleware）流式跑 → reporter 透传 `subagent_text`。
    - `team_task` → `TeamSupervisor.invoke` → `TeamLedger` 写 task 记录（hash + sig 链验证）→ `TeamMember` 在自己的 `AsyncLoopThread` 上拿/建 `ACPSession` → 收到响应 → 写 outbox + result 链。
    - `read_file(path="/mnt/skills/...")` → `ToolEventMiddleware` 自动把 skill name 加入 `loaded_skills`。
+   - `rag_search` → 当前 `RagTurnSession` → `LightRAGService.retrieve`，共享最多 N 次尝试额度。
    - 网络/文件/shell 工具走各自的 sandbox 与开关。
 6. **`after_agent`**（反向）：
+   - `RagAttributionMiddleware`（仅 RAG）：根据 session 和工具事件生成来源尾注与 provenance metadata。
    - `FinalTextMiddleware`：把最后一条 AIMessage 文本写到 `metadata.final_assistant_text` + `memory_ready=True`。
    - `MemoryWriterMiddleware`：构造 `MemoryWritePayload` 入 `MemoryWriteQueue`（debounce 30s 后或 CLI flush 时批写）。
    - `ShortMemoryMiddleware`：把本 turn 的 user/tool_event/assistant 三组记录追加到 `messages.jsonl`；触发 `maybe_compress_short_memory`，若超 token_limit 则用 LLM 生成新 summary 并把"老记录"从 jsonl 中剪掉，更新 `thread_meta.json.summary`。
@@ -1219,15 +1278,37 @@ FastAPI 应用名 `SuperAssist Memory Graph`，挂载 `frontend/` 静态站点�
 8. **后台**：`MemoryWriteQueue` 倒计时到点 → `MemoryWriter.write(payload)`：`_build_plan` (LLM 或 fallback) → `apply_plan` → `consolidate`（merge concepts / decay edges / complete orphans）；写完触发 `rebuild_vector_index`，FAISS 与 SQLite 一致性恢复。
 9. **UI / 飞书**：
    - 飞书每收到 `agent_text` / `subagent_text` 事件就 patch 卡片；最终 `final=True` 时清缓存。
-   - Memory Graph UI 通过 `/api/graph` 拉 `nodes/edges/updates/stats` 配合 `recall_snapshot` 展示当前命中节点与分项分数。
+   - React 通过 Go `/api/graph` 拉 `nodes/edges/updates/stats`；聊天完成事件触发会话和记忆图自动刷新。
+   - Knowledge 页面轮询文档状态，并通过 `/api/rag/graph` 单独显示 LightRAG 实体关系图。
 
 各模块不互相调用对方的内部细节——所有跨边界数据都经过本文档列出的 Pydantic / dataclass 契约。修改任一字段时，按"持有者 → 中间件 → 入口"的顺序回放本时序，是判断"会不会破坏哪一段"的最快方法。
 
+---
 
+<a id="17-rag"></a>
+## 17. `rag/`
 
+本节只记录与其它 Python 模块交界的合同；切片、抽取、同名实体聚合、五种检索模式、删除语义和上游 LightRAG 默认值见 [`superassist/rag/README.md`](superassist/rag/README.md)。
 
+### 17.1 `documents.py`
 
+`SUPPORTED_EXTENSIONS` 为 `.txt/.md/.json/.csv/.html/.htm/.pdf/.docx/.pptx/.xlsx`。`extract_document(path)` 统一返回纯文本：PDF 用 pypdf，Office 文件用各自解析库，HTML 丢弃 script/style/noscript，CSV/XLSX 用 ` | ` 保留表格列。`safe_filename` 去掉路径并替换 Windows 非法字符，原始客户端文件名不能直接作为磁盘路径。
 
+### 17.2 `service.LightRAGService`
 
+- 构造时创建专用 asyncio loop/thread，普通同步 Agent 通过 `run_coroutine_threadsafe` 调用 LightRAG，避免同一个异步锁跨 loop。
+- `base_dir=settings.rag_dir`；用户目录是 `sha256(user_id)[:24]`，所有 public 方法都要求 user_id。
+- `upload` 先写随机 `doc-<uuid>` 文件和 `documents.json` manifest，再后台执行 `extract_document → rag.ainsert`。
+- 每用户只缓存一个 `LightRAG` 实例；embedding 复用 SuperAssist embedder，LLM 复用 `create_chat_model(settings)`。
+- `retrieve` 只调用 `aquery_data` 并转换成 `RagRetrievalResult`，最终回答仍由 lead Agent 生成。
+- `delete` 调 `adelete_by_doc_id` 后才删除原文件和 manifest；失败状态保留错误便于 UI 展示。
+- `graph` 读取上游 graph storage 的全部节点/边，过滤悬空边并按 degree/weight 归一化给前端。
+- `close` 停止 LightRAG worker、finalize storages、停止专用 loop；AI Engine lifespan 必须调用它。
 
+### 17.3 `context.RagTurnSession`
 
+每轮通过 `rag_turn_context` 写入 `ContextVar`。Session 保存 `user_id/enabled/max_attempts/attempts/queries/sources/successful` 并用锁保护 `search`。工具只从 ContextVar 取 session，因此没有模型可控的 user_id 参数。检索异常转换成 `RagRetrievalResult(success=False)`，不让知识库故障终止整个 Agent。
+
+### 17.4 HTTP 与 Go 边界
+
+[`ui/rag.py`](superassist/ui/rag.py) 暴露 `/internal/rag/*`，Go 的 JWT handler 才暴露 `/api/rag/*`。上传接口必须同时执行：浏览器/Go 请求体限制、Python 文件数量/单文件大小限制、扩展名检查和 `safe_filename`。任何新增内部 RAG 路由都必须在 Go proxy 中显式映射，不能依赖浏览器直连 Python。

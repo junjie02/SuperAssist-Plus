@@ -1,270 +1,252 @@
 # SuperAssist
 
-AI 助手 Web 应用，支持流式对话、CogniFold 类型图谱长期记忆、工具调用、子智能体。
+SuperAssist 是一个面向长期协作场景的多智能体个人助理。系统使用 CogniFold 风格类型图维护跨会话长期记忆，使用 LightRAG 对用户上传的资料进行图检索与原文检索，并提供流式聊天、工具调用、Subagent、ACP Agent Teams、飞书接入和运行时配置界面。
 
-技术栈：**Go + Python + React + MySQL/SQLite + WebSocket + SSE**
+当前技术栈：**React + Vite、Go + Gin、Python + FastAPI、LangChain/LangGraph、SQLite/MySQL、FAISS、LightRAG、WebSocket/SSE**。
 
-## 架构
+## 系统架构
 
+```text
+Browser (React)
+    │ HTTP / WebSocket
+    ▼
+Go Gateway :8080
+    ├── JWT、用户与会话 API
+    ├── 前端静态文件
+    └── 将聊天/图谱/设置/RAG 请求代理到 Python
+              │ HTTP / SSE
+              ▼
+       Python AI Engine :8765
+          ├── LangChain Agent + middleware
+          ├── CogniFold Memory
+          ├── LightRAG Knowledge Base
+          ├── Tools / Subagents / ACP Teams
+          └── Feishu channel
+
+持久化：
+  .superassist/superassist.sqlite3   业务数据与长期记忆图
+  .superassist/faiss/                长期记忆向量入口索引
+  .superassist/rag/<user-hash>/      每用户 LightRAG 文件、图和向量数据
+  .superassist/threads/              对话 JSONL 与短记忆摘要
 ```
-浏览器 ──HTTP/WS──→ Go (Gin) ──SSE──→ Python (FastAPI) → AI Agent
-    (React)          :8080              :8765              (LangChain)
-                         │
-                         ▼
-                      MySQL / SQLite
-```
 
-- **React 前端** — 登录/注册、流式聊天、记忆图谱查看
-- **Go 服务** — JWT 认证、WebSocket 管理、线程 CRUD、静态文件、代理 AI 请求
-- **Python AI 引擎** — LangChain/LangGraph Agent、记忆算法、FAISS 向量索引、工具执行
-- **数据库** — 开发默认 SQLite，生产切 MySQL（`SUPERASSIST_DB_URL`）
+Go 是面向浏览器的产品入口：负责认证、WebSocket 生命周期、会话列表、静态资源以及 Python 内部 API 的安全代理。Python 只监听本机地址，负责模型、Memory、RAG 和 Agent 执行。
+
+## 主要功能
+
+- **流式聊天**：WebSocket 连接浏览器与 Go，Go 消费 Python SSE，并实时转发思考、工具和回答事件。
+- **长期记忆**：`event/concept/intent/time` 四类节点、九类边，结合向量入口、BFS、Personalized PageRank、时间和访问频次召回。
+- **LightRAG 知识库**：批量上传 PDF、DOCX、PPTX、XLSX、TXT、Markdown、JSON、CSV 和 HTML，异步完成切片、实体关系抽取和建图。
+- **Agentic RAG**：首轮默认 `mix` 检索；证据不足时允许模型改写查询，并由中间件保证最多完成三轮检索。失败后可按工具配置联网，最终回答明确标注上传资料、网页或模型知识来源。
+- **工具与 Subagent**：支持文件、网页和可选 Shell 工具，通过 `task` 把复杂任务交给 general-purpose 或 research 子 Agent。
+- **ACP Agent Teams**：通过 `agent_team.toml` 接入 Claude Code 等外部 Agent，使用带文件锁、hash chain 和 HMAC 的 JSONL ledger 记录协作过程。
+- **可视化与设置**：导航栏提供 Chat、Memory Graph、Knowledge、Settings；设置页可管理 Memory 与飞书参数。
+- **飞书 Bot**：支持私聊和群聊 @ 触发、流式卡片更新及会话映射。
 
 ## 快速开始
 
+项目默认在 Windows、PowerShell 和 Conda 环境 `CF` 下开发。
+
 ```powershell
 conda activate CF
-cd f:\CODE\SuperAssist\superAssist\SuperAssist
+Set-Location F:\CODE\SuperAssist\superAssist\SuperAssist
 
-# 安装 Python 依赖
-pip install -e .
+# Python
+python -m pip install -e .
 
-# 构建前端
-cd frontend && npm install && npm run build && cd ..
-
-# 1. 启动 Python AI 引擎（后台）
-superassist-ai-engine --port 8765
-
-# 2. 启动 Go Web 服务（前台）
-cd go-server && go run .
+# React
+Set-Location frontend
+npm install
+npm run build
+Set-Location ..
 ```
 
-浏览器打开 `http://localhost:8080`，注册账号后即可使用。
-
-### 开发模式（前端热更新）
+复制配置并填写模型地址和密钥：
 
 ```powershell
-# 终端 1: Python AI 引擎
-superassist-ai-engine --port 8765
-
-# 终端 2: Go 服务
-cd go-server && go run .
-
-# 终端 3: React 前端（Vite dev server，自动代理 API 到 Go）
-cd frontend && npm run dev
+Copy-Item .env.example .env
 ```
 
-浏览器打开 `http://localhost:5173`。
-
-### CLI 模式
+分别启动两个后端进程：
 
 ```powershell
-# 单轮对话
+# 终端 1，项目根目录
+superassist-ai-engine --port 8765
+
+# 终端 2
+Set-Location F:\CODE\SuperAssist\superAssist\SuperAssist\go-server
+go run .
+```
+
+浏览器访问 `http://localhost:8080`。首次使用先注册用户。
+
+> `go run .` 不能写成 `run .`。如果看到 `bind: Only one usage...` 或 `[Errno 10048]`，表示 8080/8765 已有进程监听，不要重复启动。Go 日志中的 Python `connection refused` 表示 AI Engine 尚未运行或端口不一致。
+
+### 前端开发模式
+
+先启动 Python 和 Go，再启动 Vite：
+
+```powershell
+Set-Location F:\CODE\SuperAssist\superAssist\SuperAssist\frontend
+npm run dev
+```
+
+访问 `http://localhost:5173`。Vite 会把 `/api` 和 `/ws` 代理到 `127.0.0.1:8080`。
+
+### CLI 与飞书
+
+```powershell
+# 单轮
 superassist "你好" --flush-memory
 
-# 交互式多轮，--thread-id 保持跨次启动连续性
+# 连续对话
 superassist -i --thread-id my-thread --flush-memory
-```
 
-### 记忆图谱可视化（独立模式）
-
-```powershell
-superassist-memory-ui --user-id local-user --port 8765
-```
-
-浏览器打开 `http://localhost:8765`。
-
-### 飞书 Bot
-
-```powershell
+# 飞书通道
 superassist-feishu
 ```
 
-需要 `.env` 中配置 `SUPERASSIST_FEISHU_APP_ID` 和 `SUPERASSIST_FEISHU_APP_SECRET`。
+`superassist-memory-ui` 是仍保留的旧调试入口，不属于当前 React 产品的验证路径；完整界面应通过 Go 的 `http://localhost:8080` 使用。
 
-## 功能
+## 知识库使用
 
-- **流式 AI 对话** — WebSocket 实时推送，支持思考过程展示、工具调用可视化
-- **长期记忆** — CogniFold 类型图谱（event/concept/intent/time 四种节点 + 9 种边类型）
-- **工具调用** — 文件读写、网页搜索、Shell 执行（可选开启）
-- **子智能体** — `task` 工具可派发复杂任务给 general-purpose / research 子 Agent
-- **ACP 团队** — 通过 `agent_team.toml` 配置 Claude Code 等外部 Agent 协作
-- **记忆图谱查看器** — 节点/边可视化、力导向布局、拖拽缩放
-- **飞书集成** — WebSocket Bot，支持群里 @ 触发
+1. 打开 **Knowledge** 页面并批量选择文件。
+2. 上传接口立即返回 `202`；页面会轮询 `queued → parsing → indexing → ready/failed`。
+3. 文档变为 `ready` 后，可在 Knowledge 页面查看知识图。
+4. 在 Chat 输入框旁开启 RAG 模式后提问。
+5. 删除文档会异步删除 LightRAG 中对应的原文、chunk、向量以及只由该文档支持的图数据。
 
-## 环境变量
+当前 LightRAG 使用固定 Token 切片，默认约为 `1200 tokens + 100 overlap`；默认查询模式为 `mix`，将实体图、关系图和原文向量召回合并。完整实现说明见 [LightRAG 技术设计](src/superassist/rag/README.md)。
 
-所有配置使用 `SUPERASSIST_` 前缀，在项目根目录 `.env` 文件中设置。
+## 配置
 
-### 模型
+Python 配置集中在 `src/superassist/config.py`，示例见 [.env.example](.env.example)。设置页写回项目根 `.env`；Memory 参数对新请求立即生效，飞书连接参数需要重启飞书通道。
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `SUPERASSIST_MODEL_PROVIDER` | `openai` | 模型提供商 |
-| `SUPERASSIST_MODEL` | `gpt-4o-mini` | 模型名称 |
-| `SUPERASSIST_API_KEY` | — | API 密钥，为空时使用本地 fallback（不联网） |
-| `SUPERASSIST_BASE_URL` | `https://api.openai.com/v1` | API 地址 |
-| `SUPERASSIST_TEMPERATURE` | — | 温度参数 |
-| `SUPERASSIST_MAX_TOKENS` | — | 最大 token 数 |
-
-### 数据库
+### 核心配置
 
 | 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `SUPERASSIST_DB_URL` | — | MySQL DSN，为空时使用 SQLite |
-| `SUPERASSIST_DATA_DIR` | `.superassist` | 数据目录（SQLite、FAISS、线程文件） |
+| --- | --- | --- |
+| `SUPERASSIST_MODEL` | `gpt-4o-mini` | 聊天、Memory writer 与 LightRAG 使用的模型 |
+| `SUPERASSIST_API_KEY` | 空 | 为空时使用测试用 fallback 模型 |
+| `SUPERASSIST_BASE_URL` | OpenAI API | OpenAI 兼容接口地址 |
+| `SUPERASSIST_DATA_DIR` | `.superassist` | SQLite、FAISS、RAG、线程等数据根目录 |
+| `SUPERASSIST_DB_URL` | 空 | Python MySQL DSN；为空使用 SQLite |
+| `SUPERASSIST_EMBEDDING_PROVIDER` | `bge` | `bge` 或测试用 `hash` |
+| `SUPERASSIST_EMBEDDING_MODEL` | `BAAI/bge-base-zh-v1.5` | Memory 与 LightRAG 共用的向量模型 |
+| `SUPERASSIST_ENABLE_TOOLS` | `false` | 常规工具总开关 |
+| `SUPERASSIST_TOOL_NETWORK_ENABLED` | `true` | 是否允许 web search/fetch |
+| `SUPERASSIST_TOOL_SHELL_ENABLED` | `false` | 是否允许 Shell |
+| `SUPERASSIST_MEMORY_LLM_WRITER_ENABLED` | `false` | LLM 写长期记忆图；关闭时走规则 writer |
+| `SUPERASSIST_MEMORY_TOP_K` | `12` | 注入模型的长期记忆节点总数 |
+| `SUPERASSIST_RAG_MAX_ATTEMPTS` | `3` | 每轮聊天最多上传资料检索次数 |
+| `SUPERASSIST_RAG_TOP_K` | `20` | LightRAG 实体/关系候选数 |
+| `SUPERASSIST_RAG_CHUNK_TOP_K` | `10` | LightRAG 原文 chunk 候选数 |
 
-MySQL 连接格式：`mysql+pymysql://用户名:密码@主机:3306/数据库名`
-
-### 服务端口
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `SUPERASSIST_GO_PORT` | `8080` | Go Web 服务端口 |
-| `SUPERASSIST_PYTHON_HOST` | `http://127.0.0.1:8765` | Python AI 引擎地址（Go 调用） |
-
-### JWT 认证
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `SUPERASSIST_JWT_SECRET` | — | JWT 签名密钥，生产环境必填 |
-| `SUPERASSIST_JWT_EXPIRY_HOURS` | `48` | Token 过期时间（小时） |
-
-### 工具
+### Go 配置
 
 | 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `SUPERASSIST_ENABLE_TOOLS` | `false` | 总开关 |
-| `SUPERASSIST_TOOL_NETWORK_ENABLED` | `true` | 网络搜索/抓取 |
-| `SUPERASSIST_TOOL_SHELL_ENABLED` | `false` | Shell 执行 |
-| `SUPERASSIST_MAX_TOOL_CALLS` | `8` | 每轮最大工具调用次数 |
+| --- | --- | --- |
+| `SUPERASSIST_GO_PORT` | `8080` | 浏览器访问端口 |
+| `SUPERASSIST_PYTHON_HOST` | `http://127.0.0.1:8765` | Python AI Engine 地址 |
+| `SUPERASSIST_JWT_SECRET` | 开发默认值 | JWT 签名密钥，生产环境必须修改 |
+| `SUPERASSIST_JWT_EXPIRY_HOURS` | `48` | 登录有效期 |
 
-### 子智能体
+MySQL URL 在 Python/SQLAlchemy 中使用 `mysql+pymysql://...`，Go/GORM 使用 Go MySQL DSN。当前默认的单机产品形态使用同一个 SQLite 文件；切换数据库前应同时确认 Go 与 Python 的连接格式。
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `SUPERASSIST_SUBAGENTS_ENABLED` | `true` | 启用 task 工具 |
-| `SUPERASSIST_SUBAGENT_MAX_CONCURRENT` | `3` | 最大并发子任务 |
-| `SUPERASSIST_SUBAGENT_TIMEOUT_SECONDS` | `900` | 子任务超时 |
-| `SUPERASSIST_SUBAGENT_MAX_TURNS` | `20` | 子任务最大轮次 |
+## 数据与隔离
 
-### 记忆
+```text
+.superassist/
+├── superassist.sqlite3
+├── faiss/
+│   ├── <safe-user-id>.index
+│   └── <safe-user-id>.mapping.json
+├── rag/<sha256(user-id)[:24]>/
+│   ├── documents.json
+│   ├── files/
+│   └── index/default/
+├── threads/<thread-id>/
+│   ├── messages.jsonl
+│   └── thread_meta.json
+├── teams/<thread-id>/ledger.jsonl
+├── channels/feishu_threads.json
+├── huggingface/
+└── workspace/
+```
 
-完整列表参见 `.env` 文件的 `# --- Memory ---` 区块，包含读路径、写路径、巩固衰减、短记忆四组参数。
-
-关键参数：
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `SUPERASSIST_MEMORY_TOP_K` | `12` | 每次注入 LLM 的记忆节点数 |
-| `SUPERASSIST_MEMORY_LLM_WRITER_ENABLED` | `false` | LLM 写图谱（`true`=高质量，`false`=规则写） |
-| `SUPERASSIST_EMBEDDING_PROVIDER` | `bge` | `bge`=中文语义向量，`hash`=确定性离线向量（测试用） |
-| `SUPERASSIST_EMBEDDING_MODEL` | `BAAI/bge-base-zh-v1.5` | Embedding 模型 |
-| `SUPERASSIST_EMBEDDING_DEVICE` | `cpu` | Embedding 设备 |
-
-### 记忆算法档位
-
-**读路径**：控制怎么找回相关记忆
-
-- `SUPERASSIST_MEMORY_READ_USE_PPR=true` — BFS + Personalized PageRank 混合（推荐）
-- `SUPERASSIST_MEMORY_READ_USE_PPR=false` — 纯 BFS 扩散
-
-**写路径**：控制怎么把新知识写入图谱
-
-- `SUPERASSIST_MEMORY_LLM_WRITER_ENABLED=true` — LLM 分析对话，产出结构化更新（质量高，费 token）
-- `SUPERASSIST_MEMORY_LLM_WRITER_ENABLED=false` — 规则写（省 token，离线可用）
-
-更多参数及说明见 `.env` 文件内注释。
+长期记忆图和 LightRAG 知识图是两套独立数据：前者记录对话事件、概念、意图和时间关系；后者只记录用户上传资料的实体、关系与原文来源。
 
 ## 项目结构
 
-```
+```text
 SuperAssist/
-├── frontend/              React + Vite SPA
-│   ├── src/
-│   │   ├── pages/         LoginPage, ChatPage, GraphPage
-│   │   ├── layouts/       MainLayout（侧边栏 + 内容区）
-│   │   ├── components/    可复用组件
-│   │   ├── hooks/         useAuth, useWebSocket
-│   │   └── lib/           api 封装
-│   └── dist/              构建产物（Go 直接 serve）
-├── go-server/             Go Web 服务（Gin + GORM）
-│   ├── main.go            入口
-│   ├── config/            环境变量解析
-│   ├── handler/           auth, thread, graph 路由处理
-│   ├── ws/                WebSocket 聊天
-│   ├── middleware/         JWT 中间件
-│   ├── proxy/             Python AI 引擎 HTTP 客户端
-│   ├── service/           业务逻辑
-│   └── model/             GORM 模型
-├── src/superassist/       Python AI 引擎
-│   ├── agent/             运行时、中间件链、prompt、流式
-│   ├── memory/            类型图谱（存储、嵌入、评分、向量索引）
-│   ├── middlewares/       9 条中间件（一条文件一个）
-│   ├── acp_client/        ACP 协议客户端
-│   ├── teams/             agent_team.toml 团队管理
-│   ├── subagents/         子智能体执行器
-│   ├── channels/          飞书 WebSocket 通道
-│   ├── tools/             LangChain 工具函数
-│   ├── skills/            SKILL.md 注册表
-│   ├── ui/                FastAPI AI 引擎 + 记忆图谱后端
-│   └── auth/              认证模块（预留，Go 侧实现）
-├── skills/                技能定义（SKILL.md）
-├── .env                   环境变量配置
-└── pyproject.toml         Python 项目配置
+├── frontend/                 React + Vite，Chat/Graph/Knowledge/Settings
+├── go-server/                Gin 网关、认证、线程、WS 和 Python 代理
+├── src/superassist/
+│   ├── agent/                Agent 工厂、状态、运行时和短记忆
+│   ├── memory/               CogniFold 图、向量入口和 PPR/BFS 排名
+│   ├── rag/                  LightRAG 文档、索引、检索和技术文档
+│   ├── middlewares/          Memory、RAG、工具和最终文本中间件
+│   ├── subagents/            进程内子 Agent
+│   ├── acp_client/           ACP 客户端
+│   ├── teams/                ACP 团队与可审计 ledger
+│   ├── channels/             飞书通道
+│   ├── tools/                文件、网页、Shell、task、team_task
+│   └── ui/                   Python 内部 FastAPI API
+├── skills/                   SKILL.md 技能
+├── tests/                    Python 自动化测试
+├── agent_team.toml           ACP 团队配置
+└── pyproject.toml
 ```
 
-## 测试
+## API 边界
+
+浏览器只访问 Go：
+
+- `/api/auth/*`：注册、登录和当前用户。
+- `/api/threads/*`：会话列表、历史和删除。
+- `/api/graph`：长期记忆图。
+- `/api/rag/documents`、`/api/rag/graph`：知识库和 LightRAG 图。
+- `/api/settings`：Memory 与飞书设置。
+- `/ws/chat?token=...`：流式聊天。
+
+Python `/internal/*` 仅供 Go 在本机调用，不应直接暴露到公网。
+
+## 测试与构建
 
 ```powershell
-python -B -m pytest                              # 全量
-python -B -m pytest tests/test_memory.py         # 记忆模块
-python -B -m pytest tests/test_memory.py -k merge -x  # 单个测试
+# Python
+python -B -m pytest
+python -m ruff check src tests
+
+# Go
+Set-Location go-server
+go test ./...
+Set-Location ..
+
+# Frontend
+Set-Location frontend
+npm run build
 ```
 
-## 从 SuperAssist-Plus 迁移数据
+RAG 单测和详细运维命令见 [src/superassist/rag/README.md](src/superassist/rag/README.md)。
 
-SQLite schema 和 FAISS 布局未变，可直拷：
+## 从 SuperAssist-Plus 迁移
+
+当前 SQLite schema 与 FAISS 文件布局兼容旧项目。迁移前停止所有 SuperAssist 进程，并备份目标 `.superassist`：
 
 ```powershell
-$src = "f:\CODE\SuperAssist\superAssist\SuperAssist-Plus\.superassist-plus"
-$dst = "f:\CODE\SuperAssist\superAssist\SuperAssist\.superassist"
-New-Item -ItemType Directory -Force $dst | Out-Null
-Copy-Item -Recurse "$src\threads"  "$dst\threads"
-Copy-Item       "$src\superassist_plus.sqlite3"  "$dst\superassist.sqlite3"
-Copy-Item -Recurse "$src\faiss"    "$dst\faiss"
-Copy-Item -Recurse "$src\teams"    "$dst\teams"
-Copy-Item -Recurse "$src\channels" "$dst\channels"
+$sourceDir = "F:\CODE\SuperAssist\superAssist\SuperAssist-Plus\.superassist-plus"
+$targetDir = "F:\CODE\SuperAssist\superAssist\SuperAssist\.superassist"
+
+Copy-Item "$sourceDir\superassist_plus.sqlite3" "$targetDir\superassist.sqlite3"
+Copy-Item -Recurse "$sourceDir\faiss" "$targetDir\faiss"
+Copy-Item -Recurse "$sourceDir\threads" "$targetDir\threads"
+Copy-Item -Recurse "$sourceDir\teams" "$targetDir\teams"
+Copy-Item -Recurse "$sourceDir\channels" "$targetDir\channels"
 ```
 
-## MySQL 部署
-
-```powershell
-# Docker（推荐）
-docker run -d --name mysql-superassist `
-  -e MYSQL_ROOT_PASSWORD=yourpassword `
-  -e MYSQL_DATABASE=superassist `
-  -p 3306:3306 `
-  mysql:8.0
-
-# .env 配置
-SUPERASSIST_DB_URL=mysql+pymysql://root:yourpassword@localhost:3306/superassist
-```
-
-首次启动时自动建表。Go 管 `users` 表，Python 管 `memory_nodes`、`memory_edges` 等记忆表。
-
-## 生产部署
-
-```powershell
-# 构建
-cd frontend && npm run build && cd ..
-cd go-server && go build -o superassist-server.exe && cd ..
-
-# 启动
-superassist-ai-engine --port 8765 &      # Python 后台
-.\go-server\superassist-server.exe        # Go 前台，含前端静态文件
-```
-
-浏览器打开 `http://localhost:8080`。
+LightRAG 是当前项目新增的数据域，需要通过 Knowledge 页面重新上传资料建立索引。
 
 ## License
 

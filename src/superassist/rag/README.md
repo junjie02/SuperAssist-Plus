@@ -582,6 +582,12 @@ npm.cmd run build
 5. 关闭 AI Engine 必须走正常 FastAPI lifespan，以触发 `LightRAGService.close()`；
    强制杀进程可能留下未 flush 的本地 JSON/GraphML 写入。
 
+### 11.4 Vector RAG 对照评测
+
+仓库内 [`.rag-eval-stage`](../../../.rag-eval-stage/README.md) 保存评测工程源码快照，实际运行目录为项目同级的 `RAG-EVAL`。评测复用 LightRAG 的 91 个原始 chunk，在三篇论文上构造 100 道有逐字证据和 gold chunk ID 的问题，并以相同 LLM、Embedding、约 6000 Token 检索预算和封闭证据提示比较传统 Top-5 Vector RAG 与 LightRAG `mix`。
+
+当前基线中，Vector RAG / LightRAG 的回答准确率为 `55% / 60%`，平均证据召回为 `46.5% / 80.5%`，平均总 Token 为 `6694.5 / 4918.8`；LightRAG 的检索 P50 为 `6.531s`，明显慢于 Vector RAG 的 `0.067s`。该结果说明图来源提高了证据覆盖，但关键词 LLM 调用增加延迟，且更宽的来源集合令 evidence precision 降低。完整指标定义、限制和复现实验命令以评测 README 为准。
+
 ## 12. 当前限制与后续演进建议
 
 1. **无 OCR/多模态理解**：扫描 PDF、图片、图表无法可靠建图。
@@ -615,4 +621,3 @@ npm.cmd run build
 | `../ui/rag.py` | Python 内部 HTTP 路由 |
 | `../../../go-server/handler/rag.go` | Go JWT 代理与请求大小限制 |
 | `../../../frontend/src/pages/KnowledgePage.jsx` | 批量上传和状态轮询 UI |
-

@@ -1,115 +1,178 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file is the repository-level development guide. Keep it synchronized with the code whenever runtime boundaries, middleware ordering, storage layout, routes, or build commands change.
 
 ## Commands
 
-The project assumes the conda env `CF` and is developed on Windows + PowerShell.
+The primary development environment is Windows, PowerShell, and the Conda environment `CF`.
 
 ```powershell
 conda activate CF
-cd f:\CODE\SuperAssist\superAssist\SuperAssist
+Set-Location F:\CODE\SuperAssist\superAssist\SuperAssist
 python -m pip install -e .
 
-# single turn (CLI)
-superassist "你好" --flush-memory
-
-# continuous conversation
-superassist -i --thread-id my-thread --flush-memory
-
-# memory graph viewer (FastAPI on http://localhost:8765)
-superassist-memory-ui --user-id local-user --port 8765
-
-# Feishu bot (requires SUPERASSIST_FEISHU_APP_ID / _APP_SECRET in .env)
-superassist-feishu
-
-# tests — run `python -B` so .pyc files don't pollute the tree
+# Python tests and lint
 python -B -m pytest
+python -B -m pytest tests\test_rag.py -q -p no:cacheprovider
+python -m ruff check src tests
 
-# single test file / single test
-python -B -m pytest tests/test_memory.py
-python -B -m pytest tests/test_memory.py::test_name -k name -x
+# Go tests
+Set-Location go-server
+go test ./...
+Set-Location ..
+
+# Frontend build
+Set-Location frontend
+npm install
+npm run build
+Set-Location ..
 ```
 
-Lint is `ruff` (configured in `pyproject.toml`, line-length 120, target py3.11). There is no separate build step — `pip install -e .` registers the three console scripts via `[project.scripts]`.
+Run the product in separate terminals:
 
-## Environment
+```powershell
+# terminal 1, repository root
+superassist-ai-engine --port 8765
 
-All settings use the `SUPERASSIST_` prefix and are defined in [src/superassist/config.py](src/superassist/config.py). The `.env` file at the project root is auto-loaded. A blank `SUPERASSIST_API_KEY` falls back to a deterministic local responder so tests run without credentials. `SUPERASSIST_EMBEDDING_PROVIDER=hash` switches to an offline embedder for the same reason. Tools, subagents, and `team_task` are gated behind `SUPERASSIST_ENABLE_TOOLS=true`.
+# terminal 2
+Set-Location F:\CODE\SuperAssist\superAssist\SuperAssist\go-server
+go run .
 
-## Architecture
+# optional terminal 3 for Vite HMR
+Set-Location F:\CODE\SuperAssist\superAssist\SuperAssist\frontend
+npm run dev
+```
 
-This is a LangChain 1.x + LangGraph assistant with **CogniFold-style typed-graph long-term memory**, **ACP-backed team agents** (Claude Code via `agent-client-protocol`), and a **Feishu** chat channel. It is a clean rewrite of `SuperAssist-Plus` — when in doubt about migration intent, the old repo is at `f:\CODE\SuperAssist\superAssist\SuperAssist-Plus`.
+Other entry points:
 
-### Middleware-first agent (no outer LangGraph wrapper)
+```powershell
+superassist "hello" --flush-memory
+superassist -i --thread-id my-thread --flush-memory
+superassist-feishu
+superassist-memory-ui --user-id local-user --port 8765
+```
 
-[src/superassist/agent/factory.py](src/superassist/agent/factory.py) composes a single `langchain.agents.create_agent` call with a deterministic middleware chain. There is **no outer LangGraph state graph** — cross-cutting concerns are middleware in a fixed order. Reading the docstring at the top of `factory.py` is the fastest way to understand control flow.
+Use `python -B` for tests so bytecode files do not pollute the tree. `ruff` uses line length 120 and Python 3.11. `frontend/dist` is a generated build artifact served by Go and should only change through `npm run build`.
 
-The chain (top→bottom; LangChain dispatches `before_*` in order, `after_*` in reverse):
+## Configuration
 
-1. `ToolErrorMiddleware` — wrap_tool_call: convert exceptions into ToolMessages
-2. `ToolCallLimitMiddleware` — refuse new tool calls past per-turn budget
-3. `MemoryRecallMiddleware` — before_agent: read graph memory, create user-turn event
-4. `DynamicContextMiddleware` — wrap_model_call: prepend recall+skills+time to system message
-5. `ShortMemoryMiddleware` — after_agent: persist `messages.jsonl`, compress when over budget
-6. `ToolEventMiddleware` — collect tool start/result events
-7. `SubagentLimitMiddleware` (only if `subagents_enabled`) — trim parallel `task` calls
-8. `MemoryWriterMiddleware` — enqueue durable memory write payload
-9. `FinalTextMiddleware` — surface `final_assistant_text` in state metadata
+Python settings live in [src/superassist/config.py](src/superassist/config.py), use the `SUPERASSIST_` prefix, and load the root `.env`. Go loads the same `.env` through [go-server/config/config.go](go-server/config/config.go). The two runtimes do not accept identical database URL syntax, so verify both sides before enabling MySQL.
 
-`SuperAssistState` ([agent/state.py](src/superassist/agent/state.py)) extends LangChain's `AgentState` with `user_id`, `thread_id`, `memory_event_id`, `memory_recall`, `tool_events`, `loaded_skills`, and `metadata`. Every middleware reads/writes this shape.
+Important test behavior:
 
-`AgentRuntime` ([agent/runtime.py](src/superassist/agent/runtime.py)) is the public turn driver — it loads thread history (`messages.jsonl` + `thread_meta.json`) into the initial state, calls `agent.invoke` (sync) or `agent.stream` (streaming with `accumulate_stream_text` from [agent/streaming.py](src/superassist/agent/streaming.py)), then extracts `AgentRunResult`. The streaming path is shared with the subagent executor.
+- Empty `SUPERASSIST_API_KEY` selects the deterministic fallback chat model.
+- `SUPERASSIST_EMBEDDING_PROVIDER=hash` selects the deterministic offline embedder.
+- Normal tools require `SUPERASSIST_ENABLE_TOOLS=true`.
+- RAG mode always binds `rag_search`, `web_search`, and `web_fetch`; the network tools still enforce `SUPERASSIST_TOOL_NETWORK_ENABLED`.
+- Settings updates are written to the root `.env`. Memory values apply to newly constructed runtimes; Feishu connection changes require a channel restart.
 
-### Memory: typed graph with FAISS
+## Runtime Architecture
 
-[src/superassist/memory/](src/superassist/memory/) implements a CogniFold-style graph:
+```text
+React/Vite browser
+  -> Go/Gin :8080 (JWT, users, threads, WebSocket, static assets, proxy)
+      -> Python/FastAPI :8765 (SSE chat, memory graph, settings, LightRAG)
+          -> LangChain create_agent
+          -> SQLite/MySQL + FAISS + local LightRAG stores
+```
 
-- **storage.py** — SQLite-backed `MemoryGraphStore` (nodes + typed edges).
-- **embedding.py** — pluggable `Embedder` (default `bge`, `hash` for offline tests). Embedder is preloaded by `MemoryService.preload_embedder()`.
-- **vector_index.py** — per-user `PersistentFaissIndex` keyed by `user_id`.
-- **scoring.py** — `MemoryContextRanker` does the read path: vector entry-point selection → bidirectional BFS / Personalized PageRank blend → `Score(v)` for highlighted recall nodes.
-- **plans.py** — `UpdatePlan` is a Pydantic **discriminated union** of operations (`ADD_NODE`, `ADD_EDGE`, `REINFORCE`, etc.).
-- **operations.py** — pure dispatch: `apply_plan(plan, ApplyContext)` is the only place per-op logic lives. Don't hand-roll dispatch elsewhere.
-- **service.py** — `MemoryService` is the single public surface used by middleware. It owns the store, FAISS, embedder, ranker, and consolidation (concept merge, edge decay, orphan completion).
-- **writer.py** — `MemoryWriteQueue` debounces durable writes (`SUPERASSIST_MEMORY_DEBOUNCE_SECONDS`). When `SUPERASSIST_MEMORY_LLM_WRITER_ENABLED=true`, an LLM produces an `UpdatePlan`; otherwise a deterministic writer runs.
+The browser must never call Python `/internal/*` routes directly. Go derives `user_id` from JWT and adds it to proxied graph, settings, document, and chat calls. Python should remain bound to `127.0.0.1` unless a separate trusted network boundary is added.
 
-The ontology is fixed and asserted by `tests/test_smoke.py` — node types: `event|concept|intent|time`; edge types: `GROUNDS|CAUSES|TRIGGERS|REINFORCES|PART_OF|DERIVED_FROM|DEADLINE_FOR|RELATED_TO|USER_FEEDBACK`. Changing these requires updating the test.
+### Go Gateway
 
-### ACP team agents
+[go-server/main.go](go-server/main.go) owns the public HTTP surface:
 
-[src/superassist/acp_client/](src/superassist/acp_client/) is the low-level Agent Client Protocol implementation: process spawning (`process.py`), the `AsyncLoopThread` event loop, `ACPSession`, `PermissionPolicy`, and error types. **It speaks ACP and nothing else.**
+- unauthenticated `/api/auth/register` and `/api/auth/login`;
+- authenticated threads, memory graph, settings, LightRAG documents, and LightRAG graph APIs;
+- `/ws/chat?token=...`, which validates JWT before upgrading;
+- React assets from `frontend/dist`, including SPA fallback routes.
 
-[src/superassist/teams/](src/superassist/teams/) sits on top: `TeamSupervisor` parses `agent_team.toml`, holds a pool of long-lived ACP team-member processes (one per configured agent, e.g. `claude_code`), and routes `team_task` tool invocations through them. It maintains a hash-chained, HMAC-signed, file-locked **JSONL ledger per thread** ([teams/ledger.py](src/superassist/teams/ledger.py)) — `LedgerTamperError` indicates the chain was broken. The `team_thread_context` (used by `AgentRuntime`) scopes ledger writes to the current thread.
+The WebSocket handler forwards `{message, thread_id, rag_mode}` to Python `/internal/chat`, consumes SSE incrementally, and sends JSON events to the browser. A Python connection refusal therefore appears as a Go 502/stream error, not as an LLM response.
 
-`agent_team.toml` controls membership; setting `enabled=false` or removing all `[[agents]]` entries cleanly disables team mode (the supervisor returns `None` and the `team_task` tool isn't bound).
+### Middleware-First Agent
 
-### Subagents
+[src/superassist/agent/factory.py](src/superassist/agent/factory.py) creates one LangChain `create_agent`; there is no outer lead-agent `StateGraph`. Hook ordering is behavioral API because `before_*` runs in registration order and `after_*` runs in reverse.
 
-[src/superassist/subagents/](src/superassist/subagents/) is a separate concept from teams: it's the **in-process** general-purpose / research subagent invoked via the `task` tool. `executor.py` shares the streaming pipeline with the lead runtime. Concurrency is bounded by `SubagentLimitMiddleware` (parallel `task` calls trimmed) and `SUPERASSIST_SUBAGENT_MAX_CONCURRENT`.
+Base chain:
 
-### Channels
+1. `ToolErrorMiddleware`
+2. `ToolCallLimitMiddleware`
+3. `MemoryRecallMiddleware`
+4. `DynamicContextMiddleware`
+5. `ShortMemoryMiddleware`
+6. `ToolEventMiddleware`
+7. optional `SubagentLimitMiddleware`
+8. `MemoryWriterMiddleware`
+9. `FinalTextMiddleware`
 
-[src/superassist/channels/feishu.py](src/superassist/channels/feishu.py) is a Feishu WebSocket bot. It uses `lark-oapi`, maps Feishu chats to thread IDs through `FeishuThreadStore`, gates on `SUPERASSIST_FEISHU_ALLOWED_OPEN_IDS` and `SUPERASSIST_FEISHU_MENTION_ONLY`, and only handles **text** in v1 (files/images return `UNSUPPORTED_FILE_MESSAGE`).
+RAG mode inserts `RagRetrievalMiddleware` and `RagRetryMiddleware` after memory recall, and registers `RagAttributionMiddleware` after `FinalTextMiddleware`; reverse `after_agent` dispatch makes attribution run first so final-text extraction captures the attributed answer. Keep [src/CLAUDE.md](src/CLAUDE.md) synchronized when changing this order.
 
-### Frontend (memory graph viewer)
+### Long-Term Memory
 
-[frontend/](frontend/) is a static, no-build SPA served by [src/superassist/ui/server.py](src/superassist/ui/server.py) at `/api/graph?user_id=<id>`. **Read [frontend/AGENT.md](frontend/AGENT.md) before changing the viewer** — its data contract (`nodes`, `edges`, `updates`, `stats`, plus `active_recall`/`recall_score`/`recall_components` on highlighted nodes), force-directed layout invariants, and "no build tooling, no network-loaded assets" rule are documented there.
+[src/superassist/memory/](src/superassist/memory/) implements a CogniFold-style typed graph:
 
-### Skills
+- SQLite/MySQL `MemoryGraphStore` is authoritative for nodes, edges, jobs, and recall snapshots.
+- BGE is the normal embedder; hash embeddings exist for deterministic tests.
+- `PersistentFaissIndex` provides per-user semantic entry points.
+- `MemoryContextRanker` combines vector entry points, bidirectional BFS, optional Personalized PageRank, recency, access count, urgency, and semantic affinity.
+- `MemoryWriter` produces an `UpdatePlan` through an LLM or deterministic fallback; `operations.apply_plan` is the only operation dispatcher.
+- consolidation merges similar concepts, decays edges, and grounds orphan concepts.
 
-`SKILL.md`-based skill loading lives in [src/superassist/skills/registry.py](src/superassist/skills/registry.py). The single bundled skill is [skills/public/deep-research/SKILL.md](skills/public/deep-research/SKILL.md). `loaded_skills` flows through state and `thread_meta.json` so skill activation persists across turns within a thread.
+The ontology is fixed: `event|concept|intent|time` and `GROUNDS|CAUSES|TRIGGERS|REINFORCES|PART_OF|DERIVED_FROM|DEADLINE_FOR|RELATED_TO|USER_FEEDBACK`. Update `tests/test_smoke.py` if this contract intentionally changes.
 
-## Data layout
+### LightRAG Knowledge Base
 
-`SUPERASSIST_DATA_DIR` (default `.superassist/`) holds:
+[src/superassist/rag/](src/superassist/rag/) is separate from long-term memory. It stores uploaded-document content under a SHA-256-derived per-user directory and uses `lightrag-hku` local JSON KV, NanoVectorDB, GraphML, and document-status stores.
 
-- `superassist.sqlite3` — memory graph store
-- `faiss/<user_id>/` — per-user FAISS vector index
-- `threads/<thread_id>/messages.jsonl` + `thread_meta.json` — short memory history (loaded by `load_short_memory`)
-- `teams/<thread_id>/ledger.jsonl` — hash-chained team ledger
-- `channels/feishu_threads.json` — Feishu chat ↔ thread_id map
-- `huggingface/` — embedder model cache
-- `workspace/` — default tool sandbox (overridable via `SUPERASSIST_TOOL_WORKSPACE_DIR`)
+- Upload returns 202 and indexes in the service's dedicated asyncio loop.
+- Supported formats are declared in `rag/documents.py`.
+- `LightRAGService.retrieve` uses structured `aquery_data` and does not ask LightRAG to generate the final answer.
+- `mix` is the automatic first attempt. The agent may call `rag_search`; retry middleware guarantees up to the configured attempt limit when no usable evidence is found.
+- Attribution middleware deterministically appends uploaded/web/model provenance.
+- RAG graph and document manifests are isolated from CogniFold memory data.
 
-The SQLite schema and FAISS layout are unchanged from `SuperAssist-Plus`, so old data can be copied directly (see [README.md](README.md) for the exact `Copy-Item` recipe).
+The complete storage, extraction, chunking, graph, update, retrieval, and deletion contract is in [src/superassist/rag/README.md](src/superassist/rag/README.md).
+
+### Subagents And ACP Teams
+
+`subagents/` contains in-process task agents invoked by the `task` tool. `teams/` is a distinct ACP integration configured by `agent_team.toml`; it manages long-lived external processes and a hash-chained, HMAC-signed, file-locked ledger. Do not conflate the two execution models.
+
+### Frontend
+
+[frontend/](frontend/) is a React 18 + Vite SPA, not the legacy no-build viewer. Development requests proxy to Go; production assets are built into `frontend/dist` and served by Go.
+
+The authenticated shell keeps Chat mounted while switching pages so WebSocket and thread state survive navigation. Main views are Chat, Memory Graph, Knowledge, and Settings. Read [frontend/CLAUDE.md](frontend/CLAUDE.md) before changing data contracts, responsive layout, graph behavior, or refresh events.
+
+### Feishu
+
+[src/superassist/channels/feishu.py](src/superassist/channels/feishu.py) receives Feishu events over WebSocket and sends incremental interactive-card updates. It maps Feishu chats/topics to SuperAssist thread IDs and enforces allowed Open IDs and mention-only behavior. File and image understanding is not implemented in the channel.
+
+## Data Layout
+
+`SUPERASSIST_DATA_DIR` defaults to `.superassist`:
+
+```text
+superassist.sqlite3              relational data and typed memory graph
+faiss/<safe-user-id>.index      memory vector index
+faiss/<safe-user-id>.mapping.json
+rag/<user-hash>/documents.json  uploaded-document manifest
+rag/<user-hash>/files/          original uploaded files
+rag/<user-hash>/index/default/  LightRAG KV/vector/GraphML stores
+threads/<thread-id>/             messages.jsonl + thread_meta.json
+teams/<thread-id>/ledger.jsonl  audited ACP team communication
+channels/feishu_threads.json    Feishu-to-thread mapping
+huggingface/                    embedding model cache
+workspace/                      file/shell tool sandbox
+```
+
+Do not manually merge the CogniFold graph with the LightRAG graph. They have different ownership, lifecycle, deletion, and recall semantics.
+
+## Documentation Ownership
+
+- [README.md](README.md): user-facing setup, architecture, configuration, and operations.
+- [src/CLAUDE.md](src/CLAUDE.md): detailed Python contracts down to fields and call ordering.
+- [src/superassist/rag/README.md](src/superassist/rag/README.md): complete LightRAG technical design.
+- [frontend/CLAUDE.md](frontend/CLAUDE.md): frontend contracts and interaction invariants.
+- [.rag-eval-stage/README.md](.rag-eval-stage/README.md): reproducible Vector RAG versus LightRAG evaluation.
+
+Generated dataset examples and `skills/**/SKILL.md` are content/protocol assets, not general project documentation. Change them only when their own behavior changes.
