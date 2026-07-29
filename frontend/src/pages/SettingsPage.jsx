@@ -9,6 +9,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import { api } from '../lib/api'
+import { useAuth } from '../hooks/useAuth'
 
 const MEMORY_SECTIONS = [
   {
@@ -46,7 +47,7 @@ const MEMORY_SECTIONS = [
     title: 'Short memory',
     fields: [
       { key: 'short_token_limit', label: 'Compression token limit', env: 'SUPERASSIST_SHORT_MEMORY_TOKEN_LIMIT', min: 100, max: 10000000, step: 100 },
-      { key: 'short_keep_recent_turns', label: 'Recent turns kept', env: 'SUPERASSIST_SHORT_MEMORY_KEEP_RECENT_TURNS', min: 0, max: 10000, step: 1 },
+      { key: 'short_keep_recent_turns', label: 'Sliding window turns', env: 'SUPERASSIST_SHORT_MEMORY_KEEP_RECENT_TURNS', min: 1, max: 10000, step: 1 },
       { key: 'short_summary_target_tokens', label: 'Summary target tokens', env: 'SUPERASSIST_SHORT_MEMORY_SUMMARY_TARGET_TOKENS', min: 1, max: 1000000, step: 100 },
       { key: 'short_enable_tool_events', label: 'Record tool events', env: 'SUPERASSIST_SHORT_MEMORY_ENABLE_TOOL_EVENTS', type: 'boolean' },
     ],
@@ -54,11 +55,15 @@ const MEMORY_SECTIONS = [
 ]
 
 export default function SettingsPage() {
+  const { user } = useAuth()
   const [activeTab, setActiveTab] = useState('memory')
   const [draft, setDraft] = useState(null)
   const [secret, setSecret] = useState('')
   const [secretDirty, setSecretDirty] = useState(false)
   const [showSecret, setShowSecret] = useState(false)
+  const [wecomSecret, setWecomSecret] = useState('')
+  const [wecomSecretDirty, setWecomSecretDirty] = useState(false)
+  const [showWecomSecret, setShowWecomSecret] = useState(false)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -70,9 +75,11 @@ export default function SettingsPage() {
     setError('')
     try {
       const data = await api.get('/settings')
-      setDraft({ memory: data.memory, feishu: data.feishu })
+      setDraft({ memory: data.memory, skills: data.skills, feishu: data.feishu, wecom: data.wecom })
       setSecret('')
       setSecretDirty(false)
+      setWecomSecret('')
+      setWecomSecretDirty(false)
       setRestartRequired(false)
     } catch (e) {
       setError(e.message)
@@ -93,6 +100,16 @@ export default function SettingsPage() {
     setDraft(current => ({ ...current, feishu: { ...current.feishu, [key]: value } }))
   }
 
+  const updateSkills = (key, value) => {
+    setSaved(false)
+    setDraft(current => ({ ...current, skills: { ...current.skills, [key]: value } }))
+  }
+
+  const updateWeCom = (key, value) => {
+    setSaved(false)
+    setDraft(current => ({ ...current, wecom: { ...current.wecom, [key]: value } }))
+  }
+
   const handleSubmit = async (event) => {
     event.preventDefault()
     setSaving(true)
@@ -103,15 +120,32 @@ export default function SettingsPage() {
       domain: draft.feishu.domain,
       allowed_open_ids: draft.feishu.allowed_open_ids,
       mention_only: draft.feishu.mention_only,
+      active_session_seconds: draft.feishu.active_session_seconds,
     }
     if (secretDirty) feishu.app_secret = secret
+    const wecom = {
+      bot_id: draft.wecom.bot_id,
+      allowed_user_ids: draft.wecom.allowed_user_ids,
+      user_id_map: draft.wecom.user_id_map,
+      rag_mode_default: draft.wecom.rag_mode_default,
+      max_concurrent: draft.wecom.max_concurrent,
+      stream_interval_ms: draft.wecom.stream_interval_ms,
+      ai_engine_url: draft.wecom.ai_engine_url,
+      rpa_allowed_groups: draft.wecom.rpa_allowed_groups,
+      rpa_trigger_prefixes: draft.wecom.rpa_trigger_prefixes,
+      rpa_poll_interval_seconds: draft.wecom.rpa_poll_interval_seconds,
+      rpa_reply_max_chars: draft.wecom.rpa_reply_max_chars,
+    }
+    if (wecomSecretDirty) wecom.bot_secret = wecomSecret
 
     try {
-      const data = await api.put('/settings', { memory: draft.memory, feishu })
-      setDraft({ memory: data.memory, feishu: data.feishu })
+      const data = await api.put('/settings', { memory: draft.memory, skills: draft.skills, feishu, wecom })
+      setDraft({ memory: data.memory, skills: data.skills, feishu: data.feishu, wecom: data.wecom })
       setSecret('')
       setSecretDirty(false)
-      setRestartRequired(data.meta?.feishu_restart_required === true)
+      setWecomSecret('')
+      setWecomSecretDirty(false)
+      setRestartRequired(data.meta?.feishu_restart_required === true || data.meta?.wecom_restart_required === true)
       setSaved(true)
     } catch (e) {
       setError(e.message)
@@ -153,7 +187,9 @@ export default function SettingsPage() {
 
       <div className="settings-tabs" role="tablist" aria-label="Settings sections">
         <button type="button" role="tab" aria-selected={activeTab === 'memory'} className={activeTab === 'memory' ? 'active' : ''} onClick={() => setActiveTab('memory')}>Memory</button>
+        <button type="button" role="tab" aria-selected={activeTab === 'skills'} className={activeTab === 'skills' ? 'active' : ''} onClick={() => setActiveTab('skills')}>Skills</button>
         <button type="button" role="tab" aria-selected={activeTab === 'feishu'} className={activeTab === 'feishu' ? 'active' : ''} onClick={() => setActiveTab('feishu')}>Feishu</button>
+        <button type="button" role="tab" aria-selected={activeTab === 'wecom'} className={activeTab === 'wecom' ? 'active' : ''} onClick={() => setActiveTab('wecom')}>WeCom</button>
       </div>
 
       <div className="settings-scroll">
@@ -162,7 +198,7 @@ export default function SettingsPage() {
           {saved && (
             <div className="settings-notice success-notice">
               <CheckCircle2 size={18} />
-              <span>{restartRequired ? 'Saved. Restart the Feishu channel to apply connection changes.' : 'Saved and applied to new requests.'}</span>
+              <span>{restartRequired ? 'Saved. Restart the affected channel process to apply connection changes.' : 'Saved and applied to new requests.'}</span>
             </div>
           )}
 
@@ -192,7 +228,14 @@ export default function SettingsPage() {
                 </div>
               </section>
             ))
-          ) : (
+          ) : activeTab === 'skills' ? (
+            <section className="settings-section skills-section">
+              <h2>Progressive loading</h2>
+              <div className="settings-grid">
+                <NumberField label="Active skill timeout" env="SUPERASSIST_SKILL_ACTIVE_TTL_SECONDS" value={draft.skills.active_ttl_seconds} onChange={value => updateSkills('active_ttl_seconds', value)} suffix="seconds" min={30} max={86400} step={30} />
+              </div>
+            </section>
+          ) : activeTab === 'feishu' ? (
             <section className="settings-section feishu-section">
               <h2>Connection</h2>
               <div className="settings-grid">
@@ -221,9 +264,57 @@ export default function SettingsPage() {
                 </label>
                 <TextField label="Open API domain" env="SUPERASSIST_FEISHU_DOMAIN" type="url" value={draft.feishu.domain} onChange={value => updateFeishu('domain', value)} required />
                 <TextField label="Allowed Open IDs" env="SUPERASSIST_FEISHU_ALLOWED_OPEN_IDS" value={draft.feishu.allowed_open_ids} onChange={value => updateFeishu('allowed_open_ids', value)} placeholder="ou_xxx,ou_yyy" />
-                <ToggleField label="Mention only" env="SUPERASSIST_FEISHU_MENTION_ONLY" checked={Boolean(draft.feishu.mention_only)} onChange={value => updateFeishu('mention_only', value)} />
+                <ToggleField label="Mention to start session" env="SUPERASSIST_FEISHU_MENTION_ONLY" checked={Boolean(draft.feishu.mention_only)} onChange={value => updateFeishu('mention_only', value)} />
+                <NumberField label="Active session timeout" env="SUPERASSIST_FEISHU_ACTIVE_SESSION_SECONDS" value={draft.feishu.active_session_seconds} onChange={value => updateFeishu('active_session_seconds', value)} suffix="seconds" min={10} max={86400} step={10} />
               </div>
             </section>
+          ) : (
+            <>
+              <section className="settings-section wecom-section">
+                <h2>Intelligent robot connection</h2>
+                <div className="settings-grid">
+                <TextField label="Bot ID" env="SUPERASSIST_WECOM_BOT_ID" value={draft.wecom.bot_id} onChange={value => updateWeCom('bot_id', value)} autoComplete="off" />
+                <label className="settings-field">
+                  <span className="field-label">Bot Secret</span>
+                  <span className="field-env">SUPERASSIST_WECOM_BOT_SECRET</span>
+                  <span className="secret-input-wrap">
+                    <input
+                      type={showWecomSecret ? 'text' : 'password'}
+                      value={wecomSecret}
+                      onChange={event => { setWecomSecret(event.target.value); setWecomSecretDirty(true); setSaved(false) }}
+                      placeholder={draft.wecom.bot_secret_configured && !wecomSecretDirty ? 'Configured - leave blank to keep' : 'Not configured'}
+                      autoComplete="new-password"
+                    />
+                    <button type="button" className="field-icon-btn" onClick={() => setShowWecomSecret(value => !value)} title={showWecomSecret ? 'Hide secret' : 'Show secret'} disabled={!wecomSecret}>
+                      {showWecomSecret ? <EyeOff size={17} /> : <Eye size={17} />}
+                    </button>
+                  </span>
+                  {draft.wecom.bot_secret_configured && !wecomSecretDirty && (
+                    <button type="button" className="clear-secret-btn" onClick={() => { setWecomSecret(''); setWecomSecretDirty(true); setSaved(false) }}>
+                      <Trash2 size={14} /> Clear configured secret
+                    </button>
+                  )}
+                  {wecomSecretDirty && wecomSecret === '' && <span className="field-warning">Secret will be cleared when saved.</span>}
+                </label>
+                <TextField label="AI Engine URL" env="SUPERASSIST_WECOM_AI_ENGINE_URL" type="url" value={draft.wecom.ai_engine_url} onChange={value => updateWeCom('ai_engine_url', value)} required />
+                <TextField label="Allowed user IDs" env="SUPERASSIST_WECOM_ALLOWED_USER_IDS" value={draft.wecom.allowed_user_ids} onChange={value => updateWeCom('allowed_user_ids', value)} placeholder="zhangsan,lisi" />
+                <TextField label="Current SuperAssist user ID" value={user?.id || ''} onChange={() => {}} readOnly />
+                <TextField label="WeCom to SuperAssist user map" env="SUPERASSIST_WECOM_USER_ID_MAP" value={draft.wecom.user_id_map} onChange={value => updateWeCom('user_id_map', value)} placeholder={'{"zhangsan":"user_xxx","chat:group_id":"user_shared"}'} spellCheck="false" />
+                <NumberField label="Maximum concurrent requests" env="SUPERASSIST_WECOM_MAX_CONCURRENT" value={draft.wecom.max_concurrent} onChange={value => updateWeCom('max_concurrent', value)} min={1} max={32} step={1} />
+                <NumberField label="Stream update interval" env="SUPERASSIST_WECOM_STREAM_INTERVAL_MS" value={draft.wecom.stream_interval_ms} onChange={value => updateWeCom('stream_interval_ms', value)} suffix="ms" min={100} max={5000} step={50} />
+                <ToggleField label="Enable RAG by default" env="SUPERASSIST_WECOM_RAG_MODE_DEFAULT" checked={Boolean(draft.wecom.rag_mode_default)} onChange={value => updateWeCom('rag_mode_default', value)} />
+                </div>
+              </section>
+              <section className="settings-section wecom-section">
+                <h2>Desktop RPA for external groups</h2>
+                <div className="settings-grid">
+                  <TextField label="Allowed group names" env="SUPERASSIST_WECOM_RPA_ALLOWED_GROUPS" value={draft.wecom.rpa_allowed_groups} onChange={value => updateWeCom('rpa_allowed_groups', value)} placeholder="项目答疑群,客户交流群" />
+                  <TextField label="Wake prefixes" env="SUPERASSIST_WECOM_RPA_TRIGGER_PREFIXES" value={draft.wecom.rpa_trigger_prefixes} onChange={value => updateWeCom('rpa_trigger_prefixes', value)} placeholder="@SuperAssist,小助手" />
+                  <NumberField label="Polling interval" env="SUPERASSIST_WECOM_RPA_POLL_INTERVAL_SECONDS" value={draft.wecom.rpa_poll_interval_seconds} onChange={value => updateWeCom('rpa_poll_interval_seconds', value)} suffix="seconds" min={0.5} max={30} step={0.5} />
+                  <NumberField label="Reply chunk size" env="SUPERASSIST_WECOM_RPA_REPLY_MAX_CHARS" value={draft.wecom.rpa_reply_max_chars} onChange={value => updateWeCom('rpa_reply_max_chars', value)} suffix="characters" min={100} max={10000} step={100} />
+                </div>
+              </section>
+            </>
           )}
         </div>
       </div>

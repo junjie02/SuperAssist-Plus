@@ -26,7 +26,7 @@
 10. [`teams/` — `team_task` 监督器与哈希链 ledger](#10-teams)
 11. [`tools/` — LangChain `@tool` 集合](#11-tools)
 12. [`skills/` — SKILL.md 注册表与虚拟路径](#12-skills)
-13. [`channels/feishu` — 飞书 WebSocket 通道](#13-channelsfeishu)
+13. [`channels/feishu` / `channels/wecom` — 飞书与企业微信通道](#13-channelsfeishu)
 14. [`ui/server.py` — FastAPI 记忆图查看器后端](#14-uiserverpy)
 15. [`cli.py` — `superassist` 命令入口](#15-clipy)
 16. [跨模块时序：一条用户消息从进入到落库](#16-cross-module-sequence)
@@ -220,6 +220,18 @@
 | `feishu_allowed_open_ids` | `""` | 逗号分隔；`feishu_allowed_open_id_set` 属性返回去空白后的 set。 |
 | `feishu_mention_only` | `True` | True 且非私聊时只响应被 @ 消息。 |
 
+**企业微信**
+
+| 字段 | 默认 | 备注 |
+| --- | --- | --- |
+| `wecom_bot_id` / `wecom_bot_secret` | `""` | 官方智能机器人长连接凭据；任意为空时通道拒绝启动。 |
+| `wecom_allowed_user_ids` | `""` | 逗号分隔 userid 白名单；留空允许机器人可见范围内所有成员。 |
+| `wecom_user_id_map` | `{}` | JSON 对象；单聊键为 userid，群聊键为 `chat:<chatid>`，映射到 Go/JWT user_id 以共享 Memory 与 LightRAG。 |
+| `wecom_rag_mode_default` | `False` | 新会话的知识库检索默认值，后续可通过 `/rag on/off` 覆盖。 |
+| `wecom_max_concurrent` | `3` | 企业微信通道全局 Agent 并发上限。 |
+| `wecom_stream_interval_ms` | `300` | 向企业微信合并发送流式更新的最小间隔。 |
+| `wecom_ai_engine_url` | `http://127.0.0.1:8765` | 复用现有 AI Engine 的地址。 |
+
 ### 2.2 派生属性
 
 | 属性 | 计算 |
@@ -230,6 +242,7 @@
 | `faiss_dir` | `data_dir / "faiss"` |
 | `rag_dir` | `data_dir / "rag"` |
 | `feishu_thread_store_path` | `data_dir / "channels" / "feishu_threads.json"` |
+| `wecom_thread_store_path` | `data_dir / "channels" / "wecom_threads.json"` |
 
 `PROJECT_ROOT` 同时被 [`teams/config.py`](superassist/teams/config.py) 用来定位 `agent_team.toml`、被 [`skills/registry.py`](superassist/skills/registry.py) 定位 `skills/`、被 [`tools/shell.py`](superassist/tools/shell.py) 限制 `cwd` 不可越界、被 [`ui/server.py`](superassist/ui/server.py) 定位 `frontend/`。
 
@@ -703,7 +716,7 @@ LangChain 1.x middleware 的钩子分类：`before_agent` / `after_agent`（agen
 
 - 钩子：`after_agent`（**注册顺序在 DynamicContextMiddleware 之后，因此 after_agent 反向时它在 MemoryRecallMiddleware 之后、ToolEventMiddleware 之前**——但 after_agent 与 after_model 钩子不冲突）。
 - 流程见 §6.6；返回 `{"metadata": metadata, "loaded_skills": loaded_skills}` 让 LangChain 把 metadata 与 loaded skills 合并进 state（`loaded_skills` 排序去重后写回，确保跨 turn 稳定）。
-- 持久化文件：`<data_dir>/threads/<thread_id>/messages.jsonl` 与 `thread_meta.json`（仅持久化 `loaded_skills` / `summary` / `summary_updated_at`）。
+- 持久化文件：`<data_dir>/threads/<thread_id>/messages.jsonl` 与 `thread_meta.json`。元数据持久化 `user_id`（Go 会话所有权与管理员审计依据）、`loaded_skills`、`summary`、`summary_updated_at`。
 
 ### 7.6 `ToolEventMiddleware`
 
@@ -1150,7 +1163,7 @@ LangChain `@tool("team_task")`：
 3. `clean_mention_text` 去掉 @ 文本。
 4. 文本为空但有附件 → 回 `UNSUPPORTED_FILE_MESSAGE`。
 5. 先发占位卡片"Preparing context..."。
-6. `user_id = f"feishu:{open_id}"`；`thread_id` 通过 `FeishuThreadStore.get_or_create_thread_id(chat_id, topic_id, user_id)`。
+6. 私聊使用 `user_id = f"feishu:{open_id}"` 与稳定 `__private__` thread scope；群聊使用 `user_id = f"feishu-group:{chat_id}"` 与稳定 `__group__` scope，同群成员共享短记忆、长期 Memory 图和 RAG。群消息送入 runtime 前加 `[飞书群成员: <nickname|name|群成员>]` 前缀；昵称由 Contact v3 用户接口解析并缓存，禁止回退显示 raw open_id；同 scope 通过 `asyncio.Lock` 串行写入。
 7. 构造 `report` 闭包：仅放行 `thinking` / `agent_text` / `subagent_text` 三类事件，其它事件 `return`；subagent_text 走 `format_subagent_card_text` 加 `Subagent [...]:` 前缀。
 8. `runtime = runtime_factory(report)`，`asyncio.to_thread(runtime.run_streaming, clean_text, user_id, thread_id)`，最后 `runtime.memory_queue.flush()` 强制落库。
 9. `final_text = result.answer or 上次卡片缓存 or "(empty response)"`，调 `_send_or_patch(..., final=True)`。
@@ -1158,7 +1171,7 @@ LangChain `@tool("team_task")`：
 
 #### 13.2.3 卡片渲染
 
-- 单个 `message_id` 对应一个 `_running_cards[message_id] = card_id`。第一次回复用 `reply_card`（`reply_in_thread=True` 嵌入消息线程），此后所有更新走 `_update_card`（`im.v1.message.patch`）；私聊走 `_create_card`。
+- 单个 `message_id` 对应一个 `_running_cards[message_id] = card_id`。群聊第一次回复按事件 `chat_id` 调用 `im.v1.message.create`，保证卡片出现在原群主消息流；私聊使用 `reply_card`。中间文本进入每消息唯一的 coalescing worker，约 300ms 合并并串行调用 `_update_card`；最终答案必须等待 pending patch 全部完成后再提交，禁止旧片段覆盖最终卡片。
 - `final=True` 时清掉本 message 的 running card 与上次文本缓存。
 - 卡片 content 是 `interactive` 类型的 markdown 元素（`build_card_content`）。
 
@@ -1188,6 +1201,31 @@ JSON 文件，路径来自 `Settings.feishu_thread_store_path`。
 
 注册 SIGINT/SIGTERM 触发 stop_event；`await stop_event.wait()` 阻塞主协程。`main()` 是 console script 入口，先 `load_dotenv()`、配 INFO logging。
 
+### 13.5 `WeComChannel` / `AIEngineClient`
+
+`channels/wecom.py` 使用官方 `wecom-aibot-python-sdk` 的 `WSClient` 接收 `text/voice/mixed` 消息和进入会话事件。它不直接构建 `AgentRuntime`，而由 `channels/ai_engine_client.py` 调用 `/internal/chat` 并解析 SSE，从而复用 AI Engine 内唯一的 Memory/LightRAG 生命周期。
+
+- 单聊用户键：`wecom:<bot_id>:<sender_userid>`，thread scope 为 sender userid。
+- 群聊用户键：`wecom-group:<bot_id>:<chat_id>`，thread scope 固定为 `__group__`，所有群成员共享上下文、Memory 和 RAG 状态。
+- `wecom_user_id_map` 单聊查 sender userid，群聊查 `chat:<chatid>`；命中后改用映射的网页 user id，身份变化时 store 轮换 thread。
+- `WeComThreadStore` 原子持久化 thread id 和每会话 RAG 开关。
+- 同会话用 `asyncio.Lock` 串行，全局用 `Semaphore` 限流；回调 msgid 用有界 TTL 缓存去重。
+- `/rag on|off|status` 不进入模型，直接读写通道状态。
+- 流式回复先在 5 秒内发送准备状态，再按 `stream_interval_ms` 合并更新，`done.answer` 作为最终内容。
+- 图片/文件提示用户走 Knowledge 上传；语音使用企业微信转写文本。
+
+完整管理后台步骤与运维约束见 [`channels/WECOM.md`](superassist/channels/WECOM.md)。
+
+### 13.6 `WeComRPAChannel`
+
+`channels/wecom_rpa.py` 面向企业微信 5.x 中由普通微信用户创建的外部群。由于消息控件不暴露 UIA，它通过 `pywinauto` 截图、RapidOCR 和气泡区域分割读取当前可见群聊，再复用 `/internal/chat`。安全门按固定顺序执行：标题含“外部群” -> 群名白名单 -> 消息以前缀唤醒 -> 持久化去重 -> Agent；发送前再次 OCR 校验群名。窗口最小化、切到私聊/非白名单群、无法识别发送按钮时一律停止发送。
+
+- 只监控当前打开的群，不自动点击会话列表。
+- 群身份默认为 `wecom-rpa-group:<group-name-hash>`，thread scope 固定为 `__group__`。
+- `wecom_user_id_map` 可用 `rpa:<群名>` 映射到网页知识空间。
+- `.superassist/channels/wecom_rpa_state.json` 保存 24 小时可见消息指纹，启动时先 prime，避免回复历史消息。
+- RPA 使用浅色主题的气泡颜色定位；客户端升级或主题变化后必须重新做只读识别验证。
+
 ---
 
 <a id="14-uiserverpy"></a>
@@ -1213,7 +1251,7 @@ AI Engine 内部路由：
 | `GET /internal/health` | Go 健康检查。 |
 | `POST /internal/chat` | 接收 `user_id/message/thread_id/rag_mode`，返回 SSE 事件流。 |
 | `GET /internal/graph` | 按 Go 注入的 `user_id` 返回长期记忆图。 |
-| `GET/PUT /internal/settings` | 读取、校验并写回 Memory/飞书配置；secret 只写不回显。 |
+| `GET/PUT /internal/settings` | 读取、校验并写回 Memory/飞书/企业微信配置；secret 只写不回显。 |
 | `GET/POST/DELETE /internal/rag/documents...` | LightRAG 文档列表、上传和删除。 |
 | `GET /internal/rag/graph` | 当前用户知识图。 |
 

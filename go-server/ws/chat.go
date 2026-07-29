@@ -26,12 +26,17 @@ type ChatMessage struct {
 
 // ChatHandler manages WebSocket chat connections.
 type ChatHandler struct {
-	client    *proxy.PythonClient
-	jwtSecret string
+	client          *proxy.PythonClient
+	jwtSecret       string
+	canAccessThread func(userID, threadID string) bool
 }
 
-func NewChatHandler(client *proxy.PythonClient, jwtSecret string) *ChatHandler {
-	return &ChatHandler{client: client, jwtSecret: jwtSecret}
+func NewChatHandler(
+	client *proxy.PythonClient,
+	jwtSecret string,
+	canAccessThread func(userID, threadID string) bool,
+) *ChatHandler {
+	return &ChatHandler{client: client, jwtSecret: jwtSecret, canAccessThread: canAccessThread}
 }
 
 // Handle upgrades the HTTP connection to WebSocket and proxies chat messages
@@ -75,6 +80,10 @@ func (h *ChatHandler) Handle(c *gin.Context) {
 		}
 
 		if msg.Message == "" {
+			continue
+		}
+		if h.canAccessThread != nil && !h.canAccessThread(userID, msg.ThreadID) {
+			conn.WriteJSON(gin.H{"type": "error", "message": "thread not found or access denied"})
 			continue
 		}
 

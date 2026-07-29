@@ -13,7 +13,7 @@ export function AuthProvider({ children }) {
       return
     }
     api.get('/auth/me')
-      .then(data => setUser({ id: data.user_id, username: data.username }))
+      .then(data => setUser({ id: data.user_id, username: data.username, isAdmin: data.is_admin === true }))
       .catch(() => clearToken())
       .finally(() => setLoading(false))
   }, [])
@@ -25,7 +25,7 @@ export function AuthProvider({ children }) {
 
   const loginUser = useCallback((data) => {
     setToken(data.access_token)
-    setUser({ id: data.user_id, username: data.username })
+    setUser({ id: data.user_id, username: data.username, isAdmin: data.is_admin === true })
   }, [])
 
   return (

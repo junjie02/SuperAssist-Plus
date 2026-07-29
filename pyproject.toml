@@ -16,6 +16,8 @@ dependencies = [
     "lark-oapi>=1.4.0",
     "networkx>=3.2.0",
     "numpy>=1.26.0",
+    "openai>=2.0.0",
+    "pillow>=10.4.0,<13.0.0",
     "pydantic>=2.8.0",
     "pydantic-settings>=2.4.0",
     "pypdf>=6.1.0,<7.0.0",
@@ -29,6 +31,9 @@ dependencies = [
     "sqlalchemy>=2.0.0",
     "typing-extensions>=4.12.0",
     "uvicorn>=0.30.0",
+    "wecom-aibot-python-sdk==1.0.2",
+    "pywinauto>=0.6.9,<0.7.0; sys_platform == 'win32'",
+    "rapidocr-onnxruntime>=1.4.4,<2.0.0; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
@@ -40,6 +45,8 @@ dev = [
 [project.scripts]
 superassist = "superassist.cli:main"
 superassist-feishu = "superassist.channels.feishu:main"
+superassist-wecom = "superassist.channels.wecom:main"
+superassist-wecom-rpa = "superassist.channels.wecom_rpa:main"
 superassist-memory-ui = "superassist.ui.server:main"
 superassist-ai-engine = "superassist.ui.server:serve_main"
 

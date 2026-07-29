@@ -8,7 +8,7 @@ import time
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import Runnable
 from langchain_openai import ChatOpenAI
@@ -27,6 +27,30 @@ class OneSecondRetryChatModel(ChatOpenAI):
         except Exception:
             time.sleep(1)
             return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+    def _convert_chunk_to_generation_chunk(  # type: ignore[no-untyped-def]
+        self, chunk, default_chunk_class, base_generation_info
+    ):
+        generation = super()._convert_chunk_to_generation_chunk(
+            chunk, default_chunk_class, base_generation_info
+        )
+        if generation is None or not isinstance(generation.message, AIMessageChunk):
+            return generation
+        choices = chunk.get("choices", []) or chunk.get("chunk", {}).get("choices", [])
+        delta = choices[0].get("delta") if choices else None
+        if not isinstance(delta, Mapping):
+            return generation
+        reasoning = _merge_reasoning(
+            delta.get("reasoning_content") if isinstance(delta.get("reasoning_content"), str) else None,
+            delta.get("reasoning") if isinstance(delta.get("reasoning"), str) else None,
+            _extract_reasoning_text(delta.get("reasoning_details")),
+        )
+        if not reasoning:
+            return generation
+        additional_kwargs = dict(generation.message.additional_kwargs)
+        additional_kwargs["reasoning_content"] = reasoning
+        message = generation.message.model_copy(update={"additional_kwargs": additional_kwargs})
+        return generation.model_copy(update={"message": message})
 
 
 class FallbackChatModel(BaseChatModel):

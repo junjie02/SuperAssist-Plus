@@ -6,6 +6,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"gorm.io/gorm"
+
+	"superassist-go/model"
 )
 
 // JWTAuth returns a Gin middleware that validates Bearer tokens.
@@ -47,6 +50,22 @@ func JWTAuth(secret string) gin.HandlerFunc {
 		}
 
 		c.Set("user_id", userID)
+		c.Next()
+	}
+}
+
+// RequireAdmin rejects authenticated users without the persisted admin role.
+func RequireAdmin(db *gorm.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var user model.User
+		if err := db.Select("id", "is_admin").Where("id = ?", c.GetString("user_id")).First(&user).Error; err != nil {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"detail": "administrator access required"})
+			return
+		}
+		if !user.IsAdmin {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"detail": "administrator access required"})
+			return
+		}
 		c.Next()
 	}
 }

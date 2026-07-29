@@ -123,7 +123,7 @@ export default function GraphCanvas({
       n.y = st.drag.ny + dy
       posRef.current.set(n.id, { x: n.x, y: n.y })
       if (st.drag.moved) pinnedRef.current.add(n.id)
-      updatePositions(st)
+      updatePositions(st, svgRef.current)
       return
     }
     if (st.pan) {
@@ -242,13 +242,13 @@ function fullRender(svg, laidOut, edges, w, h, onSelect, showEdgeLabels) {
   vp.append(elL, nlL); svg.append(vp)
 }
 
-function updatePositions(st) {
+function updatePositions(st, svg) {
   const es = st.edgeState; if (!es) return
-  document.querySelectorAll('.node-layer .node').forEach(g => {
+  svg?.querySelectorAll('.node-layer .node').forEach(g => {
     const n = st.laidOut.find(x => x.id === g.dataset.id)
     if (n) g.setAttribute('transform', `translate(${n.x}, ${n.y})`)
   })
-  document.querySelectorAll('.edge-layer .edge').forEach(g => {
+  svg?.querySelectorAll('.edge-layer .edge').forEach(g => {
     const s = es.nodeMap.get(g.dataset.sourceId), t = es.nodeMap.get(g.dataset.targetId)
     if (!s || !t) return
     const geo = edgeGeometry(s, t, Number(g.dataset.curveOffset) || 0)

@@ -19,8 +19,15 @@ func NewGraphHandler(client *proxy.PythonClient) *GraphHandler {
 
 // GET /api/graph — proxy to Python AI engine.
 func (h *GraphHandler) Get(c *gin.Context) {
-	userID := c.GetString("user_id")
+	h.writeGraph(c, c.GetString("user_id"))
+}
 
+// GET /api/admin/users/:user_id/graph — fetch a selected identity's memory graph.
+func (h *GraphHandler) GetAdminUser(c *gin.Context) {
+	h.writeGraph(c, c.Param("user_id"))
+}
+
+func (h *GraphHandler) writeGraph(c *gin.Context, userID string) {
 	raw, err := h.client.GraphPayload(userID)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"detail": "failed to fetch graph from AI engine"})

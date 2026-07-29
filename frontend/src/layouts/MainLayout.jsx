@@ -1,10 +1,11 @@
 import { NavLink, useLocation, useNavigate } from 'react-router-dom'
-import { Bot, Library, LogOut, MessageSquare, Settings, Share2 } from 'lucide-react'
+import { Bot, Library, LogOut, MessageSquare, Settings, Share2, Users } from 'lucide-react'
 import { useAuth } from '../hooks/useAuth'
 import ChatPage from '../pages/ChatPage'
 import GraphPage from '../pages/GraphPage'
 import SettingsPage from '../pages/SettingsPage'
 import KnowledgePage from '../pages/KnowledgePage'
+import UsersPage from '../pages/UsersPage'
 
 export default function MainLayout() {
   const { user, logout } = useAuth()
@@ -14,7 +15,8 @@ export default function MainLayout() {
   const showGraph = location.pathname.startsWith('/graph')
   const showSettings = location.pathname.startsWith('/settings')
   const showKnowledge = location.pathname.startsWith('/knowledge')
-  const showChat = !showGraph && !showSettings && !showKnowledge
+  const showUsers = location.pathname.startsWith('/users')
+  const showChat = !showGraph && !showSettings && !showKnowledge && !showUsers
 
   const handleLogout = () => {
     logout()
@@ -48,6 +50,14 @@ export default function MainLayout() {
               <span>Knowledge</span>
             </NavLink>
           </li>
+          {user?.isAdmin && (
+            <li>
+              <NavLink to="/users" className={({ isActive }) => isActive ? 'nav-item active' : 'nav-item'}>
+                <Users size={18} aria-hidden="true" />
+                <span>Users</span>
+              </NavLink>
+            </li>
+          )}
           <li>
             <NavLink to="/settings" className={({ isActive }) => isActive ? 'nav-item active' : 'nav-item'}>
               <Settings size={18} aria-hidden="true" />
@@ -73,6 +83,7 @@ export default function MainLayout() {
         </div>
         {showKnowledge && <KnowledgePage />}
         {showSettings && <SettingsPage />}
+        {showUsers && <UsersPage />}
       </main>
     </div>
   )

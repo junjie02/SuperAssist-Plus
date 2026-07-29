@@ -34,6 +34,9 @@ func main() {
 
 	// ---- Services ----------------------------------------------------------
 	authSvc := service.NewAuthService(db, cfg)
+	if err := authSvc.SyncConfiguredAdmins(); err != nil {
+		log.Fatalf("Failed to sync configured administrators: %v", err)
+	}
 	pythonClient := proxy.NewPythonClient(cfg.PythonHost)
 
 	// ---- Handlers ----------------------------------------------------------
@@ -42,7 +45,7 @@ func main() {
 	settingsH := handler.NewSettingsHandler(pythonClient)
 	ragH := handler.NewRAGHandler(pythonClient)
 	threadH := handler.NewThreadHandler(db, cfg.DataDir)
-	chatH := ws.NewChatHandler(pythonClient, cfg.JWTSecret)
+	chatH := ws.NewChatHandler(pythonClient, cfg.JWTSecret, threadH.CanAccessThread)
 
 	// ---- Router ------------------------------------------------------------
 	gin.SetMode(gin.ReleaseMode)
@@ -70,6 +73,16 @@ func main() {
 		api.GET("/rag/graph", ragH.Graph)
 		api.POST("/rag/documents", ragH.Upload)
 		api.DELETE("/rag/documents/:id", ragH.Delete)
+
+		admin := api.Group("/admin")
+		admin.Use(middleware.RequireAdmin(db))
+		{
+			admin.GET("/users", threadH.GetAdminUsers)
+			admin.GET("/users/:user_id/threads", threadH.GetAdminUserThreads)
+			admin.GET("/users/:user_id/threads/:thread_id/history", threadH.GetAdminUserHistory)
+			admin.DELETE("/users/:user_id/threads/:thread_id/messages/:record_index", threadH.DeleteAdminUserMessage)
+			admin.GET("/users/:user_id/graph", graphH.GetAdminUser)
+		}
 	}
 
 	// WebSocket (auth via query param)

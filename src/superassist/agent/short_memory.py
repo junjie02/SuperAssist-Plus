@@ -75,26 +75,12 @@ def load_short_memory(
     messages_path: Path,
     metadata: dict[str, Any],
     *,
-    token_limit: int,
+    keep_recent_turns: int,
 ) -> ShortMemoryLoad:
     records = read_jsonl(messages_path)
-    summary = str(metadata.get("summary") or "").strip()
-    budget = max(0, token_limit - estimate_tokens(summary))
-    selected: list[dict[str, Any]] = []
-    total = 0
-    for record in reversed(records):
-        cost = estimate_tokens(_record_text(record))
-        if selected and total + cost > budget:
-            break
-        selected.append(record)
-        total += cost
-    selected.reverse()
-
-    messages: list[BaseMessage] = []
-    if summary:
-        messages.append(HumanMessage(content=f"Here is a summary of the conversation to date:\n\n{summary}", name="summary"))
-    messages.extend(record_to_message(record) for record in selected)
-    return ShortMemoryLoad(messages=messages, records=selected, summary=summary)
+    _older, selected = split_records_for_compression(records, keep_recent_turns)
+    messages = [record_to_message(record) for record in selected]
+    return ShortMemoryLoad(messages=messages, records=selected, summary="")
 
 
 def turn_records(

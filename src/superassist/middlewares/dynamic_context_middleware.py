@@ -10,21 +10,33 @@ and dynamic data flows through the same channel.
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Any, Callable
+from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 from langchain_core.messages import BaseMessage, SystemMessage
 from langgraph.runtime import Runtime
 
 from superassist.agent.state import SuperAssistState
-from superassist.skills import build_available_skills_section, build_loaded_skills_section
+from superassist.skills import active_skill_names, build_available_skills_section, build_loaded_skills_section
 
 
 class DynamicContextMiddleware(AgentMiddleware[SuperAssistState]):
     """Prepend turn-time runtime context to the agent's system message."""
 
     state_schema = SuperAssistState
+
+    def __init__(
+        self,
+        skill_active_ttl_seconds: int = 300,
+        *,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        super().__init__()
+        self._skill_active_ttl_seconds = skill_active_ttl_seconds
+        self._clock = clock
 
     def before_model(self, state: SuperAssistState, runtime: Runtime) -> dict[str, Any] | None:
         metadata = dict(state.get("metadata") or {})
@@ -38,7 +50,14 @@ class DynamicContextMiddleware(AgentMiddleware[SuperAssistState]):
     ) -> ModelResponse:
         state = request.state or {}
         memory_recall = state.get("memory_recall", {})
-        loaded_skills = state.get("loaded_skills", [])
+        currently_active = set(active_skill_names(
+            state.get("skill_activations"),
+            self._skill_active_ttl_seconds,
+            now=self._clock(),
+        ))
+        loaded_skills = sorted(
+            currently_active.intersection(state.get("active_skills_at_turn_start") or [])
+        )
         user_id = state.get("user_id", "local-user")
         thread_id = state.get("thread_id", "")
         rag_mode = bool(state.get("rag_mode"))

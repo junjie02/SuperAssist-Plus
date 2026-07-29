@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from functools import lru_cache
 from pathlib import Path
 
@@ -33,7 +34,7 @@ class Settings(BaseSettings):
     subagent_max_turns: int = Field(default=20, alias="SUPERASSIST_SUBAGENT_MAX_TURNS")
     memory_llm_writer_enabled: bool = Field(default=False, alias="SUPERASSIST_MEMORY_LLM_WRITER_ENABLED")
     short_memory_token_limit: int = Field(default=80000, alias="SUPERASSIST_SHORT_MEMORY_TOKEN_LIMIT")
-    short_memory_keep_recent_turns: int = Field(default=10, alias="SUPERASSIST_SHORT_MEMORY_KEEP_RECENT_TURNS")
+    short_memory_keep_recent_turns: int = Field(default=30, alias="SUPERASSIST_SHORT_MEMORY_KEEP_RECENT_TURNS")
     short_memory_summary_target_tokens: int = Field(
         default=6000,
         alias="SUPERASSIST_SHORT_MEMORY_SUMMARY_TARGET_TOKENS",
@@ -41,6 +42,12 @@ class Settings(BaseSettings):
     short_memory_enable_tool_events: bool = Field(
         default=True,
         alias="SUPERASSIST_SHORT_MEMORY_ENABLE_TOOL_EVENTS",
+    )
+    skill_active_ttl_seconds: int = Field(
+        default=300,
+        ge=30,
+        le=86400,
+        alias="SUPERASSIST_SKILL_ACTIVE_TTL_SECONDS",
     )
 
     memory_reinforce_similarity: float = Field(default=0.85, alias="SUPERASSIST_MEMORY_REINFORCE_SIMILARITY")
@@ -72,6 +79,28 @@ class Settings(BaseSettings):
     feishu_domain: str = Field(default="https://open.feishu.cn", alias="SUPERASSIST_FEISHU_DOMAIN")
     feishu_allowed_open_ids: str = Field(default="", alias="SUPERASSIST_FEISHU_ALLOWED_OPEN_IDS")
     feishu_mention_only: bool = Field(default=True, alias="SUPERASSIST_FEISHU_MENTION_ONLY")
+    feishu_active_session_seconds: int = Field(
+        default=180,
+        alias="SUPERASSIST_FEISHU_ACTIVE_SESSION_SECONDS",
+    )
+    wecom_bot_id: str = Field(default="", alias="SUPERASSIST_WECOM_BOT_ID")
+    wecom_bot_secret: str = Field(default="", alias="SUPERASSIST_WECOM_BOT_SECRET")
+    wecom_allowed_user_ids: str = Field(default="", alias="SUPERASSIST_WECOM_ALLOWED_USER_IDS")
+    wecom_user_id_map: str = Field(default="{}", alias="SUPERASSIST_WECOM_USER_ID_MAP")
+    wecom_rag_mode_default: bool = Field(default=False, alias="SUPERASSIST_WECOM_RAG_MODE_DEFAULT")
+    wecom_max_concurrent: int = Field(default=3, alias="SUPERASSIST_WECOM_MAX_CONCURRENT")
+    wecom_stream_interval_ms: int = Field(default=300, alias="SUPERASSIST_WECOM_STREAM_INTERVAL_MS")
+    wecom_ai_engine_url: str = Field(
+        default="http://127.0.0.1:8765",
+        alias="SUPERASSIST_WECOM_AI_ENGINE_URL",
+    )
+    wecom_rpa_allowed_groups: str = Field(default="", alias="SUPERASSIST_WECOM_RPA_ALLOWED_GROUPS")
+    wecom_rpa_trigger_prefixes: str = Field(default="", alias="SUPERASSIST_WECOM_RPA_TRIGGER_PREFIXES")
+    wecom_rpa_poll_interval_seconds: float = Field(
+        default=1.5,
+        alias="SUPERASSIST_WECOM_RPA_POLL_INTERVAL_SECONDS",
+    )
+    wecom_rpa_reply_max_chars: int = Field(default=3000, alias="SUPERASSIST_WECOM_RPA_REPLY_MAX_CHARS")
 
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",
@@ -107,6 +136,40 @@ class Settings(BaseSettings):
     @property
     def feishu_thread_store_path(self) -> Path:
         return self.data_dir / "channels" / "feishu_threads.json"
+
+    @property
+    def wecom_allowed_user_id_set(self) -> set[str]:
+        return {item.strip() for item in self.wecom_allowed_user_ids.split(",") if item.strip()}
+
+    @property
+    def wecom_user_id_mapping(self) -> dict[str, str]:
+        try:
+            value = json.loads(self.wecom_user_id_map)
+        except (TypeError, json.JSONDecodeError):
+            return {}
+        if not isinstance(value, dict):
+            return {}
+        return {
+            str(wecom_id).strip(): str(user_id).strip()
+            for wecom_id, user_id in value.items()
+            if str(wecom_id).strip() and str(user_id).strip()
+        }
+
+    @property
+    def wecom_thread_store_path(self) -> Path:
+        return self.data_dir / "channels" / "wecom_threads.json"
+
+    @property
+    def wecom_rpa_allowed_group_set(self) -> set[str]:
+        return {item.strip() for item in self.wecom_rpa_allowed_groups.split(",") if item.strip()}
+
+    @property
+    def wecom_rpa_trigger_prefix_list(self) -> list[str]:
+        return [item.strip() for item in self.wecom_rpa_trigger_prefixes.split(",") if item.strip()]
+
+    @property
+    def wecom_rpa_state_path(self) -> Path:
+        return self.data_dir / "channels" / "wecom_rpa_state.json"
 
 
 @lru_cache(maxsize=1)

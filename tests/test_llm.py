@@ -1,5 +1,5 @@
 from superassist.config import Settings
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
 from superassist.llm import MiniMaxCompatibleChatModel, OneSecondRetryChatModel, create_chat_model, is_minimax_model
@@ -29,6 +29,25 @@ def test_explicit_temperature_wins() -> None:
     model = create_chat_model(settings)
 
     assert model.temperature == 0.7
+
+
+def test_openai_compatible_stream_preserves_reasoning_content() -> None:
+    model = OneSecondRetryChatModel(model="gpt-reasoning", api_key="secret")
+    generation = model._convert_chunk_to_generation_chunk(
+        {
+            "choices": [
+                {
+                    "delta": {"role": "assistant", "content": "", "reasoning_content": "分析中"},
+                    "finish_reason": None,
+                }
+            ]
+        },
+        AIMessageChunk,
+        None,
+    )
+
+    assert generation is not None
+    assert generation.message.additional_kwargs["reasoning_content"] == "分析中"
 
 
 def test_minimax_detection_uses_model_or_base_url() -> None:

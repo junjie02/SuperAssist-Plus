@@ -9,6 +9,7 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 from superassist.middlewares import DynamicContextMiddleware, ToolEventMiddleware
 from superassist.config import Settings
 from superassist.skills import (
+    active_skill_names,
     build_available_skills_section,
     build_loaded_skills_section,
     list_public_skills,
@@ -30,6 +31,13 @@ def test_available_skill_prompt_contains_metadata_not_full_content() -> None:
     assert "<name>deep-research</name>" in section
     assert "<location>/mnt/skills/public/deep-research/SKILL.md</location>" in section
     assert "# Deep Research Skill" not in section
+
+
+def test_skill_discovery_is_one_level_and_does_not_register_references() -> None:
+    names = {skill.name for skill in list_public_skills()}
+
+    assert "gongkao-huasheng13" in names
+    assert "ziliao-fenxi" not in names
 
 
 def test_read_file_can_read_skill_virtual_path() -> None:
@@ -59,8 +67,8 @@ def test_write_and_delete_do_not_mutate_skill_virtual_path(tmp_path: Path, monke
             raise AssertionError(f"{tool.name} should reject /mnt/skills mutation")
 
 
-def test_reading_skill_records_loaded_skill_and_full_content_can_be_injected() -> None:
-    middleware = ToolEventMiddleware()
+def test_reading_skill_records_timed_activation_and_full_content_can_be_injected() -> None:
+    middleware = ToolEventMiddleware(clock=lambda: 1000.0)
 
     class DummyTool:
         name = "read_file"
@@ -72,7 +80,7 @@ def test_reading_skill_records_loaded_skill_and_full_content_can_be_injected() -
             "args": {"path": "/mnt/skills/public/deep-research/SKILL.md"},
         },
         tool=DummyTool(),
-        state={"tool_events": [], "loaded_skills": []},
+        state={"tool_events": [], "loaded_skills": [], "skill_activations": {}},
         runtime=None,
     )
 
@@ -82,11 +90,41 @@ def test_reading_skill_records_loaded_skill_and_full_content_can_be_injected() -
     )
 
     assert request.state["loaded_skills"] == ["deep-research"]
+    assert request.state["skill_activations"] == {"deep-research": 1000.0}
     assert "# Deep Research Skill" in build_loaded_skills_section(request.state["loaded_skills"])
 
 
+def test_reading_skill_reference_refreshes_activation() -> None:
+    middleware = ToolEventMiddleware(clock=lambda: 1200.0)
+
+    class DummyTool:
+        name = "read_file"
+
+    request = ToolCallRequest(
+        tool_call={
+            "name": "read_file",
+            "id": "call_2",
+            "args": {"path": "/mnt/skills/public/huasheng13/references/ziliao-fenxi.md"},
+        },
+        tool=DummyTool(),
+        state={
+            "tool_events": [],
+            "loaded_skills": ["gongkao-huasheng13"],
+            "skill_activations": {"gongkao-huasheng13": 1000.0},
+        },
+        runtime=None,
+    )
+
+    middleware.wrap_tool_call(
+        request,
+        lambda _request: ToolMessage(content="reference", tool_call_id="call_2", name="read_file"),
+    )
+
+    assert request.state["skill_activations"] == {"gongkao-huasheng13": 1200.0}
+
+
 def test_dynamic_context_injects_available_and_loaded_skills() -> None:
-    middleware = DynamicContextMiddleware()
+    middleware = DynamicContextMiddleware(300, clock=lambda: 1100.0)
 
     class Request:
         state = {
@@ -94,6 +132,8 @@ def test_dynamic_context_injects_available_and_loaded_skills() -> None:
             "thread_id": "t",
             "memory_recall": {},
             "loaded_skills": ["deep-research"],
+            "skill_activations": {"deep-research": 1000.0},
+            "active_skills_at_turn_start": ["deep-research"],
         }
         messages = [HumanMessage(content="Research AI")]
 
@@ -106,3 +146,54 @@ def test_dynamic_context_injects_available_and_loaded_skills() -> None:
     assert "<available_skills>" in content
     assert '<skill name="deep-research">' in content
     assert "# Deep Research Skill" in content
+
+
+def test_expired_skill_keeps_index_but_drops_full_content() -> None:
+    middleware = DynamicContextMiddleware(300, clock=lambda: 1300.0)
+
+    class Request:
+        state = {
+            "user_id": "u",
+            "thread_id": "t",
+            "memory_recall": {},
+            "loaded_skills": ["deep-research"],
+            "skill_activations": {"deep-research": 1000.0},
+            "active_skills_at_turn_start": ["deep-research"],
+        }
+        messages = [HumanMessage(content="hello")]
+
+        def override(self, **kwargs):
+            return kwargs["messages"]
+
+    merged = middleware.wrap_model_call(Request(), lambda value: value)
+    content = str(merged[0].content)
+
+    assert "<available_skills>" in content
+    assert "<name>deep-research</name>" in content
+    assert '<skill name="deep-research">' not in content
+    assert "# Deep Research Skill" not in content
+    assert active_skill_names({"deep-research": 1000.0}, 300, now=1300.0) == []
+
+
+def test_newly_loaded_skill_is_not_duplicated_in_same_turn_context() -> None:
+    middleware = DynamicContextMiddleware(300, clock=lambda: 1001.0)
+
+    class Request:
+        state = {
+            "user_id": "u",
+            "thread_id": "t",
+            "memory_recall": {},
+            "loaded_skills": ["deep-research"],
+            "skill_activations": {"deep-research": 1000.0},
+            "active_skills_at_turn_start": [],
+        }
+        messages = [HumanMessage(content="skill tool result is already in this turn")]
+
+        def override(self, **kwargs):
+            return kwargs["messages"]
+
+    merged = middleware.wrap_model_call(Request(), lambda value: value)
+    content = str(merged[0].content)
+
+    assert "<name>deep-research</name>" in content
+    assert '<skill name="deep-research">' not in content

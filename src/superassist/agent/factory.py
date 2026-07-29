@@ -173,8 +173,8 @@ def _build_middleware_chain(
         chain.append(RagRetryMiddleware())
     chain.extend(
         [
-            DynamicContextMiddleware(),
-            ShortMemoryMiddleware(settings, model),
+            DynamicContextMiddleware(settings.skill_active_ttl_seconds),
+            ShortMemoryMiddleware(settings),
             ToolEventMiddleware(tool_event_reporter),
         ]
     )

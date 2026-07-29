@@ -4,8 +4,8 @@ Replaces the standalone ``persist_turn`` graph node from the previous
 runtime. Runs after the inner agent has produced its final assistant
 message; appends both the user input and assistant answer (plus any tool
 events when enabled) to the thread's JSONL log, then asks
-``maybe_compress_short_memory`` to fold the older portion into a summary if
-the token budget is exceeded.
+Older records remain available for audit and UI history, while model context
+loading uses a fixed recent-turn sliding window.
 """
 
 from __future__ import annotations
@@ -15,13 +15,13 @@ from pathlib import Path
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langgraph.runtime import Runtime
 
-from superassist.agent.short_memory import append_jsonl, maybe_compress_short_memory, turn_records
+from superassist.agent.short_memory import append_jsonl, turn_records
 from superassist.agent.state import SuperAssistState
 from superassist.config import Settings
+from superassist.skills import active_skill_activations, active_skill_names
 
 
 class ShortMemoryMiddleware(AgentMiddleware[SuperAssistState]):
@@ -29,10 +29,9 @@ class ShortMemoryMiddleware(AgentMiddleware[SuperAssistState]):
 
     state_schema = SuperAssistState
 
-    def __init__(self, settings: Settings, model: BaseChatModel) -> None:
+    def __init__(self, settings: Settings, _legacy_model: Any | None = None) -> None:
         super().__init__()
         self._settings = settings
-        self._model = model
 
     def after_agent(self, state: SuperAssistState, runtime: Runtime) -> dict[str, Any] | None:
         thread_id = state.get("thread_id") or ""
@@ -56,28 +55,29 @@ class ShortMemoryMiddleware(AgentMiddleware[SuperAssistState]):
             ),
         )
 
-        loaded_skills = sorted(set(state.get("loaded_skills") or []))
-        thread_metadata = self._load_thread_metadata(thread_dir)
-        compression_update = maybe_compress_short_memory(
-            messages_path=path,
-            metadata=thread_metadata,
-            model=self._model,
-            token_limit=self._settings.short_memory_token_limit,
-            keep_recent_turns=self._settings.short_memory_keep_recent_turns,
-            summary_target_tokens=self._settings.short_memory_summary_target_tokens,
-            loaded_skills=loaded_skills,
+        skill_activations = active_skill_activations(
+            state.get("skill_activations"),
+            self._settings.skill_active_ttl_seconds,
         )
-
-        meta_update: dict[str, Any] = {"loaded_skills": loaded_skills}
-        for key in ("summary", "summary_updated_at"):
-            if key in compression_update:
-                meta_update[key] = compression_update[key]
+        loaded_skills = active_skill_names(
+            skill_activations,
+            self._settings.skill_active_ttl_seconds,
+        )
+        meta_update: dict[str, Any] = {
+            "loaded_skills": loaded_skills,
+            "skill_activations": skill_activations,
+            "user_id": str(state.get("user_id") or ""),
+        }
         self._save_thread_metadata(thread_dir, meta_update)
 
         metadata = dict(state.get("metadata") or {})
         metadata["messages_path"] = str(path)
-        metadata.update(compression_update)
-        return {"metadata": metadata, "loaded_skills": loaded_skills}
+        metadata["short_memory_window_turns"] = self._settings.short_memory_keep_recent_turns
+        return {
+            "metadata": metadata,
+            "loaded_skills": loaded_skills,
+            "skill_activations": skill_activations,
+        }
 
     @staticmethod
     def _load_thread_metadata(thread_dir: Path) -> dict[str, Any]:

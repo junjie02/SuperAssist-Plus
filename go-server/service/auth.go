@@ -53,6 +53,7 @@ func (s *AuthService) Register(username, password string) (string, *model.User, 
 		ID:           model.NewUserID(),
 		Username:     username,
 		PasswordHash: string(hash),
+		IsAdmin:      s.cfg.IsAdminUsername(username),
 		CreatedAt:    time.Now().UTC(),
 		UpdatedAt:    time.Now().UTC(),
 	}
@@ -67,6 +68,18 @@ func (s *AuthService) Register(username, password string) (string, *model.User, 
 	}
 
 	return token, &user, nil
+}
+
+// SyncConfiguredAdmins promotes configured existing users during startup.
+func (s *AuthService) SyncConfiguredAdmins() error {
+	for username := range s.cfg.AdminUsernames {
+		if err := s.db.Model(&model.User{}).
+			Where("LOWER(username) = ?", username).
+			Update("is_admin", true).Error; err != nil {
+			return fmt.Errorf("sync admin %s: %w", username, err)
+		}
+	}
+	return nil
 }
 
 // Login verifies credentials and returns a JWT token.

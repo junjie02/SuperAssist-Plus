@@ -22,7 +22,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from superassist.agent.factory import AgentBundle, build_agent
 from superassist.agent.prompts import SYSTEM_PROMPT, subagent_section as subagent_prompt_section, team_section as team_prompt_section
 from superassist.agent.short_memory import load_short_memory
-from superassist.agent.streaming import accumulate_stream_text
+from superassist.agent.streaming import StreamParts, accumulate_stream_parts, clean_answer_text
 from superassist.agent.state import SuperAssistState
 from superassist.config import Settings, get_settings
 from superassist.llm import is_minimax_model
@@ -31,6 +31,7 @@ from superassist.observability import runnable_trace_config, traceable, without_
 from superassist.rag.context import rag_turn_context
 from superassist.rag.service import LightRAGService
 from superassist.run_events import run_event_reporter_context
+from superassist.skills import active_skill_activations, active_skill_names
 from superassist.teams import set_team_supervisor
 from superassist.teams.context import team_thread_context
 
@@ -129,12 +130,36 @@ class AgentRuntime:
 
     # -- Streaming turn ----------------------------------------------------
 
-    def run_streaming(self, message: str, *, user_id: str = "local-user", thread_id: str | None = None) -> AgentRunResult:
-        return self._run_streaming_traced(message, user_id=user_id, thread_id=thread_id)
+    def run_streaming(
+        self,
+        message: str,
+        *,
+        user_id: str = "local-user",
+        thread_id: str | None = None,
+        message_content: str | list[dict[str, Any]] | None = None,
+    ) -> AgentRunResult:
+        return self._run_streaming_traced(
+            message,
+            user_id=user_id,
+            thread_id=thread_id,
+            message_content=message_content,
+        )
 
     @traceable(name="superassist.turn.streaming", run_type="chain", process_inputs=without_self)
-    def _run_streaming_traced(self, message: str, *, user_id: str, thread_id: str | None) -> AgentRunResult:
-        state = self._initial_state(message, user_id=user_id, thread_id=thread_id)
+    def _run_streaming_traced(
+        self,
+        message: str,
+        *,
+        user_id: str,
+        thread_id: str | None,
+        message_content: str | list[dict[str, Any]] | None = None,
+    ) -> AgentRunResult:
+        state = self._initial_state(
+            message,
+            user_id=user_id,
+            thread_id=thread_id,
+            message_content=message_content,
+        )
         with run_event_reporter_context(self._run_event_reporter):
             self._report_run_event("preparing_context", "Preparing context...", thread_id=state["thread_id"])
             self._report_run_event("thinking", "Thinking...", thread_id=state["thread_id"])
@@ -146,7 +171,7 @@ class AgentRuntime:
 
     def _stream_agent(self, state: SuperAssistState, *, user_id: str, thread_id: str) -> dict[str, Any]:
         last_values: dict[str, Any] | None = None
-        text_buffers: dict[str, str] = {}
+        stream_buffers: dict[str, StreamParts] = {}
         current_message_id: str | None = None
         previous_seen = self._active_agent_text_seen
         self._active_agent_text_seen = set()
@@ -174,7 +199,11 @@ class AgentRuntime:
                         else:
                             mode, chunk = "values", item
                         if mode == "messages":
-                            text, current_message_id = accumulate_stream_text(text_buffers, current_message_id, chunk)
+                            reasoning, text, current_message_id = accumulate_stream_parts(
+                                stream_buffers, current_message_id, chunk
+                            )
+                            if reasoning:
+                                self._report_run_event("agent_reasoning", reasoning, thread_id=thread_id)
                             if text:
                                 self._report_agent_text(text, thread_id=thread_id)
                             continue
@@ -186,24 +215,41 @@ class AgentRuntime:
 
     # -- Helpers -----------------------------------------------------------
 
-    def _initial_state(self, message: str, *, user_id: str, thread_id: str | None) -> SuperAssistState:
+    def _initial_state(
+        self,
+        message: str,
+        *,
+        user_id: str,
+        thread_id: str | None,
+        message_content: str | list[dict[str, Any]] | None = None,
+    ) -> SuperAssistState:
         resolved_thread_id = thread_id or f"thread_{uuid4().hex[:12]}"
         thread_metadata = self._load_thread_metadata(resolved_thread_id)
         history = self._load_history(resolved_thread_id, thread_metadata)
-        loaded_skills = sorted({str(item) for item in (thread_metadata.get("loaded_skills") or []) if str(item)})
+        skill_activations = active_skill_activations(
+            thread_metadata.get("skill_activations"),
+            self.settings.skill_active_ttl_seconds,
+        )
+        loaded_skills = active_skill_names(
+            skill_activations,
+            self.settings.skill_active_ttl_seconds,
+        )
         metadata: dict[str, Any] = {
             "history_loaded": bool(history.messages),
             "history_message_count": len(history.messages),
             "short_memory_summary_loaded": bool(history.summary),
             "loaded_skills": loaded_skills,
+            "skill_activations": skill_activations,
+            "active_skills_at_turn_start": loaded_skills,
             **self._tool_compatibility_metadata(),
         }
         return {
-            "messages": [*history.messages, HumanMessage(content=message)],
+            "messages": [*history.messages, HumanMessage(content=message_content or message)],
             "input": message,
             "user_id": user_id,
             "thread_id": resolved_thread_id,
             "loaded_skills": loaded_skills,
+            "skill_activations": skill_activations,
             "tool_events": [],
             "rag_mode": self.rag_mode,
             "rag_context": "",
@@ -213,7 +259,11 @@ class AgentRuntime:
 
     def _load_history(self, thread_id: str, metadata: dict[str, Any]) -> Any:
         path = self.settings.data_dir / "threads" / thread_id / "messages.jsonl"
-        return load_short_memory(path, metadata, token_limit=self.settings.short_memory_token_limit)
+        return load_short_memory(
+            path,
+            metadata,
+            keep_recent_turns=self.settings.short_memory_keep_recent_turns,
+        )
 
     def _load_thread_metadata(self, thread_id: str) -> dict[str, Any]:
         path = self.settings.data_dir / "threads" / thread_id / "thread_meta.json"
@@ -284,7 +334,7 @@ class AgentRuntime:
 def _last_ai_text(messages: list[BaseMessage]) -> str:
     for message in reversed(messages):
         if isinstance(message, AIMessage):
-            text = str(message.content or "").strip()
+            text = clean_answer_text(message.content)
             if text:
                 return text
     return ""

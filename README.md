@@ -1,6 +1,6 @@
 # SuperAssist
 
-SuperAssist 是一个面向长期协作场景的多智能体个人助理。系统使用 CogniFold 风格类型图维护跨会话长期记忆，使用 LightRAG 对用户上传的资料进行图检索与原文检索，并提供流式聊天、工具调用、Subagent、ACP Agent Teams、飞书接入和运行时配置界面。
+SuperAssist 是一个面向长期协作场景的多智能体个人助理。系统使用 CogniFold 风格类型图维护跨会话长期记忆，使用 LightRAG 对用户上传的资料进行图检索与原文检索，并提供流式聊天、工具调用、Subagent、ACP Agent Teams、飞书/企业微信接入和运行时配置界面。
 
 当前技术栈：**React + Vite、Go + Gin、Python + FastAPI、LangChain/LangGraph、SQLite/MySQL、FAISS、LightRAG、WebSocket/SSE**。
 
@@ -21,7 +21,8 @@ Go Gateway :8080
           ├── CogniFold Memory
           ├── LightRAG Knowledge Base
           ├── Tools / Subagents / ACP Teams
-          └── Feishu channel
+          ├── Feishu channel
+          └── WeCom channel -> AI Engine SSE
 
 持久化：
   .superassist/superassist.sqlite3   业务数据与长期记忆图
@@ -40,8 +41,9 @@ Go 是面向浏览器的产品入口：负责认证、WebSocket 生命周期、�
 - **Agentic RAG**：首轮默认 `mix` 检索；证据不足时允许模型改写查询，并由中间件保证最多完成三轮检索。失败后可按工具配置联网，最终回答明确标注上传资料、网页或模型知识来源。
 - **工具与 Subagent**：支持文件、网页和可选 Shell 工具，通过 `task` 把复杂任务交给 general-purpose 或 research 子 Agent。
 - **ACP Agent Teams**：通过 `agent_team.toml` 接入 Claude Code 等外部 Agent，使用带文件锁、hash chain 和 HMAC 的 JSONL ledger 记录协作过程。
-- **可视化与设置**：导航栏提供 Chat、Memory Graph、Knowledge、Settings；设置页可管理 Memory 与飞书参数。
-- **飞书 Bot**：支持私聊和群聊 @ 触发、流式卡片更新及会话映射。
+- **可视化与管理**：导航栏提供 Chat、Memory Graph、Knowledge、Settings；管理员额外拥有 Users 页面，可查看各 Web/飞书/企业微信身份的会话、消息记录与长期记忆图，并可删除选中的未压缩短记忆记录。
+- **飞书 Bot**：支持可配置的群聊触发、合并且保序的流式卡片更新及会话映射；私聊按用户隔离，群聊按 `chat_id` 共享短记忆、长期 Memory 图和 RAG，并通过通讯录 API 在记忆文本中保留群成员昵称。
+- **企业微信 Bot**：使用官方 WebSocket SDK，无需公网回调；支持流式回复、成员白名单、单聊隔离、群聊共享记忆、RAG 开关、重复消息过滤和断线重连。
 
 ## 快速开始
 
@@ -93,7 +95,7 @@ npm run dev
 
 访问 `http://localhost:5173`。Vite 会把 `/api` 和 `/ws` 代理到 `127.0.0.1:8080`。
 
-### CLI 与飞书
+### CLI 与聊天渠道
 
 ```powershell
 # 单轮
@@ -104,6 +106,12 @@ superassist -i --thread-id my-thread --flush-memory
 
 # 飞书通道
 superassist-feishu
+
+# 企业微信通道（需先启动 AI Engine）
+superassist-wecom
+
+# 企业微信桌面 RPA（普通微信外部群，需保持目标群窗口可见）
+superassist-wecom-rpa
 ```
 
 `superassist-memory-ui` 是仍保留的旧调试入口，不属于当前 React 产品的验证路径；完整界面应通过 Go 的 `http://localhost:8080` 使用。
@@ -120,7 +128,7 @@ superassist-feishu
 
 ## 配置
 
-Python 配置集中在 `src/superassist/config.py`，示例见 [.env.example](.env.example)。设置页写回项目根 `.env`；Memory 参数对新请求立即生效，飞书连接参数需要重启飞书通道。
+Python 配置集中在 `src/superassist/config.py`，示例见 [.env.example](.env.example)。设置页写回项目根 `.env`；Memory 参数对新请求立即生效，飞书/企业微信连接参数需要重启对应通道。官方智能机器人与只服务普通微信外部群的桌面 RPA 配置、启动和排障见 [企业微信接入指南](src/superassist/channels/WECOM.md)。
 
 ### 核心配置
 
@@ -142,6 +150,9 @@ Python 配置集中在 `src/superassist/config.py`，示例见 [.env.example](.e
 | `SUPERASSIST_RAG_TOP_K` | `20` | LightRAG 实体/关系候选数 |
 | `SUPERASSIST_RAG_CHUNK_TOP_K` | `10` | LightRAG 原文 chunk 候选数 |
 
+
+短期记忆采用最近 `30` 轮对话的固定滑动窗口。`messages.jsonl` 保留完整历史供审计和前端查看，模型请求不再按 token 阈值截取历史，也不再生成或注入旧对话 summary。
+
 ### Go 配置
 
 | 变量 | 默认值 | 说明 |
@@ -150,6 +161,7 @@ Python 配置集中在 `src/superassist/config.py`，示例见 [.env.example](.e
 | `SUPERASSIST_PYTHON_HOST` | `http://127.0.0.1:8765` | Python AI Engine 地址 |
 | `SUPERASSIST_JWT_SECRET` | 开发默认值 | JWT 签名密钥，生产环境必须修改 |
 | `SUPERASSIST_JWT_EXPIRY_HOURS` | `48` | 登录有效期 |
+| `SUPERASSIST_ADMIN_USERNAMES` | `painting` | 逗号分隔的 Web 管理员用户名；Go 启动时同步管理员角色 |
 
 MySQL URL 在 Python/SQLAlchemy 中使用 `mysql+pymysql://...`，Go/GORM 使用 Go MySQL DSN。当前默认的单机产品形态使用同一个 SQLite 文件；切换数据库前应同时确认 Go 与 Python 的连接格式。
 
@@ -170,17 +182,28 @@ MySQL URL 在 Python/SQLAlchemy 中使用 `mysql+pymysql://...`，Go/GORM 使用
 │   └── thread_meta.json
 ├── teams/<thread-id>/ledger.jsonl
 ├── channels/feishu_threads.json
+├── channels/wecom_threads.json
 ├── huggingface/
 └── workspace/
 ```
 
 长期记忆图和 LightRAG 知识图是两套独立数据：前者记录对话事件、概念、意图和时间关系；后者只记录用户上传资料的实体、关系与原文来源。
 
+## Skill 渐进加载
+
+Skill 采用三层渐进式加载，避免把整个技能库长期塞进模型上下文：
+
+1. 注册器只扫描 `skills/public/*/SKILL.md` 一层，并始终注入名称、简介和路径索引。
+2. 用户意图匹配时，Agent 读取主 `SKILL.md`；同一轮直接使用工具结果，后续轮次在激活期内注入主文件。
+3. `references/`、`examples/`、脚本和资源不会递归注册，仅在任务需要时按路径读取；读取任意技能资源会刷新激活时间。
+
+激活期由 `SUPERASSIST_SKILL_ACTIVE_TTL_SECONDS` 控制，默认 `300` 秒，也可在 Settings → Skills 修改。超时后线程只保留全局索引，不再注入完整 Skill 内容。
+
 ## 项目结构
 
 ```text
 SuperAssist/
-├── frontend/                 React + Vite，Chat/Graph/Knowledge/Settings
+├── frontend/                 React + Vite，Chat/Graph/Knowledge/Users/Settings
 ├── go-server/                Gin 网关、认证、线程、WS 和 Python 代理
 ├── src/superassist/
 │   ├── agent/                Agent 工厂、状态、运行时和短记忆
@@ -190,7 +213,7 @@ SuperAssist/
 │   ├── subagents/            进程内子 Agent
 │   ├── acp_client/           ACP 客户端
 │   ├── teams/                ACP 团队与可审计 ledger
-│   ├── channels/             飞书通道
+│   ├── channels/             飞书与企业微信通道
 │   ├── tools/                文件、网页、Shell、task、team_task
 │   └── ui/                   Python 内部 FastAPI API
 ├── skills/                   SKILL.md 技能
@@ -205,9 +228,10 @@ SuperAssist/
 
 - `/api/auth/*`：注册、登录和当前用户。
 - `/api/threads/*`：会话列表、历史和删除。
+- `/api/admin/users/*`：管理员查看所有身份、会话、消息历史和长期记忆图；普通用户访问返回 `403`。
 - `/api/graph`：长期记忆图。
 - `/api/rag/documents`、`/api/rag/graph`：知识库和 LightRAG 图。
-- `/api/settings`：Memory 与飞书设置。
+- `/api/settings`：Memory、Skills、飞书与企业微信设置。
 - `/ws/chat?token=...`：流式聊天。
 
 Python `/internal/*` 仅供 Go 在本机调用，不应直接暴露到公网。

@@ -50,6 +50,7 @@ func (h *AuthHandler) Register(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{
 		"user_id":      user.ID,
 		"username":     user.Username,
+		"is_admin":     user.IsAdmin,
 		"access_token": token,
 		"token_type":   "bearer",
 	})
@@ -72,6 +73,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"user_id":      user.ID,
 		"username":     user.Username,
+		"is_admin":     user.IsAdmin,
 		"access_token": token,
 		"token_type":   "bearer",
 	})
@@ -89,5 +91,6 @@ func (h *AuthHandler) Me(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"user_id":  user.ID,
 		"username": user.Username,
+		"is_admin": user.IsAdmin,
 	})
 }

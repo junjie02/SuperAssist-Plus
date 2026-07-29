@@ -1,6 +1,9 @@
+import json
+
 from superassist.agent import AgentRuntime
 from superassist.agent.runtime import SYSTEM_PROMPT
 from superassist.agent.short_memory import (
+    load_short_memory,
     maybe_compress_short_memory,
     read_jsonl,
     split_records_for_compression,
@@ -9,10 +12,6 @@ from superassist.agent.short_memory import (
 )
 from superassist.middlewares import (
     DynamicContextMiddleware,
-    FinalTextMiddleware,
-    SubagentLimitMiddleware,
-    ToolCallLimitMiddleware,
-    ToolErrorMiddleware,
     ToolEventMiddleware,
 )
 from superassist.config import Settings
@@ -41,9 +40,7 @@ def test_short_memory_defaults_are_configured() -> None:
         SUPERASSIST_EMBEDDING_PROVIDER="hash",
     )
 
-    assert settings.short_memory_token_limit == 80000
-    assert settings.short_memory_keep_recent_turns == 10
-    assert settings.short_memory_summary_target_tokens == 6000
+    assert settings.short_memory_keep_recent_turns == 30
     assert settings.short_memory_enable_tool_events is True
     assert settings.feishu_domain == "https://open.feishu.cn"
     assert settings.feishu_mention_only is True
@@ -258,6 +255,30 @@ def test_runtime_streaming_reports_thinking_after_context(tmp_path) -> None:
     assert events[1].message == "Thinking..."
 
 
+def test_runtime_multimodal_content_keeps_text_input_for_memory(tmp_path) -> None:
+    settings = Settings(
+        SUPERASSIST_DATA_DIR=tmp_path,
+        SUPERASSIST_API_KEY="",
+        SUPERASSIST_ENABLE_TOOLS=False,
+        SUPERASSIST_EMBEDDING_PROVIDER="hash",
+    )
+    runtime = AgentRuntime(settings)
+    content = [
+        {"type": "text", "text": "What is shown?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U="}},
+    ]
+
+    state = runtime._initial_state(
+        "memory-safe text",
+        user_id="u",
+        thread_id="t",
+        message_content=content,
+    )
+
+    assert state["input"] == "memory-safe text"
+    assert state["messages"][-1].content == content
+
+
 def test_runtime_accumulates_stream_text_and_ignores_tool_calls(tmp_path) -> None:
     from superassist.agent.streaming import accumulate_stream_text
 
@@ -351,6 +372,54 @@ def test_runtime_accumulates_ai_message_chunks(tmp_path) -> None:
     assert message_id == "chunk_1"
 
 
+def test_runtime_stream_parts_separates_structured_reasoning() -> None:
+    from superassist.agent.streaming import StreamParts, accumulate_stream_parts
+
+    buffers: dict[str, StreamParts] = {}
+    reasoning, answer, message_id = accumulate_stream_parts(
+        buffers,
+        None,
+        AIMessageChunk(
+            content="最终答案",
+            id="reasoning_1",
+            additional_kwargs={"reasoning_content": "先分析问题"},
+        ),
+    )
+
+    assert reasoning == "先分析问题"
+    assert answer == "最终答案"
+    assert message_id == "reasoning_1"
+
+
+def test_runtime_stream_parts_handles_split_inline_think_tags() -> None:
+    from superassist.agent.streaming import StreamParts, accumulate_stream_parts
+
+    buffers: dict[str, StreamParts] = {}
+    reasoning, answer, message_id = accumulate_stream_parts(
+        buffers, None, AIMessageChunk(content="<thi", id="reasoning_2")
+    )
+    assert reasoning is None
+    assert answer is None
+
+    reasoning, answer, message_id = accumulate_stream_parts(
+        buffers, message_id, AIMessageChunk(content="nk>分析中</thi", id="reasoning_2")
+    )
+    assert reasoning == "分析中"
+    assert answer is None
+
+    reasoning, answer, _message_id = accumulate_stream_parts(
+        buffers, message_id, AIMessageChunk(content="nk>这是正文", id="reasoning_2")
+    )
+    assert reasoning == "分析中"
+    assert answer == "这是正文"
+
+
+def test_runtime_last_ai_text_removes_inline_reasoning() -> None:
+    from superassist.agent.runtime import _last_ai_text
+
+    assert _last_ai_text([AIMessage(content="<think>内部推理</think>公开答案")]) == "公开答案"
+
+
 def test_runtime_last_ai_text_skips_empty_tool_call_messages(tmp_path) -> None:
     from superassist.agent.runtime import _last_ai_text
 
@@ -377,6 +446,7 @@ def test_runtime_persists_compact_tool_events_in_short_memory(tmp_path) -> None:
     runtime = AgentRuntime(settings)
     middleware = ShortMemoryMiddleware(settings, runtime.model)
     state = {
+        "user_id": "user-owner",
         "thread_id": "t",
         "input": "search this",
         "messages": [_AIMessage(content="done")],
@@ -401,6 +471,46 @@ def test_runtime_persists_compact_tool_events_in_short_memory(tmp_path) -> None:
     assert records[1]["tool"] == "web_search"
     assert records[1]["args"] == {"query": "x"}
     assert "very long result" not in str(records[1])
+    metadata = json.loads((tmp_path / "threads" / "t" / "thread_meta.json").read_text(encoding="utf-8"))
+    assert metadata["user_id"] == "user-owner"
+
+
+def test_runtime_persists_only_unexpired_skill_activations(tmp_path) -> None:
+    import time
+
+    from langchain_core.messages import AIMessage as _AIMessage
+    from superassist.middlewares.short_memory_middleware import ShortMemoryMiddleware
+
+    settings = Settings(
+        SUPERASSIST_DATA_DIR=tmp_path,
+        SUPERASSIST_API_KEY="",
+        SUPERASSIST_EMBEDDING_PROVIDER="hash",
+        SUPERASSIST_SKILL_ACTIVE_TTL_SECONDS=300,
+    )
+    runtime = AgentRuntime(settings)
+    middleware = ShortMemoryMiddleware(settings, runtime.model)
+    activated_at = time.time()
+    state = {
+        "user_id": "u",
+        "thread_id": "t",
+        "input": "research this",
+        "messages": [_AIMessage(content="done")],
+        "tool_events": [],
+        "loaded_skills": ["deep-research"],
+        "skill_activations": {
+            "deep-research": activated_at,
+            "gongkao-huasheng13": activated_at - 301,
+        },
+        "metadata": {},
+    }
+
+    middleware.after_agent(state, runtime=None)
+    metadata = json.loads((tmp_path / "threads" / "t" / "thread_meta.json").read_text(encoding="utf-8"))
+    restored = runtime._initial_state("next", user_id="u", thread_id="t")
+
+    assert metadata["loaded_skills"] == ["deep-research"]
+    assert set(metadata["skill_activations"]) == {"deep-research"}
+    assert restored["loaded_skills"] == ["deep-research"]
 
 
 def test_short_memory_compression_keeps_recent_ten_turns(tmp_path) -> None:
@@ -422,6 +532,28 @@ def test_short_memory_compression_keeps_recent_ten_turns(tmp_path) -> None:
     assert old_records[-1]["content"] == "assistant 1"
     assert recent_records[0]["content"] == "user 2"
     assert recent_records[-1]["content"] == "assistant 11"
+
+
+def test_short_memory_loads_fixed_recent_turn_window_without_pruning_history(tmp_path) -> None:
+    path = tmp_path / "messages.jsonl"
+    records = []
+    for index in range(35):
+        records.extend(
+            turn_records(
+                user_message=f"user {index}",
+                assistant_answer=f"assistant {index}",
+                tool_events=[],
+                include_tool_events=True,
+            )
+        )
+    write_jsonl(path, records)
+
+    loaded = load_short_memory(path, {"summary": "old summary must not be injected"}, keep_recent_turns=30)
+
+    assert loaded.summary == ""
+    assert loaded.messages[0].content == "user 5"
+    assert loaded.messages[-1].content == "assistant 34"
+    assert len([record for record in read_jsonl(path) if record["role"] == "user"]) == 35
 
 
 def test_short_memory_compression_writes_summary_and_prunes_old_records(tmp_path) -> None:

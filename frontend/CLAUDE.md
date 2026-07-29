@@ -4,7 +4,7 @@ Update this document whenever frontend routes, API contracts, refresh events, ch
 
 ## Purpose And Runtime
 
-`frontend/` is the authenticated React 18 + Vite application for SuperAssist. It provides Chat, Memory Graph, Knowledge, and Settings views.
+`frontend/` is the authenticated React 18 + Vite application for SuperAssist. It provides Chat, Memory Graph, Knowledge, Users, and Settings views.
 
 - Development: Vite serves `http://localhost:5173` and proxies `/api` plus `/ws` to Go at `127.0.0.1:8080`.
 - Production: `npm run build` writes `frontend/dist`; Go serves those assets and handles SPA fallback.
@@ -28,7 +28,8 @@ npm run build
 | `/` | Chat | Always mounted after login; hidden with CSS on other pages |
 | `/graph` | Memory Graph | Always mounted; reloads on turn-completed events |
 | `/knowledge` | Uploaded documents and LightRAG graph | Mounted while selected |
-| `/settings` | Memory and Feishu configuration | Mounted while selected |
+| `/users` | Admin-only user directory, conversations, transcript, and per-user memory graph | Mounted while selected |
+| `/settings` | Memory, Feishu, and WeCom configuration | Mounted while selected |
 | `/login` | Login/register | Public route |
 
 Keeping Chat mounted is intentional: WebSocket, selected thread, draft state, and conversation history must survive navigation.
@@ -38,7 +39,8 @@ Keeping Chat mounted is intentional: WebSocket, selected thread, draft state, an
 - `src/pages/ChatPage.jsx`: thread list, history, streaming chat, RAG toggle, and autosizing composer.
 - `src/pages/GraphPage.jsx`: CogniFold memory graph/list modes and refresh behavior.
 - `src/pages/KnowledgePage.jsx`: multipart upload, document state polling, deletion, and LightRAG graph.
-- `src/pages/SettingsPage.jsx`: validated Memory and Feishu settings editor.
+- `src/pages/UsersPage.jsx`: admin user directory, per-user thread list, Markdown transcript, and memory graph viewer.
+- `src/pages/SettingsPage.jsx`: validated Memory, Feishu, and WeCom settings editor.
 - `src/components/GraphCanvas.jsx`: shared canvas renderer for both graph domains.
 - `src/hooks/useAuth.jsx`: token and authenticated-user lifecycle.
 - `src/hooks/useWebSocket.js`: reconnectable chat transport.
@@ -86,9 +88,19 @@ Document states are `queued`, `parsing`, `indexing`, `ready`, `failed`, and `del
 
 ### Settings
 
-`GET /api/settings` returns `memory`, `feishu`, and `meta`. The actual Feishu App Secret is never returned; only `app_secret_configured` is exposed.
+`GET /api/settings` returns `memory`, `feishu`, `wecom`, and `meta`. Feishu and WeCom secrets are never returned; only `app_secret_configured` and `bot_secret_configured` are exposed.
 
-`PUT /api/settings` accepts both groups. Omitting `feishu.app_secret` preserves it, sending `""` clears it. The Python engine validates related numeric constraints and atomically updates the root `.env`. Memory values apply to newly created runtimes; Feishu connection changes set a restart-required flag.
+`PUT /api/settings` accepts all three groups. Omitting a channel secret preserves it, while sending `""` clears it. The Python engine validates related numeric constraints and atomically updates the root `.env`. Memory values apply to newly created runtimes; Feishu/WeCom connection changes set channel-specific restart-required flags.
+
+### Admin Users
+
+- `GET /api/admin/users`: registered Web users plus virtual Feishu/WeCom identities and activity totals.
+- `GET /api/admin/users/:user_id/threads`: conversations owned by one identity.
+- `GET /api/admin/users/:user_id/threads/:thread_id/history`: transcript records with stable-for-that-response `record_index` values.
+- `DELETE /api/admin/users/:user_id/threads/:thread_id/messages/:record_index`: remove one current JSONL short-memory record; this does not alter compressed summaries or long-term graph nodes.
+- `GET /api/admin/users/:user_id/graph`: the selected identity's CogniFold memory graph.
+
+The Users navigation and route are rendered only when `/api/auth/me` returns `is_admin: true`. This is convenience, not authorization: Go rechecks the persisted admin role for every `/api/admin/*` request.
 
 ## Refresh And Error Semantics
 

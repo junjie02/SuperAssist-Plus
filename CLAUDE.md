@@ -49,6 +49,7 @@ Other entry points:
 superassist "hello" --flush-memory
 superassist -i --thread-id my-thread --flush-memory
 superassist-feishu
+superassist-wecom
 superassist-memory-ui --user-id local-user --port 8765
 ```
 
@@ -64,7 +65,7 @@ Important test behavior:
 - `SUPERASSIST_EMBEDDING_PROVIDER=hash` selects the deterministic offline embedder.
 - Normal tools require `SUPERASSIST_ENABLE_TOOLS=true`.
 - RAG mode always binds `rag_search`, `web_search`, and `web_fetch`; the network tools still enforce `SUPERASSIST_TOOL_NETWORK_ENABLED`.
-- Settings updates are written to the root `.env`. Memory values apply to newly constructed runtimes; Feishu connection changes require a channel restart.
+- Settings updates are written to the root `.env`. Memory values apply to newly constructed runtimes; Feishu and WeCom connection changes require the affected channel process to restart.
 
 ## Runtime Architecture
 
@@ -141,11 +142,17 @@ The complete storage, extraction, chunking, graph, update, retrieval, and deleti
 
 [frontend/](frontend/) is a React 18 + Vite SPA, not the legacy no-build viewer. Development requests proxy to Go; production assets are built into `frontend/dist` and served by Go.
 
-The authenticated shell keeps Chat mounted while switching pages so WebSocket and thread state survive navigation. Main views are Chat, Memory Graph, Knowledge, and Settings. Read [frontend/CLAUDE.md](frontend/CLAUDE.md) before changing data contracts, responsive layout, graph behavior, or refresh events.
+The authenticated shell keeps Chat mounted while switching pages so WebSocket and thread state survive navigation. Main views are Chat, Memory Graph, Knowledge, Users (admin only), and Settings. `SUPERASSIST_ADMIN_USERNAMES` is synchronized to persisted Go user roles at startup; all `/api/admin/*` routes must retain database-backed authorization. Read [frontend/CLAUDE.md](frontend/CLAUDE.md) before changing data contracts, responsive layout, graph behavior, or refresh events.
 
 ### Feishu
 
-[src/superassist/channels/feishu.py](src/superassist/channels/feishu.py) receives Feishu events over WebSocket and sends incremental interactive-card updates. It maps Feishu chats/topics to SuperAssist thread IDs and enforces allowed Open IDs and mention-only behavior. File and image understanding is not implemented in the channel.
+[src/superassist/channels/feishu.py](src/superassist/channels/feishu.py) receives Feishu events over WebSocket and sends incremental interactive-card updates. Private chats use `feishu:<open_id>` identities; every member of a group shares `feishu-group:<chat_id>`, a stable group thread, Memory graph, and RAG scope. Group messages are prefixed with a Contact API-resolved nickname (cached by open ID) before persistence; raw open IDs must never be used as the visible fallback. Per-scope locks serialize writes. Streaming card updates use one coalescing worker per message and must drain before the final patch, preventing stale partial text from overwriting the final answer. It enforces allowed Open IDs and configurable mention-only behavior. File and image understanding is not implemented in the channel.
+
+### WeCom
+
+[src/superassist/channels/wecom.py](src/superassist/channels/wecom.py) uses the official WeCom intelligent-robot WebSocket SDK, but delegates Agent execution to the existing Python `/internal/chat` SSE endpoint through [ai_engine_client.py](src/superassist/channels/ai_engine_client.py). Keep this process boundary: constructing another runtime in the channel would create unsafe concurrent writers for local LightRAG files. Private chats are isolated by sender; every member of a group chat shares the group thread, Memory identity, and RAG state. Explicit sender/group-to-browser mappings can attach either scope to uploaded knowledge. See [WECOM.md](src/superassist/channels/WECOM.md) for setup and operations.
+
+[src/superassist/channels/wecom_rpa.py](src/superassist/channels/wecom_rpa.py) is a separate Windows-only visual adapter for ordinary-WeChat external groups opened in WeCom 5.x. It must keep the hard gates in this order: recognized `外部群` header, exact configured group allowlist, configured leading wake prefix, replay claim, then AI Engine call. It only monitors the active visible group and rechecks the group before every send. Never relax these gates to support private chats or background coordinate clicking.
 
 ## Data Layout
 
@@ -161,6 +168,8 @@ rag/<user-hash>/index/default/  LightRAG KV/vector/GraphML stores
 threads/<thread-id>/             messages.jsonl + thread_meta.json
 teams/<thread-id>/ledger.jsonl  audited ACP team communication
 channels/feishu_threads.json    Feishu-to-thread mapping
+channels/wecom_threads.json     WeCom chat/sender-to-thread and RAG mapping
+channels/wecom_rpa_state.json   desktop RPA visible-message replay guard
 huggingface/                    embedding model cache
 workspace/                      file/shell tool sandbox
 ```

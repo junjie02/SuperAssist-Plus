@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from superassist.skills.registry import (
+    active_skill_activations,
+    active_skill_names,
     Skill,
     build_available_skills_section,
     build_loaded_skills_section,
@@ -10,6 +12,8 @@ from superassist.skills.registry import (
 )
 
 __all__ = [
+    "active_skill_activations",
+    "active_skill_names",
     "Skill",
     "build_available_skills_section",
     "build_loaded_skills_section",

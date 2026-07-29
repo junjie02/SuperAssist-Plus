@@ -5,12 +5,14 @@ The agent uses ``state['tool_events']`` for two downstream features:
 * the short-memory persistence layer can replay tool calls as JSONL
 * the memory writer can summarize tool side-effects when building durable memory
 
-This middleware also auto-populates ``state['loaded_skills']`` whenever the
-agent reads a SKILL.md so subsequent turns inject the loaded skill prompt.
+This middleware records a timed skill activation whenever the agent reads a
+SKILL.md or one of its resources. Subsequent turns inject the skill only while
+that activation remains fresh.
 """
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable
 
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
@@ -26,9 +28,15 @@ class ToolEventMiddleware(AgentMiddleware[SuperAssistState]):
 
     state_schema = SuperAssistState
 
-    def __init__(self, reporter: Callable[[dict[str, Any]], None] | None = None) -> None:
+    def __init__(
+        self,
+        reporter: Callable[[dict[str, Any]], None] | None = None,
+        *,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
         super().__init__()
         self._reporter = reporter
+        self._clock = clock
 
     def _report(self, event: dict[str, Any]) -> None:
         if self._reporter is not None:
@@ -53,10 +61,14 @@ class ToolEventMiddleware(AgentMiddleware[SuperAssistState]):
         result = handler(request)
 
         loaded_skills = list(state.get("loaded_skills") or [])
-        if tool_name == "read_file":
+        if tool_name == "read_file" and getattr(result, "status", "success") != "error":
             skill_name = skill_name_from_virtual_path(str(args.get("path") or ""))
-            if skill_name and skill_name not in loaded_skills:
-                loaded_skills.append(skill_name)
+            if skill_name:
+                activations = dict(state.get("skill_activations") or {})
+                activations[skill_name] = self._clock()
+                state["skill_activations"] = activations
+                if skill_name not in loaded_skills:
+                    loaded_skills.append(skill_name)
                 state["loaded_skills"] = loaded_skills
 
         result_event: dict[str, Any] = {

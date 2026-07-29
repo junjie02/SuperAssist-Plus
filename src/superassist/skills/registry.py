@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+import time
+from typing import Any
 
 from superassist.config import PROJECT_ROOT
 
@@ -110,9 +112,46 @@ def skill_name_from_virtual_path(path: str) -> str | None:
     if not normalized.startswith(prefix):
         return None
     parts = normalized.removeprefix(prefix).split("/")
-    if len(parts) >= 2 and parts[1] == SKILL_FILE_NAME:
-        return parts[0]
+    if len(parts) < 2:
+        return None
+    directory_name = parts[0]
+    for skill in list_public_skills():
+        if skill.relative_path.parts[-1] == directory_name:
+            return skill.name
     return None
+
+
+def active_skill_names(
+    activations: Any,
+    ttl_seconds: int,
+    *,
+    now: float | None = None,
+) -> list[str]:
+    if not isinstance(activations, dict) or ttl_seconds <= 0:
+        return []
+    current = time.time() if now is None else now
+    available = {skill.name for skill in list_public_skills()}
+    active: list[str] = []
+    for name, activated_at in activations.items():
+        try:
+            timestamp = float(activated_at)
+        except (TypeError, ValueError):
+            continue
+        if name in available and 0 <= current - timestamp < ttl_seconds:
+            active.append(str(name))
+    return sorted(set(active))
+
+
+def active_skill_activations(
+    activations: Any,
+    ttl_seconds: int,
+    *,
+    now: float | None = None,
+) -> dict[str, float]:
+    names = set(active_skill_names(activations, ttl_seconds, now=now))
+    if not isinstance(activations, dict):
+        return {}
+    return {name: float(activations[name]) for name in sorted(names)}
 
 
 def _parse_skill_file(skill_file: Path, relative_path: Path) -> Skill | None:

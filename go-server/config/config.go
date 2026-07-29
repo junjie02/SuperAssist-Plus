@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/joho/godotenv"
 )
@@ -26,6 +27,7 @@ type Config struct {
 	// JWT
 	JWTSecret      string
 	JWTExpiryHours int
+	AdminUsernames map[string]struct{}
 
 	// Data
 	DataDir string
@@ -59,6 +61,7 @@ func Load() *Config {
 		PythonHost:     getEnv("SUPERASSIST_PYTHON_HOST", "http://127.0.0.1:8765"),
 		JWTSecret:      getEnv("SUPERASSIST_JWT_SECRET", ""),
 		JWTExpiryHours: getEnvInt("SUPERASSIST_JWT_EXPIRY_HOURS", 48),
+		AdminUsernames: parseSet(getEnv("SUPERASSIST_ADMIN_USERNAMES", "painting")),
 		DataDir:        getEnv("SUPERASSIST_DATA_DIR", ".superassist"),
 	}
 
@@ -73,6 +76,22 @@ func Load() *Config {
 	}
 
 	return cfg
+}
+
+func (c *Config) IsAdminUsername(username string) bool {
+	_, ok := c.AdminUsernames[strings.ToLower(strings.TrimSpace(username))]
+	return ok
+}
+
+func parseSet(value string) map[string]struct{} {
+	result := make(map[string]struct{})
+	for _, item := range strings.Split(value, ",") {
+		item = strings.ToLower(strings.TrimSpace(item))
+		if item != "" {
+			result[item] = struct{}{}
+		}
+	}
+	return result
 }
 
 func getEnv(key, fallback string) string {
