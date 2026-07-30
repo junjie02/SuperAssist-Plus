@@ -6,6 +6,7 @@ import {
   Bot,
   GitBranch,
   LoaderCircle,
+  Maximize2,
   MessageSquare,
   RefreshCw,
   Search,
@@ -13,6 +14,7 @@ import {
   Trash2,
   UserRound,
   Users,
+  X,
 } from 'lucide-react'
 import GraphCanvas from '../components/GraphCanvas'
 import { useAuth } from '../hooks/useAuth'
@@ -33,6 +35,7 @@ export default function UsersPage() {
   const [loadingHistory, setLoadingHistory] = useState(false)
   const [loadingGraph, setLoadingGraph] = useState(false)
   const [graphError, setGraphError] = useState('')
+  const [graphExpanded, setGraphExpanded] = useState(false)
   const [deletingMessage, setDeletingMessage] = useState(null)
   const [error, setError] = useState('')
 
@@ -120,6 +123,17 @@ export default function UsersPage() {
   }, [selectedUserId])
 
   useEffect(() => { loadGraph() }, [loadGraph])
+
+  useEffect(() => {
+    if (!graphExpanded) return undefined
+    const closeOnEscape = event => {
+      if (event.key === 'Escape') setGraphExpanded(false)
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [graphExpanded])
+
+  useEffect(() => { setGraphExpanded(false) }, [selectedUserId])
 
   const deleteMessage = useCallback(async message => {
     if (!selectedUserId || !selectedThreadId) return
@@ -272,9 +286,20 @@ export default function UsersPage() {
                 <h2>Memory Graph</h2>
                 <span>{graph ? `${graph.stats?.nodes || 0} nodes · ${graph.stats?.edges || 0} edges` : selectedUser?.username || 'Select a user'}</span>
               </div>
-              <button className="icon-btn graph-inline-refresh" onClick={loadGraph} disabled={loadingGraph || !selectedUser} title="Refresh graph">
-                <RefreshCw size={15} className={loadingGraph ? 'spin' : ''} />
-              </button>
+              <div className="graph-heading-actions">
+                <button
+                  className="icon-btn"
+                  onClick={() => setGraphExpanded(true)}
+                  disabled={!selectedUser}
+                  title="Enlarge graph"
+                  aria-label="Enlarge graph"
+                >
+                  <Maximize2 size={15} />
+                </button>
+                <button className="icon-btn" onClick={loadGraph} disabled={loadingGraph || !selectedUser} title="Refresh graph" aria-label="Refresh graph">
+                  <RefreshCw size={15} className={loadingGraph ? 'spin' : ''} />
+                </button>
+              </div>
             </div>
             <div className="user-graph-canvas">
               {loadingGraph && !graph ? <LoadingState label="Loading memory graph" /> : graphError ? (
@@ -291,6 +316,47 @@ export default function UsersPage() {
           </section>
         </div>
       </div>
+
+      {graphExpanded && (
+        <div
+          className="graph-expanded-overlay"
+          onMouseDown={event => {
+            if (event.target === event.currentTarget) setGraphExpanded(false)
+          }}
+        >
+          <section className="graph-expanded-dialog" role="dialog" aria-modal="true" aria-label={`${selectedUser?.username || 'User'} memory graph`}>
+            <header className="graph-expanded-heading">
+              <div className="graph-expanded-title">
+                <GitBranch size={18} />
+                <div>
+                  <h2>{selectedUser?.username || 'User'} Memory Graph</h2>
+                  <span>{graph ? `${graph.stats?.nodes || 0} nodes · ${graph.stats?.edges || 0} edges` : 'Memory graph'}</span>
+                </div>
+              </div>
+              <div className="graph-heading-actions">
+                <button className="icon-btn" onClick={loadGraph} disabled={loadingGraph} title="Refresh graph" aria-label="Refresh graph">
+                  <RefreshCw size={16} className={loadingGraph ? 'spin' : ''} />
+                </button>
+                <button className="icon-btn" onClick={() => setGraphExpanded(false)} title="Close enlarged graph" aria-label="Close enlarged graph">
+                  <X size={17} />
+                </button>
+              </div>
+            </header>
+            <div className="graph-expanded-canvas">
+              {loadingGraph && !graph ? <LoadingState label="Loading memory graph" /> : graphError ? (
+                <div className="records-state graph-error">Failed to load graph: {graphError}</div>
+              ) : (
+                <GraphCanvas
+                  nodes={graph?.nodes || []}
+                  edges={graph?.edges || []}
+                  emptyMessage="This user has no memory nodes yet."
+                  showEdgeLabels={false}
+                />
+              )}
+            </div>
+          </section>
+        </div>
+      )}
     </div>
   )
 }

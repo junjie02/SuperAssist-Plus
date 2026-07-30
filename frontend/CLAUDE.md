@@ -114,6 +114,7 @@ The Users navigation and route are rendered only when `/api/auth/me` returns `is
 
 - Graph positions remain stable across rerenders and filters; dragged nodes are pinned for the browser session.
 - Canvas dimensions must be stable so labels, loading states, and controls do not resize the graph container.
+- The admin Users view offers an enlarged memory-graph dialog with the same pan, zoom, selection, and refresh behavior as the inline graph.
 - Memory and knowledge graphs use the same renderer but different data semantics; never merge their node sets in frontend state.
 - Desktop navigation is a left sidebar. Narrow screens use compact icon navigation and one-column settings fields.
 - Labels and action controls must not overlap at supported mobile and desktop widths.
