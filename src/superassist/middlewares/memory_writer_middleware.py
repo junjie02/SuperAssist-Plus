@@ -14,8 +14,9 @@ from langchain_core.messages import AIMessage
 from langgraph.runtime import Runtime
 
 from superassist.agent.state import SuperAssistState
+from superassist.agent.streaming import clean_answer_text
 from superassist.memory.service import MemoryWritePayload
-from superassist.memory.writer import MemoryWriteQueue
+from superassist.memory.writer import MemoryWriteQueue, compact_tool_events
 
 
 class MemoryWriterMiddleware(AgentMiddleware[SuperAssistState]):
@@ -39,7 +40,7 @@ class MemoryWriterMiddleware(AgentMiddleware[SuperAssistState]):
                 event_id=event_id,
                 user_message=state.get("input") or "",
                 assistant_answer=assistant_answer,
-                tool_events=list(state.get("tool_events") or []),
+                tool_events=compact_tool_events(list(state.get("tool_events") or [])),
                 memory_context=dict(state.get("memory_write_context") or {}),
             )
         )
@@ -49,7 +50,7 @@ class MemoryWriterMiddleware(AgentMiddleware[SuperAssistState]):
 def _last_ai_text(messages: list[Any]) -> str:
     for message in reversed(messages):
         if isinstance(message, AIMessage):
-            text = str(message.content or "").strip()
+            text = clean_answer_text(message.content)
             if text:
                 return text
     return ""

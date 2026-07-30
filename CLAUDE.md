@@ -146,7 +146,7 @@ The authenticated shell keeps Chat mounted while switching pages so WebSocket an
 
 ### Feishu
 
-[src/superassist/channels/feishu.py](src/superassist/channels/feishu.py) receives Feishu events over WebSocket and sends incremental interactive-card updates. Private chats use `feishu:<open_id>` identities; every member of a group shares `feishu-group:<chat_id>`, a stable group thread, Memory graph, and RAG scope. Group messages are prefixed with a Contact API-resolved nickname (cached by open ID) before persistence; raw open IDs must never be used as the visible fallback. Per-scope locks serialize writes. Streaming card updates use one coalescing worker per message and must drain before the final patch, preventing stale partial text from overwriting the final answer. It enforces allowed Open IDs and configurable mention-only behavior. File and image understanding is not implemented in the channel.
+[src/superassist/channels/feishu.py](src/superassist/channels/feishu.py) receives Feishu events over WebSocket and sends incremental interactive-card updates. Private chats use `feishu:<open_id>` identities; every member of a group shares `feishu-group:<chat_id>`, a stable group thread, Memory graph, and RAG scope. Messages arriving while the same scope is busy are ignored. Image messages send the original downloaded PNG/JPEG/GIF/WebP bytes without orientation correction, resizing, background flattening, or transcoding; optional untrusted local OCR and the current user request accompany them in one multimodal `HumanMessage`. The latest image set is retained in memory across accepted Feishu messages with a configurable sliding 180-second TTL; follow-ups refresh the TTL and resend full image bytes without rerunning OCR. After expiry, only persisted OCR/text, answers, and `<ImageDescription>` remain. The original multimodal message also remains in every model request during a single Skill/tool loop; GPT-5.6 explicitly disables `use_previous_response_id` so the client cannot omit the earlier image input. Streaming card updates use one coalescing worker per message and must drain before the final patch. Non-image files remain unsupported.
 
 ### WeCom
 
@@ -160,6 +160,7 @@ The authenticated shell keeps Chat mounted while switching pages so WebSocket an
 
 ```text
 superassist.sqlite3              relational data and typed memory graph
+logs/model-input.jsonl          final provider payloads when input logging is enabled
 faiss/<safe-user-id>.index      memory vector index
 faiss/<safe-user-id>.mapping.json
 rag/<user-hash>/documents.json  uploaded-document manifest

@@ -25,7 +25,7 @@ SECTION_CORE_ROLE = """## Your Role
 6. 更新已有节点 (例如强化概念的重要性)
 7. 合并重复或高度相似的概念节点
 
-**重要**: 你必须为本次对话创建事件节点 (使用 ref="current_event")。事件节点的标题应简短概括对话主题，描述应总结对话的核心内容和结论。不要复制原始消息全文。
+只有当本次对话包含值得长期保存的信息时才创建事件节点 (使用 ref="current_event")。纯问候、致谢、寒暄或没有持久价值的对话必须返回空 operations。事件节点的标题应简短概括主题，描述应总结核心内容和结论，不要复制原始消息全文。
 """
 
 SECTION_CORE_STRUCTURE = """## 图谱结构
@@ -143,6 +143,7 @@ SECTION_CORE_OUTPUT_FORMAT = """## 输出格式
 
 `symbolic_actions` 数组捕获结构化状态变化。如果对话描述了状态变化、事实断言等, 请包含它。
 如果没有结构化变化适用, 设置 `"symbolic_actions": []`。
+如果本回合没有值得长期保存的信息，返回 `{"reasoning":"无持久记忆需要更新","operations":[],"symbolic_actions":[]}`。
 """
 
 SECTION_CORE_EXPLAINABILITY = """## 可解释性要求 (关键)
@@ -255,8 +256,8 @@ QUICK 模式下设置 `"symbolic_actions": []` 即可。
 
 SECTION_CORE_RULES = """## 重要规则
 
-1. **必须创建事件节点**: 使用 ref="current_event" 创建事件节点，概括本次对话的主题和结论
-2. 事件节点应在所有 ADD_EDGE 之前创建，以便后续边能引用它
+1. **按需创建事件节点**: 只有存在持久信息或需要更新既有记忆时，才使用 ref="current_event" 创建事件节点；纯问候返回空 operations
+2. 创建事件时，它应在所有 ADD_EDGE 之前出现，以便后续边能引用它
 3. 只存储持久化的内容: 知识点、偏好、事实、项目上下文、学习目标、截止日期
 4. 不要存储秘密、瞬时工具输出或一次性的闲聊内容
 5. 当有明确模式或稳定事实时创建概念; 如果上下文中已有相似信息, 优先 UPDATE 或 MERGE
@@ -313,15 +314,10 @@ DEFAULT_SECTION_ORDER: list[str] = [
     "core.structure",
     "core.edges",
     "core.output_format",
-    "core.operations",
     "core.rules",
-    "core.explainability",
-    "core.connectivity",
     "core.dedup",
-    "core.hierarchy",
     "core.concepts",
     "core.intents",
     "core.intent_density",
-    "core.symbolic",
     "core.language",
 ]

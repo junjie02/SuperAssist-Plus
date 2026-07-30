@@ -1,9 +1,8 @@
 """Capture normalized tool start/result events into state.
 
-The agent uses ``state['tool_events']`` for two downstream features:
-
-* the short-memory persistence layer can replay tool calls as JSONL
-* the memory writer can summarize tool side-effects when building durable memory
+The agent keeps ``state['tool_events']`` only for the current tool loop,
+per-turn limits, reporting, and the memory writer's compact completion summary.
+Raw tool inputs and outputs are not persisted into future short-memory turns.
 
 This middleware records a timed skill activation whenever the agent reads a
 SKILL.md or one of its resources. Subsequent turns inject the skill only while

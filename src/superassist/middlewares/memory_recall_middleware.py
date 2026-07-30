@@ -1,28 +1,28 @@
-"""Read long-term memory and create the user-turn event before the agent runs.
+"""Read long-term memory and reserve an optional event id before the agent runs.
 
 This middleware replaces the standalone ``prepare_context`` graph node from
 the previous outer-StateGraph design. It runs once at the start of each
 agent invocation and writes the recalled context into state so
 ``DynamicContextMiddleware`` can render it into the model prompt.
 
-The user-turn event node is created here too — its id is needed by the
-memory writer middleware after the turn completes.
+Only the id is allocated here. The memory updater creates an event node later
+when the completed turn contains durable information.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import HumanMessage
 from langgraph.runtime import Runtime
 
 from superassist.agent.state import SuperAssistState
-from superassist.memory.service import MemoryService
+from superassist.memory.service import MemoryService, project_memory_recall, project_memory_write_context
 
 
 class MemoryRecallMiddleware(AgentMiddleware[SuperAssistState]):
-    """Populate state.memory_recall and create the turn's event node."""
+    """Populate recalled memory and reserve the turn's optional event id."""
 
     state_schema = SuperAssistState
 
@@ -43,8 +43,8 @@ class MemoryRecallMiddleware(AgentMiddleware[SuperAssistState]):
         )
         return {
             "memory_event_id": contexts.event_id,
-            "memory_recall": contexts.read_recall.model_dump(mode="json"),
-            "memory_write_context": contexts.write_recall.model_dump(mode="json"),
+            "memory_recall": project_memory_recall(contexts.read_recall),
+            "memory_write_context": project_memory_write_context(contexts.write_recall),
         }
 
 

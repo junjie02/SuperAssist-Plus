@@ -3,11 +3,15 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from html import escape
 from pathlib import Path
 from typing import Any
 
+import tiktoken
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+
+from superassist.agent.streaming import clean_answer_text
 
 SUMMARY_SYSTEM_PROMPT = """You compress conversation history for an AI assistant.
 
@@ -17,6 +21,7 @@ Preserve durable context that will matter in future turns:
 - current tasks, unfinished work, decisions, and blockers
 - important facts learned from tools
 - which tools were used, what they checked, and any failures
+- question-relevant visual facts from <ImageDescription> blocks when they may matter in later turns
 - loaded skill names
 
 Do not preserve long webpage/file contents, repeated greetings, or incidental wording.
@@ -35,9 +40,7 @@ def estimate_tokens(value: Any) -> int:
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
     if not text:
         return 0
-    ascii_chars = sum(1 for char in text if ord(char) < 128)
-    non_ascii_chars = len(text) - ascii_chars
-    return max(1, ascii_chars // 4 + non_ascii_chars // 2)
+    return len(tiktoken.get_encoding("o200k_base").encode(text))
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -76,11 +79,37 @@ def load_short_memory(
     metadata: dict[str, Any],
     *,
     keep_recent_turns: int,
+    token_limit: int | None = None,
 ) -> ShortMemoryLoad:
+    """Load the complete active segment after the latest summary checkpoint.
+
+    ``keep_recent_turns`` and ``token_limit`` remain accepted for caller
+    compatibility, but limits are enforced only by whole-segment compaction.
+    Silently trimming records here would turn the history back into a sliding
+    window and invalidate the append-only prompt prefix on every turn.
+    """
+
     records = read_jsonl(messages_path)
-    _older, selected = split_records_for_compression(records, keep_recent_turns)
+    compacted_count = _compacted_record_count(metadata, len(records))
+    selected = records[compacted_count:]
+    summary = str(metadata.get("summary") or "").strip()
     messages = [record_to_message(record) for record in selected]
-    return ShortMemoryLoad(messages=messages, records=selected, summary="")
+    return ShortMemoryLoad(messages=messages, records=selected, summary=summary)
+
+
+def format_short_memory_section(summary: str) -> str:
+    rendered = escape(summary.strip()) if summary.strip() else "(no compressed summary yet)"
+    return (
+        "<ShortMemory>\n"
+        "<Summary format=\"markdown\">\n"
+        f"{rendered}\n"
+        "</Summary>\n"
+        "<RecentConversation>\n"
+        "The native user and assistant messages that follow are the uncompressed recent conversation. "
+        "Prefer newer explicit user statements over this summary.\n"
+        "</RecentConversation>\n"
+        "</ShortMemory>"
+    )
 
 
 def turn_records(
@@ -92,8 +121,6 @@ def turn_records(
 ) -> list[dict[str, Any]]:
     now = datetime.now(UTC).isoformat()
     records: list[dict[str, Any]] = [{"role": "user", "content": user_message, "created_at": now}]
-    if include_tool_events:
-        records.extend(_compact_tool_event(event, now) for event in _tool_result_events(tool_events))
     records.append({"role": "assistant", "content": assistant_answer, "created_at": now})
     return records
 
@@ -110,55 +137,51 @@ def maybe_compress_short_memory(
 ) -> dict[str, Any]:
     records = read_jsonl(messages_path)
     summary = str(metadata.get("summary") or "").strip()
-    if estimate_tokens(summary) + sum(estimate_tokens(_record_text(record)) for record in records) <= token_limit:
+    compacted_count = _compacted_record_count(metadata, len(records))
+    active_records = records[compacted_count:]
+    active_turns = sum(1 for record in active_records if record.get("role") == "user")
+    total_tokens = estimate_tokens(summary) + sum(estimate_tokens(_record_text(record)) for record in active_records)
+    over_turn_limit = keep_recent_turns > 0 and active_turns >= keep_recent_turns
+    over_token_limit = token_limit > 0 and total_tokens >= token_limit
+    if not over_turn_limit and not over_token_limit:
         return {}
-
-    old_records, recent_records = split_records_for_compression(records, keep_recent_turns)
-    if not old_records:
+    if not active_records:
         return {}
 
     prompt = build_summary_prompt(
         previous_summary=summary,
-        records=old_records,
+        records=active_records,
         summary_target_tokens=summary_target_tokens,
         loaded_skills=loaded_skills,
     )
     try:
         response = model.invoke([SystemMessage(content=SUMMARY_SYSTEM_PROMPT), HumanMessage(content=prompt)])
-        new_summary = str(response.content).strip()
+        new_summary = clean_answer_text(response.content)
     except Exception as exc:
         return {"short_memory_compression_error": f"{type(exc).__name__}: {exc}"}
 
     if not new_summary:
         return {"short_memory_compression_error": "empty summary"}
 
-    write_jsonl(messages_path, recent_records)
     return {
         "summary": new_summary,
         "summary_updated_at": datetime.now(UTC).isoformat(),
+        "summary_version": int(metadata.get("summary_version") or 0) + 1,
+        "short_memory_compacted_records": len(records),
         "short_memory_compressed": True,
-        "short_memory_compressed_records": len(old_records),
+        "short_memory_compressed_records": len(active_records),
+        "short_memory_compaction_trigger": "turns" if over_turn_limit else "tokens",
+        "short_memory_active_turns": 0,
+        "short_memory_active_tokens": estimate_tokens(new_summary),
     }
 
 
-def split_records_for_compression(
-    records: list[dict[str, Any]],
-    keep_recent_turns: int,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if keep_recent_turns <= 0:
-        return records, []
-
-    user_seen = 0
-    split_at = 0
-    for index in range(len(records) - 1, -1, -1):
-        if records[index].get("role") == "user":
-            user_seen += 1
-            if user_seen == keep_recent_turns:
-                split_at = index
-                break
-    if user_seen < keep_recent_turns:
-        return [], records
-    return records[:split_at], records[split_at:]
+def _compacted_record_count(metadata: dict[str, Any], record_count: int) -> int:
+    try:
+        value = int(metadata.get("short_memory_compacted_records") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return value if 0 <= value <= record_count else 0
 
 
 def build_summary_prompt(
@@ -205,22 +228,3 @@ def _tool_event_text(record: dict[str, Any]) -> str:
         f"Status: {record.get('status') or 'success'}\n"
         f"Error: {record.get('error')}"
     )
-
-
-def _tool_result_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [event for event in events if event.get("type") == "tool_result"]
-
-
-def _compact_tool_event(event: dict[str, Any], created_at: str) -> dict[str, Any]:
-    status = str(event.get("status") or "success")
-    error = event.get("error")
-    if status == "error" and error is None:
-        error = event.get("content")
-    return {
-        "role": "tool_event",
-        "tool": str(event.get("tool") or event.get("name") or ""),
-        "args": event.get("args") or {},
-        "status": status,
-        "error": None if error is None else str(error)[:1000],
-        "created_at": created_at,
-    }

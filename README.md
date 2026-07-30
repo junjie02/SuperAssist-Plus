@@ -42,7 +42,7 @@ Go 是面向浏览器的产品入口：负责认证、WebSocket 生命周期、�
 - **工具与 Subagent**：支持文件、网页和可选 Shell 工具，通过 `task` 把复杂任务交给 general-purpose 或 research 子 Agent。
 - **ACP Agent Teams**：通过 `agent_team.toml` 接入 Claude Code 等外部 Agent，使用带文件锁、hash chain 和 HMAC 的 JSONL ledger 记录协作过程。
 - **可视化与管理**：导航栏提供 Chat、Memory Graph、Knowledge、Settings；管理员额外拥有 Users 页面，可查看各 Web/飞书/企业微信身份的会话、消息记录与长期记忆图，并可删除选中的未压缩短记忆记录。
-- **飞书 Bot**：支持可配置的群聊触发、合并且保序的流式卡片更新及会话映射；私聊按用户隔离，群聊按 `chat_id` 共享短记忆、长期 Memory 图和 RAG，并通过通讯录 API 在记忆文本中保留群成员昵称。
+- **飞书 Bot**：支持可配置的群聊触发、合并且保序的流式卡片更新及会话映射；图片与用户问题在同一次主 Agent 多模态请求中处理，可选本地 OCR 仅作校对辅助，主模型会在回答中附加可复用的针对性图片描述；后续历史只保留文本而不重复发送 Base64 图片。私聊按用户隔离，群聊按 `chat_id` 共享短记忆、长期 Memory 图和 RAG。
 - **企业微信 Bot**：使用官方 WebSocket SDK，无需公网回调；支持流式回复、成员白名单、单聊隔离、群聊共享记忆、RAG 开关、重复消息过滤和断线重连。
 
 ## 快速开始
@@ -134,7 +134,13 @@ Python 配置集中在 `src/superassist/config.py`，示例见 [.env.example](.e
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `SUPERASSIST_MODEL` | `gpt-4o-mini` | 聊天、Memory writer 与 LightRAG 使用的模型 |
+| `SUPERASSIST_MODEL` | `gpt-4o-mini` | 主 Agent 与 LightRAG 使用的模型 |
+| `SUPERASSIST_REASONING_EFFORT` | `medium` | GPT-5.6 推理强度；飞书可用 `/effort` 按会话覆盖 |
+| `SUPERASSIST_MODEL_INPUT_LOG_ENABLED` | `false` | 将最终模型请求 payload 追加到 `logs/model-input.jsonl` |
+| `SUPERASSIST_MODEL_INPUT_LOG_MAX_BYTES` | `52428800` | 模型输入日志单文件轮转阈值，保留 3 个备份 |
+| `SUPERASSIST_FEISHU_IMAGE_OCR_ENABLED` | `true` | 飞书图片启用本地 RapidOCR 辅助；原图无论 OCR 是否成功都会直接交给主模型 |
+| `SUPERASSIST_FEISHU_IMAGE_OCR_MAX_CHARS` | `12000` | 单条飞书多图 OCR 写入当前轮文本历史的字符上限 |
+| `SUPERASSIST_FEISHU_IMAGE_CONTEXT_TTL_SECONDS` | `180` | 飞书会话原图上下文的滑动 TTL；有效消息会刷新，过期后只复用文本描述 |
 | `SUPERASSIST_API_KEY` | 空 | 为空时使用测试用 fallback 模型 |
 | `SUPERASSIST_BASE_URL` | OpenAI API | OpenAI 兼容接口地址 |
 | `SUPERASSIST_DATA_DIR` | `.superassist` | SQLite、FAISS、RAG、线程等数据根目录 |
@@ -144,14 +150,19 @@ Python 配置集中在 `src/superassist/config.py`，示例见 [.env.example](.e
 | `SUPERASSIST_ENABLE_TOOLS` | `false` | 常规工具总开关 |
 | `SUPERASSIST_TOOL_NETWORK_ENABLED` | `true` | 是否允许 web search/fetch |
 | `SUPERASSIST_TOOL_SHELL_ENABLED` | `false` | 是否允许 Shell |
-| `SUPERASSIST_MEMORY_LLM_WRITER_ENABLED` | `false` | LLM 写长期记忆图；关闭时走规则 writer |
+| `SUPERASSIST_MEMORY_LLM_WRITER_ENABLED` | `true` | 使用独立 Memory Updater 写长期记忆图；关闭时走规则 writer |
+| `SUPERASSIST_MEMORY_MODEL` | `deepseek-v4-flash` | Memory Updater 和短记忆压缩模型 |
+| `SUPERASSIST_MEMORY_API_KEY` | 空 | 独立模型密钥；为空时复用主模型密钥 |
+| `SUPERASSIST_MEMORY_BASE_URL` | 空 | 独立模型 OpenAI 兼容地址；为空时复用主模型地址 |
 | `SUPERASSIST_MEMORY_TOP_K` | `12` | 注入模型的长期记忆节点总数 |
 | `SUPERASSIST_RAG_MAX_ATTEMPTS` | `3` | 每轮聊天最多上传资料检索次数 |
 | `SUPERASSIST_RAG_TOP_K` | `20` | LightRAG 实体/关系候选数 |
 | `SUPERASSIST_RAG_CHUNK_TOP_K` | `10` | LightRAG 原文 chunk 候选数 |
 
 
-短期记忆采用最近 `30` 轮对话的固定滑动窗口。`messages.jsonl` 保留完整历史供审计和前端查看，模型请求不再按 token 阈值截取历史，也不再生成或注入旧对话 summary。
+短期记忆按完整回合追加，不使用滑动窗口。活动段达到 `30` 个已完成回合或约 `80000` tokens 时，由独立模型把“上一份摘要 + 整个活动段”压成新摘要，并从新的空活动段继续累计。`messages.jsonl` 始终追加，摘要通过 `thread_meta.json` 检查点切换；后续模型上下文只保留用户消息与最终助手回复，不保留工具参数或原始结果。
+
+模型输入日志的 `call_kind` 可区分 `lead_agent`、`memory_updater` 和 `short_memory_compactor`；`input_manifest.component_tokens` 按消息角色与用途给出近似 token 分布，`input_manifest.sections` 进一步拆出短记忆摘要、长期记忆、运行时信息、RAG 和激活 Skill 等 XML 区段。
 
 ### Go 配置
 

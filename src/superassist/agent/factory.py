@@ -10,8 +10,8 @@ Canonical chain (top to bottom):
 
 * ``ToolErrorMiddleware``        — wrap_tool_call: convert exceptions to ToolMessages first
 * ``ToolCallLimitMiddleware``    — wrap_tool_call: refuse new tool calls past the per-turn budget
-* ``MemoryRecallMiddleware``     — before_agent: read graph memory, create user-turn event
-* ``DynamicContextMiddleware``   — wrap_model_call: prepend recall+skills+time to system message
+* ``MemoryRecallMiddleware``     — before_agent: recall graph memory and reserve an optional event id
+* ``DynamicContextMiddleware``   — wrap_model_call: inject recall+skills+time without destabilizing GPT-5.6 prefix
 * ``ShortMemoryMiddleware``      — after_agent: persist messages.jsonl, compress when over budget
 * ``ToolEventMiddleware``        — wrap_tool_call: collect tool start/result events
 * ``SubagentLimitMiddleware``    — after_model: trim parallel ``task`` calls (subagents only)
@@ -30,7 +30,7 @@ from langchain_core.language_models import BaseChatModel
 
 from superassist.agent.state import SuperAssistState
 from superassist.config import Settings, get_settings
-from superassist.llm import create_chat_model
+from superassist.llm import create_chat_model, create_memory_model, is_gpt_5_6_model
 from superassist.memory.service import MemoryService
 from superassist.memory.writer import MemoryWriteQueue, MemoryWriter
 from superassist.middlewares import (
@@ -64,6 +64,8 @@ class AgentBundle:
         agent: Any,
         settings: Settings,
         model: BaseChatModel,
+        memory_model: BaseChatModel,
+        short_memory_model: BaseChatModel,
         memory: MemoryService,
         memory_queue: MemoryWriteQueue,
         team_supervisor: TeamSupervisor | None,
@@ -73,6 +75,8 @@ class AgentBundle:
         self.agent = agent
         self.settings = settings
         self.model = model
+        self.memory_model = memory_model
+        self.short_memory_model = short_memory_model
         self.memory = memory
         self.memory_queue = memory_queue
         self.team_supervisor = team_supervisor
@@ -95,10 +99,12 @@ def build_agent(
     set_team_supervisor(team_supervisor)
 
     model = create_chat_model(settings)
+    memory_model = create_memory_model(settings, call_kind="memory_updater")
+    short_memory_model = create_memory_model(settings, call_kind="short_memory_compactor")
     memory = MemoryService(settings=settings)
     memory.preload_embedder()
     memory_queue = MemoryWriteQueue(
-        MemoryWriter(memory, model, llm_enabled=settings.memory_llm_writer_enabled),
+        MemoryWriter(memory, memory_model, llm_enabled=settings.memory_llm_writer_enabled),
         debounce_seconds=settings.memory_debounce_seconds,
     )
 
@@ -122,6 +128,7 @@ def build_agent(
         memory=memory,
         memory_queue=memory_queue,
         model=model,
+        short_memory_model=short_memory_model,
         tool_event_reporter=tool_event_reporter,
         rag_mode=rag_mode,
     )
@@ -146,6 +153,8 @@ def build_agent(
         agent=agent,
         settings=settings,
         model=model,
+        memory_model=memory_model,
+        short_memory_model=short_memory_model,
         memory=memory,
         memory_queue=memory_queue,
         team_supervisor=team_supervisor,
@@ -160,6 +169,7 @@ def _build_middleware_chain(
     memory: MemoryService,
     memory_queue: MemoryWriteQueue,
     model: BaseChatModel,
+    short_memory_model: BaseChatModel,
     tool_event_reporter: Callable[[dict[str, Any]], None] | None,
     rag_mode: bool,
 ) -> list[AgentMiddleware]:
@@ -173,8 +183,11 @@ def _build_middleware_chain(
         chain.append(RagRetryMiddleware())
     chain.extend(
         [
-            DynamicContextMiddleware(settings.skill_active_ttl_seconds),
-            ShortMemoryMiddleware(settings),
+            DynamicContextMiddleware(
+                settings.skill_active_ttl_seconds,
+                preserve_static_prefix=is_gpt_5_6_model(settings.model),
+            ),
+            ShortMemoryMiddleware(settings, short_memory_model),
             ToolEventMiddleware(tool_event_reporter),
         ]
     )

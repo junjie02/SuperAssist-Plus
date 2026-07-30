@@ -40,10 +40,10 @@ MODE_QUICK = """
 
 ## Reasoning Mode: QUICK
 
-- 必须创建 1 个 event 节点 (ref="current_event") 概括本次对话
+- 有持久信息时创建 1 个 event 节点 (ref="current_event")；纯问候或无持久信息时返回空 operations
 - 提取 0-2 个新概念 (只提取明确出现的新知识点)
 - 每个概念加 1 条 GROUNDS 边连到 event
-- 每回合 3-6 个操作即可 (event + 边 = 至少 1 ADD_NODE + 1 ADD_EDGE)
+- 需要写入时通常使用 2-6 个操作；无需写入时不创建占位节点
 - 优先更新已有概念, 不要创建重复概念
 """
 

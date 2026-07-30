@@ -47,6 +47,25 @@ class FeishuThreadStore:
     def list_entries(self) -> list[dict[str, Any]]:
         return [{**entry, "key": key} for key, entry in self._data.items()]
 
+    def get_reasoning_effort(self, *, chat_id: str, topic_id: str, default: str) -> str:
+        key = self._key(chat_id, topic_id)
+        with self._lock:
+            entry = self._data.get(key)
+            if not isinstance(entry, dict):
+                return default
+            effort = entry.get("reasoning_effort")
+            return effort if isinstance(effort, str) and effort else default
+
+    def set_reasoning_effort(self, *, chat_id: str, topic_id: str, effort: str) -> None:
+        key = self._key(chat_id, topic_id)
+        with self._lock:
+            entry = self._data.get(key)
+            if not isinstance(entry, dict):
+                raise KeyError(f"Unknown Feishu conversation: {key}")
+            entry["reasoning_effort"] = effort
+            entry["updated_at"] = time.time()
+            self._save()
+
     @staticmethod
     def _key(chat_id: str, topic_id: str) -> str:
         return f"feishu:{chat_id}:{topic_id}"

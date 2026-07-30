@@ -13,7 +13,7 @@ from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
 from langgraph.errors import GraphRecursionError
 
-from superassist.agent.streaming import accumulate_stream_text
+from superassist.agent.streaming import accumulate_stream_text, clean_answer_text
 from superassist.config import Settings, get_settings
 from superassist.llm import create_chat_model
 from superassist.models import AgentRunEvent
@@ -189,7 +189,7 @@ class SubagentExecutor:
         messages = list(result.get("messages", []))
         for message in messages:
             if isinstance(message, AIMessage):
-                text = str(message.content or "").strip()
+                text = clean_answer_text(message.content)
                 if text:
                     holder.ai_messages.append(text)
                     TASK_STORE.put(holder)
@@ -284,7 +284,7 @@ class SubagentExecutor:
                 "Subagent reached the maximum recursion limit and the final summary call also failed. "
                 f"Summary error: {type(exc).__name__}: {exc}"
             )
-        text = str(getattr(response, "content", "") or "").strip()
+        text = clean_answer_text(getattr(response, "content", ""))
         if not text:
             text = "Subagent reached the maximum recursion limit and returned no additional summary."
         if "maximum recursion" not in text.lower() and "最大递归" not in text:
@@ -313,7 +313,7 @@ def _filter_tools(tools: list[BaseTool], allowed: list[str] | None) -> list[Base
 def _last_ai_text(messages: list[Any]) -> str:
     for message in reversed(messages):
         if isinstance(message, AIMessage):
-            return str(message.content or "").strip()
+            return clean_answer_text(message.content)
     return ""
 
 

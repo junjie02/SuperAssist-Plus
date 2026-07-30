@@ -1,11 +1,8 @@
 """Persist completed turns to disk and trigger short-memory compression.
 
-Replaces the standalone ``persist_turn`` graph node from the previous
-runtime. Runs after the inner agent has produced its final assistant
-message; appends both the user input and assistant answer (plus any tool
-events when enabled) to the thread's JSONL log, then asks
-Older records remain available for audit and UI history, while model context
-loading uses a fixed recent-turn sliding window.
+Runs after the inner agent has produced its final assistant message. The
+durable JSONL remains append-only, while model context advances through
+summary checkpoints whenever the active segment reaches its turn/token limit.
 """
 
 from __future__ import annotations
@@ -18,8 +15,15 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage
 from langgraph.runtime import Runtime
 
-from superassist.agent.short_memory import append_jsonl, turn_records
+from superassist.agent.short_memory import (
+    append_jsonl,
+    estimate_tokens,
+    maybe_compress_short_memory,
+    read_jsonl,
+    turn_records,
+)
 from superassist.agent.state import SuperAssistState
+from superassist.agent.streaming import clean_answer_text
 from superassist.config import Settings
 from superassist.skills import active_skill_activations, active_skill_names
 
@@ -32,6 +36,7 @@ class ShortMemoryMiddleware(AgentMiddleware[SuperAssistState]):
     def __init__(self, settings: Settings, _legacy_model: Any | None = None) -> None:
         super().__init__()
         self._settings = settings
+        self._model = _legacy_model
 
     def after_agent(self, state: SuperAssistState, runtime: Runtime) -> dict[str, Any] | None:
         thread_id = state.get("thread_id") or ""
@@ -50,8 +55,8 @@ class ShortMemoryMiddleware(AgentMiddleware[SuperAssistState]):
             turn_records(
                 user_message=user_message,
                 assistant_answer=assistant_answer,
-                tool_events=list(state.get("tool_events") or []),
-                include_tool_events=self._settings.short_memory_enable_tool_events,
+                tool_events=[],
+                include_tool_events=False,
             ),
         )
 
@@ -68,11 +73,45 @@ class ShortMemoryMiddleware(AgentMiddleware[SuperAssistState]):
             "skill_activations": skill_activations,
             "user_id": str(state.get("user_id") or ""),
         }
+        existing_metadata = self._load_thread_metadata(thread_dir)
+        if self._model is not None:
+            meta_update.update(
+                maybe_compress_short_memory(
+                    messages_path=path,
+                    metadata={**existing_metadata, **meta_update},
+                    model=self._model,
+                    token_limit=self._settings.short_memory_token_limit,
+                    keep_recent_turns=self._settings.short_memory_keep_recent_turns,
+                    summary_target_tokens=self._settings.short_memory_summary_target_tokens,
+                    loaded_skills=loaded_skills,
+                )
+            )
+        records = read_jsonl(path)
+        compacted_count = int(
+            meta_update.get(
+                "short_memory_compacted_records",
+                existing_metadata.get("short_memory_compacted_records", 0),
+            )
+            or 0
+        )
+        active_records = records[compacted_count:] if 0 <= compacted_count <= len(records) else records
+        meta_update.setdefault(
+            "short_memory_active_turns",
+            sum(1 for record in active_records if record.get("role") == "user"),
+        )
+        meta_update.setdefault(
+            "short_memory_active_tokens",
+            estimate_tokens(str(meta_update.get("summary", existing_metadata.get("summary", "")) or ""))
+            + sum(estimate_tokens(f"{record.get('role')}: {record.get('content') or ''}") for record in active_records),
+        )
         self._save_thread_metadata(thread_dir, meta_update)
 
         metadata = dict(state.get("metadata") or {})
         metadata["messages_path"] = str(path)
-        metadata["short_memory_window_turns"] = self._settings.short_memory_keep_recent_turns
+        metadata["short_memory_segment_turn_limit"] = self._settings.short_memory_keep_recent_turns
+        metadata["short_memory_summary_version"] = int(
+            meta_update.get("summary_version", existing_metadata.get("summary_version", 0)) or 0
+        )
         return {
             "metadata": metadata,
             "loaded_skills": loaded_skills,
@@ -94,13 +133,15 @@ class ShortMemoryMiddleware(AgentMiddleware[SuperAssistState]):
     def _save_thread_metadata(cls, thread_dir: Path, update: dict[str, Any]) -> None:
         path = thread_dir / "thread_meta.json"
         existing = cls._load_thread_metadata(thread_dir)
-        path.write_text(json.dumps({**existing, **update}, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps({**existing, **update}, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(path)
 
 
 def _last_ai_text(messages: list[Any]) -> str:
     for message in reversed(messages):
         if isinstance(message, AIMessage):
-            text = str(message.content or "").strip()
+            text = clean_answer_text(message.content)
             if text:
                 return text
     return ""

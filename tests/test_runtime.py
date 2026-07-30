@@ -1,4 +1,8 @@
 import json
+from datetime import UTC, datetime
+
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
+from langgraph.prebuilt.tool_node import ToolCallRequest
 
 from superassist.agent import AgentRuntime
 from superassist.agent.runtime import SYSTEM_PROMPT
@@ -6,19 +10,18 @@ from superassist.agent.short_memory import (
     load_short_memory,
     maybe_compress_short_memory,
     read_jsonl,
-    split_records_for_compression,
     turn_records,
     write_jsonl,
 )
+from superassist.config import PROJECT_ROOT, Settings
+from superassist.llm import FallbackChatModel, MiniMaxCompatibleChatModel
+from superassist.memory.service import project_memory_recall, project_memory_write_context
 from superassist.middlewares import (
     DynamicContextMiddleware,
+    MemoryWriterMiddleware,
     ToolEventMiddleware,
 )
-from superassist.config import Settings
-from superassist.config import PROJECT_ROOT
-from superassist.llm import FallbackChatModel, MiniMaxCompatibleChatModel
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
-from langgraph.prebuilt.tool_node import ToolCallRequest
+from superassist.models import MemoryNode, MemoryRecall, NodeType
 
 
 def test_project_root_env_file_is_configured() -> None:
@@ -36,19 +39,22 @@ def test_system_prompt_uses_human_progress_notes_not_raw_tool_names() -> None:
 
 def test_short_memory_defaults_are_configured() -> None:
     settings = Settings(
+        _env_file=None,
         SUPERASSIST_API_KEY="",
         SUPERASSIST_EMBEDDING_PROVIDER="hash",
     )
 
     assert settings.short_memory_keep_recent_turns == 30
-    assert settings.short_memory_enable_tool_events is True
+    assert settings.short_memory_token_limit == 80000
+    assert settings.memory_llm_writer_enabled is True
+    assert settings.memory_model == "deepseek-v4-flash"
     assert settings.feishu_domain == "https://open.feishu.cn"
     assert settings.feishu_mention_only is True
 
 
 def test_dynamic_context_injects_runtime_section() -> None:
     middleware = DynamicContextMiddleware()
-    messages = [SystemMessage(content="Base system"), HumanMessage(content="Hi")]
+    base_messages = [SystemMessage(content="Base system"), HumanMessage(content="Hi")]
     state = {"user_id": "u", "thread_id": "t", "memory_recall": {}, "loaded_skills": []}
 
     captured: dict[str, object] = {}
@@ -56,7 +62,7 @@ def test_dynamic_context_injects_runtime_section() -> None:
     class Request:
         def __init__(self) -> None:
             self.state = state
-            self.messages = messages
+            self.messages = base_messages
 
         def override(self, **kwargs):
             captured["messages"] = kwargs["messages"]
@@ -66,9 +72,134 @@ def test_dynamic_context_injects_runtime_section() -> None:
 
     merged = captured["messages"]
     assert isinstance(merged[0], SystemMessage)
-    assert "Base system" in str(merged[0].content)
-    assert "current_time_utc:" in str(merged[0].content)
-    assert "Runtime context:" in str(merged[0].content)
+    assert merged[0].content == "Base system"
+    assert isinstance(merged[-2], SystemMessage)
+    assert isinstance(merged[-1], HumanMessage)
+    assert merged[-1].content == "Hi"
+    assert "current_time_utc:" in str(merged[-2].content)
+    assert "<TurnContext>" in str(merged[-2].content)
+    assert "<RuntimeContext>" in str(merged[-2].content)
+    assert '<LongTermMemory format="json">' in str(merged[-2].content)
+
+
+def test_dynamic_context_preserves_legacy_system_order_when_cache_mode_is_disabled() -> None:
+    middleware = DynamicContextMiddleware(preserve_static_prefix=False)
+    base_messages = [SystemMessage(content="Base system"), HumanMessage(content="Hi")]
+
+    class Request:
+        state = {"user_id": "u", "thread_id": "t", "memory_recall": {}}
+        messages = base_messages
+
+        def override(self, **kwargs):
+            return kwargs["messages"]
+
+    merged = middleware.wrap_model_call(Request(), lambda value: value)
+
+    assert len(merged) == 2
+    assert isinstance(merged[0], SystemMessage)
+    assert str(merged[0].content).startswith("Base system\n\n<TurnContext>")
+
+
+def test_dynamic_context_keeps_tool_continuation_after_current_user() -> None:
+    middleware = DynamicContextMiddleware()
+    messages = [
+        SystemMessage(content="Base system"),
+        SystemMessage(content="<ShortMemory>summary</ShortMemory>"),
+        HumanMessage(content="current question"),
+        AIMessage(content="", tool_calls=[{"name": "echo", "args": {}, "id": "call_1"}]),
+        ToolMessage(content="tool result", tool_call_id="call_1", name="echo"),
+    ]
+
+    class Request:
+        state = {"user_id": "u", "thread_id": "t", "memory_recall": {}}
+
+        def __init__(self) -> None:
+            self.messages = messages
+
+        def override(self, **kwargs):
+            return kwargs["messages"]
+
+    merged = middleware.wrap_model_call(Request(), lambda value: value)
+
+    assert "<TurnContext>" in str(merged[2].content)
+    assert merged[3].content == "current question"
+    assert isinstance(merged[-1], ToolMessage)
+    assert merged[-1].content == "tool result"
+
+
+def test_dynamic_context_keeps_multimodal_image_during_skill_tool_continuation() -> None:
+    middleware = DynamicContextMiddleware()
+    image_url = "data:image/png;base64,aW1hZ2U="
+    multimodal = HumanMessage(
+        content=[
+            {"type": "image_url", "image_url": {"url": image_url}},
+            {"type": "text", "text": "请分析图片"},
+        ]
+    )
+    messages = [
+        SystemMessage(content="Base system"),
+        multimodal,
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "read_file",
+                    "args": {"path": "/mnt/skills/public/example/SKILL.md"},
+                    "id": "call_skill",
+                }
+            ],
+        ),
+        ToolMessage(content="# Skill", tool_call_id="call_skill", name="read_file"),
+    ]
+
+    class Request:
+        state = {"user_id": "u", "thread_id": "t", "memory_recall": {}}
+
+        def __init__(self) -> None:
+            self.messages = messages
+
+        def override(self, **kwargs):
+            return kwargs["messages"]
+
+    merged = middleware.wrap_model_call(Request(), lambda value: value)
+
+    retained = next(message for message in merged if isinstance(message, HumanMessage))
+    assert retained.content == multimodal.content
+    assert retained.content[0]["image_url"]["url"] == image_url
+    assert isinstance(merged[-1], ToolMessage)
+
+
+def test_initial_prompt_order_ends_with_current_user() -> None:
+    middleware = DynamicContextMiddleware(clock=lambda: 0.0)
+    messages = [
+        SystemMessage(content="stable system"),
+        SystemMessage(content="<ShortMemory>summary</ShortMemory>"),
+        HumanMessage(content="older question"),
+        AIMessage(content="older answer"),
+        HumanMessage(content="current question"),
+    ]
+
+    class Request:
+        state = {"user_id": "u", "thread_id": "t", "memory_recall": {}}
+
+        def __init__(self) -> None:
+            self.messages = messages
+
+        def override(self, **kwargs):
+            return kwargs["messages"]
+
+    merged = middleware.wrap_model_call(Request(), lambda value: value)
+
+    assert [type(message) for message in merged] == [
+        SystemMessage,
+        SystemMessage,
+        HumanMessage,
+        AIMessage,
+        SystemMessage,
+        HumanMessage,
+    ]
+    assert "<TurnContext>" in str(merged[-2].content)
+    assert merged[-1].content == "current question"
 
 
 def test_tool_event_middleware_reports_start_and_result() -> None:
@@ -391,6 +522,28 @@ def test_runtime_stream_parts_separates_structured_reasoning() -> None:
     assert message_id == "reasoning_1"
 
 
+def test_runtime_stream_parts_reads_responses_reasoning_summary_blocks() -> None:
+    from superassist.agent.streaming import accumulate_stream_parts
+
+    reasoning, answer, message_id = accumulate_stream_parts(
+        {},
+        None,
+        AIMessageChunk(
+            content=[
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "先检查约束"}],
+                }
+            ],
+            id="reasoning_response_1",
+        ),
+    )
+
+    assert reasoning == "先检查约束"
+    assert answer is None
+    assert message_id == "reasoning_response_1"
+
+
 def test_runtime_stream_parts_handles_split_inline_think_tags() -> None:
     from superassist.agent.streaming import StreamParts, accumulate_stream_parts
 
@@ -420,6 +573,19 @@ def test_runtime_last_ai_text_removes_inline_reasoning() -> None:
     assert _last_ai_text([AIMessage(content="<think>内部推理</think>公开答案")]) == "公开答案"
 
 
+def test_runtime_last_ai_text_extracts_responses_text_blocks() -> None:
+    from superassist.agent.runtime import _last_ai_text
+
+    message = AIMessage(
+        content=[
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "内部摘要"}]},
+            {"type": "text", "text": "公开答案", "phase": "final_answer"},
+        ]
+    )
+
+    assert _last_ai_text([message]) == "公开答案"
+
+
 def test_runtime_last_ai_text_skips_empty_tool_call_messages(tmp_path) -> None:
     from superassist.agent.runtime import _last_ai_text
 
@@ -431,10 +597,10 @@ def test_runtime_last_ai_text_skips_empty_tool_call_messages(tmp_path) -> None:
     assert _last_ai_text(messages) == "visible answer"
 
 
-def test_runtime_persists_compact_tool_events_in_short_memory(tmp_path) -> None:
-    """ShortMemoryMiddleware persists the turn (user + tool_event + assistant) to JSONL."""
+def test_runtime_persists_only_user_and_final_assistant_in_short_memory(tmp_path) -> None:
 
     from langchain_core.messages import AIMessage as _AIMessage
+
     from superassist.middlewares.short_memory_middleware import ShortMemoryMiddleware
 
     settings = Settings(
@@ -449,7 +615,14 @@ def test_runtime_persists_compact_tool_events_in_short_memory(tmp_path) -> None:
         "user_id": "user-owner",
         "thread_id": "t",
         "input": "search this",
-        "messages": [_AIMessage(content="done")],
+        "messages": [
+            _AIMessage(
+                content=(
+                    "done\n\n"
+                    "<ImageDescription>A geometry diagram with a labeled right triangle.</ImageDescription>"
+                )
+            )
+        ],
         "tool_events": [
             {"type": "tool_start", "tool": "web_search", "args": {"query": "x"}},
             {
@@ -467,12 +640,51 @@ def test_runtime_persists_compact_tool_events_in_short_memory(tmp_path) -> None:
     middleware.after_agent(state, runtime=None)
     records = read_jsonl(tmp_path / "threads" / "t" / "messages.jsonl")
 
-    assert [record["role"] for record in records] == ["user", "tool_event", "assistant"]
-    assert records[1]["tool"] == "web_search"
-    assert records[1]["args"] == {"query": "x"}
-    assert "very long result" not in str(records[1])
+    assert [record["role"] for record in records] == ["user", "assistant"]
+    assert "<ImageDescription>" in records[1]["content"]
+    assert "very long result" not in str(records)
+    assert "data:image" not in str(records)
+    assert "web_search" not in str(records)
     metadata = json.loads((tmp_path / "threads" / "t" / "thread_meta.json").read_text(encoding="utf-8"))
     assert metadata["user_id"] == "user-owner"
+
+
+def test_memory_writer_queue_receives_only_compact_tool_completion_fields() -> None:
+    class Queue:
+        def __init__(self) -> None:
+            self.payload = None
+
+        def add(self, payload) -> None:
+            self.payload = payload
+
+    queue = Queue()
+    middleware = MemoryWriterMiddleware(queue)
+    middleware.after_agent(
+        {
+            "user_id": "u",
+            "thread_id": "t",
+            "memory_event_id": "event_1",
+            "input": "fetch it",
+            "messages": [AIMessage(content="finished")],
+            "tool_events": [
+                {"type": "tool_start", "tool": "web_fetch", "args": {"url": "secret"}},
+                {
+                    "type": "tool_result",
+                    "tool": "web_fetch",
+                    "args": {"url": "secret"},
+                    "status": "error",
+                    "content": "provider failed",
+                },
+            ],
+            "memory_write_context": {},
+        },
+        runtime=None,
+    )
+
+    assert queue.payload is not None
+    assert queue.payload.tool_events == [
+        {"name": "web_fetch", "status": "error", "error_summary": "provider failed"}
+    ]
 
 
 def test_runtime_persists_only_unexpired_skill_activations(tmp_path) -> None:
@@ -513,10 +725,10 @@ def test_runtime_persists_only_unexpired_skill_activations(tmp_path) -> None:
     assert restored["loaded_skills"] == ["deep-research"]
 
 
-def test_short_memory_compression_keeps_recent_ten_turns(tmp_path) -> None:
+def test_short_memory_compression_waits_until_turn_limit(tmp_path) -> None:
     path = tmp_path / "messages.jsonl"
     records = []
-    for index in range(12):
+    for index in range(29):
         records.extend(
             turn_records(
                 user_message=f"user {index}",
@@ -526,15 +738,65 @@ def test_short_memory_compression_keeps_recent_ten_turns(tmp_path) -> None:
             )
         )
     write_jsonl(path, records)
-    old_records, recent_records = split_records_for_compression(records, keep_recent_turns=10)
+    before_limit = maybe_compress_short_memory(
+        messages_path=path,
+        metadata={},
+        model=FallbackChatModel(),
+        token_limit=80000,
+        keep_recent_turns=30,
+        summary_target_tokens=6000,
+        loaded_skills=[],
+    )
+    append_records = turn_records(
+        user_message="user 29",
+        assistant_answer="assistant 29",
+        tool_events=[],
+        include_tool_events=False,
+    )
+    write_jsonl(path, [*records, *append_records])
+    at_limit = maybe_compress_short_memory(
+        messages_path=path,
+        metadata={},
+        model=FallbackChatModel(),
+        token_limit=80000,
+        keep_recent_turns=30,
+        summary_target_tokens=6000,
+        loaded_skills=[],
+    )
 
-    assert old_records[0]["content"] == "user 0"
-    assert old_records[-1]["content"] == "assistant 1"
-    assert recent_records[0]["content"] == "user 2"
-    assert recent_records[-1]["content"] == "assistant 11"
+    assert before_limit == {}
+    assert at_limit["short_memory_compressed"] is True
+    assert at_limit["short_memory_compaction_trigger"] == "turns"
+    assert at_limit["short_memory_compacted_records"] == 60
 
 
-def test_short_memory_loads_fixed_recent_turn_window_without_pruning_history(tmp_path) -> None:
+def test_short_memory_compression_triggers_at_token_limit(tmp_path) -> None:
+    path = tmp_path / "messages.jsonl"
+    records = turn_records(
+        user_message="large input " + ("x" * 1000),
+        assistant_answer="large answer " + ("y" * 1000),
+        tool_events=[],
+        include_tool_events=False,
+    )
+    write_jsonl(path, records)
+
+    update = maybe_compress_short_memory(
+        messages_path=path,
+        metadata={},
+        model=FallbackChatModel(),
+        token_limit=10,
+        keep_recent_turns=30,
+        summary_target_tokens=100,
+        loaded_skills=[],
+    )
+
+    assert update["short_memory_compressed"] is True
+    assert update["short_memory_compaction_trigger"] == "tokens"
+    assert update["short_memory_compacted_records"] == len(records)
+    assert read_jsonl(path) == records
+
+
+def test_short_memory_loads_complete_active_segment_after_checkpoint(tmp_path) -> None:
     path = tmp_path / "messages.jsonl"
     records = []
     for index in range(35):
@@ -548,15 +810,105 @@ def test_short_memory_loads_fixed_recent_turn_window_without_pruning_history(tmp
         )
     write_jsonl(path, records)
 
-    loaded = load_short_memory(path, {"summary": "old summary must not be injected"}, keep_recent_turns=30)
+    loaded = load_short_memory(path, {}, keep_recent_turns=30)
+    checkpointed = load_short_memory(
+        path,
+        {"summary": "compressed first 30 turns", "short_memory_compacted_records": 60},
+        keep_recent_turns=30,
+    )
 
     assert loaded.summary == ""
-    assert loaded.messages[0].content == "user 5"
+    assert loaded.messages[0].content == "user 0"
     assert loaded.messages[-1].content == "assistant 34"
+    assert checkpointed.summary == "compressed first 30 turns"
+    assert checkpointed.messages[0].content == "user 30"
+    assert checkpointed.messages[-1].content == "assistant 34"
     assert len([record for record in read_jsonl(path) if record["role"] == "user"]) == 35
 
 
-def test_short_memory_compression_writes_summary_and_prunes_old_records(tmp_path) -> None:
+def test_short_memory_load_does_not_silently_trim_at_token_limit(tmp_path) -> None:
+    path = tmp_path / "messages.jsonl"
+    records = []
+    for index in range(35):
+        records.extend(
+            turn_records(
+                user_message=f"user {index}",
+                assistant_answer=f"assistant {index} " + ("x" * 160),
+                tool_events=[],
+                include_tool_events=True,
+            )
+        )
+    write_jsonl(path, records)
+    loaded = load_short_memory(
+        path,
+        {},
+        keep_recent_turns=30,
+        token_limit=1,
+    )
+
+    assert loaded.records == records
+    assert len(read_jsonl(path)) == len(records)
+
+
+def test_model_memory_projection_uses_explicit_field_allowlist() -> None:
+    updated_at = datetime(2026, 7, 30, 8, 0, tzinfo=UTC)
+    node = MemoryNode(
+        id="concept_1",
+        user_id="feishu:user_1",
+        type=NodeType.CONCEPT,
+        title="Preferred answer style",
+        description="The user prefers concise answers.",
+        importance=0.9,
+        access_count=12,
+        embedding=[0.1, 0.2, 0.3],
+        reasoning="Created because the user stated a preference.",
+        grounded_in=["event_1"],
+        metadata={"source": "test"},
+        updated_at=updated_at,
+    )
+
+    projected = project_memory_recall(MemoryRecall(immediate=[node]))
+
+    assert projected["immediate"] == [
+        {
+            "tier": "immediate",
+            "id": "concept_1",
+            "type": "concept",
+            "title": "Preferred answer style",
+            "description": "The user prefers concise answers.",
+            "user_id": "feishu:user_1",
+            "updated_at": updated_at.isoformat(),
+        }
+    ]
+    serialized = json.dumps(projected)
+    assert "embedding" not in serialized
+    assert "reasoning" not in serialized
+    assert "importance" not in serialized
+    assert "grounded_in" not in serialized
+
+    writer_projection = project_memory_write_context(MemoryRecall(immediate=[node]))
+    assert writer_projection["immediate"] == [
+        {
+            "tier": "immediate",
+            "id": "concept_1",
+            "type": "concept",
+            "title": "Preferred answer style",
+            "description": "The user prefers concise answers.",
+            "user_id": "feishu:user_1",
+            "importance": 0.9,
+            "grounded_in": ["event_1"],
+            "source": "test",
+            "updated_at": updated_at.isoformat(),
+        }
+    ]
+    writer_serialized = json.dumps(writer_projection)
+    assert "embedding" not in writer_serialized
+    assert "access_count" not in writer_serialized
+    assert "reasoning" not in writer_serialized
+    assert "thread_id" not in writer_serialized
+
+
+def test_short_memory_compression_writes_checkpoint_without_pruning_jsonl(tmp_path) -> None:
     path = tmp_path / "messages.jsonl"
     records = []
     for index in range(12):
@@ -583,8 +935,11 @@ def test_short_memory_compression_writes_summary_and_prunes_old_records(tmp_path
     assert update["short_memory_compressed"] is True
     assert "old user 0" in update["summary"]
     remaining = read_jsonl(path)
-    assert len([record for record in remaining if record["role"] == "user"]) == 10
-    assert remaining[0]["content"].startswith("old user 2")
+    assert remaining == records
+    assert update["short_memory_compacted_records"] == len(records)
+    reloaded = load_short_memory(path, update, keep_recent_turns=10)
+    assert reloaded.summary == update["summary"]
+    assert reloaded.records == []
 
 
 def test_short_memory_compression_failure_does_not_prune(tmp_path) -> None:

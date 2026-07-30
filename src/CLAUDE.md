@@ -145,7 +145,10 @@
 | `api_key` | `SUPERASSIST_API_KEY` | `""` | **空字符串** → `FallbackChatModel`（确定性本地回声）。 |
 | `base_url` | `SUPERASSIST_BASE_URL` | `https://api.openai.com/v1` | 可指向兼容 OpenAI 协议的网关。 |
 | `temperature` | `SUPERASSIST_TEMPERATURE` | `None` | 模型名含 `minimax` 且未显式设置时强制为 `1.0`。 |
+| `reasoning_effort` | `SUPERASSIST_REASONING_EFFORT` | `medium` | GPT-5.6 支持 `none/low/medium/high/xhigh/max`；飞书 `/effort` 可按会话覆盖。 |
 | `max_tokens` | `SUPERASSIST_MAX_TOKENS` | `None` | 仅当非 None 才透传。 |
+| `model_input_log_enabled` | `SUPERASSIST_MODEL_INPUT_LOG_ENABLED` | `False` | 开启后记录最终 provider payload 到 `<data_dir>/logs/model-input.jsonl`。 |
+| `model_input_log_max_bytes` | `SUPERASSIST_MODEL_INPUT_LOG_MAX_BYTES` | `52428800` | 单日志文件轮转阈值；保留 `.1` 到 `.3` 三个备份。 |
 
 **工具**
 
@@ -172,11 +175,13 @@
 
 | 字段 | 默认 | 用处 |
 | --- | --- | --- |
-| `memory_llm_writer_enabled` | `False` | True 才走 `MEMORY_WRITER_PROMPT`，否则 fallback writer。 |
-| `short_memory_token_limit` | `80000` | 触发短记忆压缩的阈值。 |
-| `short_memory_keep_recent_turns` | `10` | 压缩时保留的"最近几个 user 起始记录"。 |
+| `memory_llm_writer_enabled` | `True` | True 时用独立 Memory Updater 走 `MEMORY_WRITER_PROMPT`，否则 fallback writer。 |
+| `memory_model` | `deepseek-v4-flash` | Memory Updater 与短记忆压缩使用的独立 OpenAI 兼容模型。 |
+| `memory_api_key` / `memory_base_url` | 空 | 独立模型凭据与地址；为空时复用主模型配置。 |
+| `short_memory_token_limit` | `80000` | 活动段达到该 token 阈值后整体压缩为摘要。 |
+| `short_memory_keep_recent_turns` | `30` | 活动段达到该已完成回合数后整体压缩为摘要。 |
 | `short_memory_summary_target_tokens` | `6000` | 压缩 prompt 中告知模型的目标长度。 |
-| `short_memory_enable_tool_events` | `True` | False 时 JSONL 不再写入 `tool_event` 行。 |
+| `short_memory_enable_tool_events` | `False` | 已废弃的兼容字段；短记忆始终只保存 user 与最终 assistant。 |
 | `memory_reinforce_similarity` | `0.85` | event ↔ 现有 concept 余弦相似度阈值；命中即 `REINFORCES`。 |
 | `memory_concept_merge_similarity` | `0.85` | `merge_similar_concepts` 阈值。 |
 | `memory_completion_similarity` | `0.30` | `complete_orphans` 给孤立 concept 接 GROUNDS 的下限。 |
@@ -219,6 +224,9 @@
 | `feishu_domain` | `https://open.feishu.cn` | Lark Client 的 domain。 |
 | `feishu_allowed_open_ids` | `""` | 逗号分隔；`feishu_allowed_open_id_set` 属性返回去空白后的 set。 |
 | `feishu_mention_only` | `True` | True 且非私聊时只响应被 @ 消息。 |
+| `feishu_image_ocr_enabled` | `True` | 是否运行本地 RapidOCR；OCR 失败不阻止原图进入主模型。 |
+| `feishu_image_ocr_max_chars` | `12000` | 多图 OCR 注入当前轮文本历史的总字符上限。 |
+| `feishu_image_context_ttl_seconds` | `180` | 最新一组原图跨消息保留的滑动 TTL；有效后续消息刷新计时。 |
 
 **企业微信**
 
@@ -251,7 +259,7 @@
 <a id="3-llmpy"></a>
 ## 3. `llm.py`
 
-[superassist/llm.py](superassist/llm.py) 提供 `create_chat_model(settings)`，按以下分支返回 `BaseChatModel`：
+[superassist/llm.py](superassist/llm.py) 提供主模型工厂 `create_chat_model(settings)` 与独立记忆模型工厂 `create_memory_model(settings, call_kind=...)`：
 
 1. **空 API key** → `FallbackChatModel`（不调用网络）。
    - `bind_tools()` 接受参数但永远不调用工具。
@@ -259,11 +267,18 @@
 2. **包含 `minimax`（model 名或 base_url 任一）** → `MiniMaxCompatibleChatModel`：
    - `_get_request_payload`：把 OpenAI 风格的 `max_completion_tokens` 改回 `max_tokens`；剥掉每条 message 的 `name` 字段（MiniMax 不接受）；强制 `extra_body.reasoning_split=True`；可选 `SUPERASSIST_DEBUG_MINIMAX_PAYLOAD` 路径转储 payload。
    - `_create_chat_result`：从响应的 `choices[].message.reasoning_details[].text` 抽取 reasoning，与 `<think>...</think>` 内联块合并写入 `AIMessage.additional_kwargs.reasoning_content`。
-3. **其它 OpenAI 兼容** → `OneSecondRetryChatModel`，每次 `_generate` 失败后 `time.sleep(1)` 重试一次。
+3. **GPT-5.6 family** → `OneSecondRetryChatModel` + Responses API：
+   - 请求 `reasoning.effort`；非 `none` 时同时请求 `reasoning.summary="detailed"`，供流式飞书卡片展示。
+   - 开启 `stream_usage`，`AgentRuntime` 把 `input_tokens/cache_read/cache_hit_rate` 写入结果 metadata 和日志。
+4. **其它 OpenAI 兼容** → `OneSecondRetryChatModel`，每次 `_generate` 失败后 `time.sleep(1)` 重试一次。
+
+`create_memory_model` 默认使用 `deepseek-v4-flash`，从 `memory_api_key/memory_base_url` 取独立配置（空值回退主模型凭据），不附加 GPT-5.6 的 Responses/reasoning 参数。Memory Updater 与短记忆压缩各持有一个该模型客户端。
+
+所有真实模型请求都可写入 `logs/model-input.jsonl`；记录包含 `call_kind`、近似 token 总量、按 static system / short memory / turn context / current user / tool schemas 等划分的 `input_manifest`，并按配置大小轮转。
 
 `is_minimax_model(model, base_url)` 是上述路由的判定函数；`AgentRuntime` 也用它向 trace 注入 `tool_schema_binding="openai_compatible_minimax"`。
 
-`temperature` 默认 None，但 `model` 含 `minimax` 时强制 `1.0`。
+`temperature` 默认 None，但 `model` 含 `minimax` 时强制 `1.0`。GPT-5.6 默认推理强度为 `medium`。
 
 ---
 
@@ -507,7 +522,7 @@ RunEventReporter = Callable[[AgentRunEvent], None]
 | `user_id`, `thread_id`, `event_id` | 路由键。 |
 | `user_message` | 本 turn 用户输入。 |
 | `assistant_answer` | 最终 AI 答复（来自 `FinalTextMiddleware`）。 |
-| `tool_events` | `state.tool_events` 的快照，writer 用来摘录工具结果。 |
+| `tool_events` | `state.tool_events` 的快照；writer 只投影完成事件的名称、状态与错误摘要。 |
 | `memory_context` | `state.memory_write_context`（由 `MemoryRecallMiddleware` 写入），LLM writer 用来感知"我对哪些已有节点知道什么"。 |
 
 #### 5.7.2 `prepare_turn_contexts` 时序
@@ -542,13 +557,13 @@ RunEventReporter = Callable[[AgentRunEvent], None]
 - `_build_plan`: 仅当 `llm_enabled=True` **且** `model._llm_type != "superassist-fallback"` 才走 LLM；任何异常回退 `_fallback_plan`。
 - `_fallback_plan`: 用户消息 < 12 字直接返回空 `UpdatePlan()`；否则用 legacy 形状创建一个 `current_event` EVENT（记录 user/assistant 摘要）和一个 concept `User discussed: ...`。
 - LLM prompt 见模块顶部的 `MEMORY_WRITER_PROMPT`，强约束：
-  - 输出纯 JSON，并创建恰好一个 `ref="current_event"` 的 EVENT 概括本轮对话。
+  - 输出纯 JSON；仅在存在持久信息时创建 `ref="current_event"` 的 EVENT，纯问候返回空 operations。
   - 边类型默认权重表与 §1.2 一致。
   - 8 条规则，覆盖"只存持久化偏好/目标/事实/概念/截止"、"不存秘密/瞬态工具输出/闲聊"、"相似已有上下文用 UPDATE/MERGE 而非新建"、"中文事件用中文 title/description"。
 
 `_extract_json` 用宽松解析：剥 `\`\`\`json` 围栏 → 取首个 `{` 到末个 `}` 之间内容 → `json.loads`。
 
-`_compact_tool_events` / `_compact_memory_node`：把工具事件与桶节点压成给 LLM 看的精简形态（`content` 截 1000 字、节点 description 截 1200 字、grounded_in 取前 10 项），避免吞掉所有上下文预算。
+`_compact_tool_events` 只保留 `tool_result` 的 `name/status/error_summary≤500`，不发送参数或成功结果。`_compact_memory_node` 只保留 `tier/id/type/title/description/user_id/importance/grounded_in/source/updated_at`，绝不发送 embedding、access_count 或内部 reasoning。
 
 #### 5.8.2 `MemoryWriteQueue`
 
@@ -578,7 +593,7 @@ RunEventReporter = Callable[[AgentRunEvent], None]
 | `rag_context` | `NotRequired[str]` | `RagRetrievalMiddleware` / `RagRetryMiddleware` | `DynamicContextMiddleware` |
 | `rag_sources` | `NotRequired[list[str]]` | 同上 | `RagAttributionMiddleware` |
 | `rag_retrieval` | `NotRequired[dict]` | `RagRetrievalMiddleware` | 调试首轮 mode/query/attempt/message |
-| `tool_events` | `NotRequired[list[dict]]` | `ToolEventMiddleware`、`SubagentLimitMiddleware` | `ShortMemoryMiddleware`、`MemoryWriterMiddleware`、`ToolCallLimitMiddleware`（计数）|
+| `tool_events` | `NotRequired[list[dict]]` | `ToolEventMiddleware`、`SubagentLimitMiddleware` | `MemoryWriterMiddleware`、`ToolCallLimitMiddleware`（计数）|
 | `loaded_skills` | `NotRequired[list[str]]` | `ToolEventMiddleware`（探测 read_file 路径）、`ShortMemoryMiddleware`（持久化） | `DynamicContextMiddleware`（注入 SKILL.md 内容）、运行时初始化 |
 | `metadata` | `NotRequired[dict]` | 多方更新；运行时初始化时塞入 `history_loaded` / `history_message_count` / `short_memory_summary_loaded` / `loaded_skills` / `tool_calling_enabled` / `tool_schema_binding` | runtime 返回值组装 |
 
@@ -595,12 +610,12 @@ RunEventReporter = Callable[[AgentRunEvent], None]
 
 ### 6.2 `agent/factory.build_agent`
 
-返回 `AgentBundle(agent, settings, model, memory, memory_queue, team_supervisor, team_config_error, rag_service)`。流程：
+返回 `AgentBundle(agent, settings, model, memory_model, short_memory_model, memory, memory_queue, team_supervisor, team_config_error, rag_service)`。流程：
 
 1. `settings.data_dir.mkdir(...)` 兜底创建目录。
 2. `_build_team_supervisor(settings)`：尝试 `AgentTeamConfig.from_file()`，失败即把异常字符串挂在 `team_config_error`。空配置或 `enabled=False` → 返回 `(None, None)`。
 3. `set_team_supervisor(team_supervisor)` 写到模块级单例（供 `team_task` 工具与 `AgentRuntime.close` 用）。
-4. `create_chat_model(settings)`。
+4. `create_chat_model(settings)` 创建主 Agent 模型；两次 `create_memory_model` 分别创建 Memory Updater 与短记忆压缩客户端。
 5. `MemoryService(...)` + `preload_embedder()`（提前热 BGE）。
 6. `MemoryWriteQueue(MemoryWriter(...), debounce_seconds=settings.memory_debounce_seconds)`。
 7. `default_tools(...)` 仅在 `enable_tools=True` 时挂载常规工具；`include_team_task` 取决于 supervisor 是否启用。`rag_mode=True` 时额外挂载 `rag_search`、`web_search`、`web_fetch`，网络工具仍检查自己的配置开关。
@@ -617,8 +632,8 @@ RunEventReporter = Callable[[AgentRunEvent], None]
 - `_initial_state(message, user_id, thread_id)`:
   - thread_id 缺省时生成 `thread_<12hex>`。
   - `_load_thread_metadata` 读 `data_dir/threads/<thread_id>/thread_meta.json`，失败返回 `{}`。
-  - `_load_history` 调 `load_short_memory(messages_path, metadata, token_limit)`。
-  - 把消息 + 一条新 `HumanMessage(message)` 拼成 `messages` 列表写入初始 state，并初始化 `rag_mode` / `rag_context` / `rag_sources`。
+  - `_load_history` 调 `load_short_memory(messages_path, metadata, ...)`，读取摘要检查点后的完整活动段。
+  - 初始消息按 `<ShortMemory>` SystemMessage、活动段、最新 `HumanMessage(message)` 排列，并初始化 `rag_mode` / `rag_context` / `rag_sources`。
 - `run` 与 `run_streaming` 都用 `rag_turn_context(rag_service, user_id, rag_mode, max_attempts)` 包住整个 Agent 循环，使 `rag_search` 工具和 middleware 共享同一个并发安全的尝试计数器。
 - `_stream_agent`: 用 `agent.stream(state, ..., stream_mode=["messages","values"])` 同时收文本块和 state 快照；`accumulate_stream_text` 处理多种 chunk 形态；最终 state 取最后一个 `values` 模式 chunk 或退回初始 state。
 - `_report_agent_text`: 用 `_active_agent_text_seen: set[str]` 与 `startswith` 判定避免重复推送同一段渐进文本。
@@ -645,32 +660,31 @@ RunEventReporter = Callable[[AgentRunEvent], None]
 
 | 字段 | 含义 |
 | --- | --- |
-| `messages: list[BaseMessage]` | 给 LangChain agent 的初始消息列表（含 summary HumanMessage）。 |
-| `records: list[dict]` | 选中的原始 JSONL 记录（按时间顺序）。 |
+| `messages: list[BaseMessage]` | 最新摘要检查点之后的完整活动段消息（按时间顺序）。 |
+| `records: list[dict]` | 最新摘要检查点之后的原始 JSONL 记录。 |
 | `summary: str` | 上一轮压缩输出的 Markdown summary，若无则空串。 |
 
 #### 6.6.2 Token 估算
 
-`estimate_tokens(value)`：ASCII 字符 // 4 + 非 ASCII 字符 // 2，最低返回 1。中文字符按 0.5 token 估算，与 BGE/MiniMax 实际占用相对接近，避免压缩门槛飘忽。
+`estimate_tokens(value)`：使用 `tiktoken` 的 `o200k_base` 编码估算 token；模型输入日志使用同一估算口径。
 
-#### 6.6.3 加载流程 `load_short_memory(messages_path, metadata, token_limit)`
+#### 6.6.3 加载流程 `load_short_memory(messages_path, metadata, ...)`
 
 1. `read_jsonl` 读 messages.jsonl。
-2. `summary = metadata["summary"] | ""`。
-3. `budget = max(0, token_limit - estimate_tokens(summary))`。
-4. **从尾向前**累计 records，超 budget 即停（保证已选条目数 ≥ 1）；最后再按时间顺序反转。
-5. 若有 summary，在最前插一条 `HumanMessage(name="summary")`；其余按 `record_to_message` 转成 AIMessage / HumanMessage / `HumanMessage(name="tool_event")`。
+2. 从 `metadata.short_memory_compacted_records` 读取最新摘要检查点。
+3. 只装载检查点之后的完整活动段，不在加载阶段按回合或 token 静默截尾。
+4. `AgentRuntime` 将摘要包装为 `<ShortMemory>` SystemMessage，再依次放入活动段与最新 HumanMessage。
 
 #### 6.6.4 单 turn 写入 `turn_records`
 
-写入条目按顺序：`{role:user, content, created_at}`、可选 `tool_event` 们（仅 `tool_result` 类事件经 `_compact_tool_event` 转成 `{role:tool_event, tool, args, status, error≤1000 字, created_at}`）、`{role:assistant, content, created_at}`。
+每个完成回合只追加 `{role:user, content, created_at}` 与 `{role:assistant, content, created_at}`。工具参数、原始结果与中间 assistant/tool 消息不会进入后续轮次。
 
 #### 6.6.5 压缩 `maybe_compress_short_memory`
 
-1. 重读 records；与 summary 合计 token ≤ 阈值 → 直接返回 `{}`。
-2. `split_records_for_compression(records, keep_recent_turns)`：从尾向前找第 `keep_recent_turns` 条 `role=user` 记录作为分割点；若 user 数不足 → `(old=[], recent=records)`，函数返回 `{}`。
-3. 用 `SUMMARY_SYSTEM_PROMPT` + `build_summary_prompt(previous_summary, old_records, summary_target_tokens, loaded_skills)` 调 LLM。
-4. 写回 `messages.jsonl = recent_records`，返回 `{summary, summary_updated_at, short_memory_compressed: True, short_memory_compressed_records: N}` 给 `ShortMemoryMiddleware` 合并到 `metadata`。
+1. 重读检查点之后的活动段；未达到 30 个完成回合且“旧摘要 + 活动段”未达到 80000 tokens 时返回 `{}`。
+2. 达到任一阈值后，用 `SUMMARY_SYSTEM_PROMPT` + `build_summary_prompt(previous_summary, active_records, summary_target_tokens, loaded_skills)` 调独立短记忆压缩模型。
+3. `messages.jsonl` 不改写；返回新摘要、`summary_version` 与 `short_memory_compacted_records=len(records)` 检查点。
+4. 下一轮只装载新检查点之后的记录，从空活动段继续累计，因此正常轮次的模型前缀保持追加式增长。
 5. LLM 失败 → 返回 `{short_memory_compression_error: "..."}`。
 
 `SUMMARY_SYSTEM_PROMPT` 强调要保留偏好 / 当前任务 / 工具事实 / loaded skills，丢弃长 webpage 内容与重复问候。
@@ -699,18 +713,17 @@ LangChain 1.x middleware 的钩子分类：`before_agent` / `after_agent`（agen
 - 钩子：`before_agent`（一次性，整个 invoke 周期只跑一次）。
 - 短路：`state.memory_event_id` 已存在 → 跳过（重入保护）。
 - 调 `MemoryService.prepare_turn_contexts(user_id, thread_id, message)`。
-- 写入 state：`memory_event_id` / `memory_recall` (read 桶 dump) / `memory_write_context` (write 桶 dump)。
+- 写入 state：`memory_event_id` / `memory_recall` / `memory_write_context`。主模型 recall 只保留 `tier/id/type/title/description/user_id/updated_at`；writer 额外保留 `importance/grounded_in/source`。两者都排除 embedding、access_count 和内部 reasoning。
 
 ### 7.4 `DynamicContextMiddleware`
 
 - 钩子：`before_model`（写入 `metadata["dynamic_context_injected"]=True` 用作 trace 烟测）+ `wrap_model_call`（核心）。
 - `wrap_model_call`：
   1. 从 state 抽 `memory_recall` / `loaded_skills` / `user_id` / `thread_id`；RAG 模式同时读取 `rag_context` 与本轮 session trace。
-  2. `build_available_skills_section()` —— 列出全部 public skills（`<skill_system>` XML 段）。
-  3. `build_loaded_skills_section(loaded_skills)` —— 把已读过 SKILL.md 的全文塞回 system 末尾，跨 turn 持久化技能上下文。
-  4. 拼装 `Runtime context:` 块（带 `current_time_utc`、`json.dumps(memory_recall)` 全量）。
-  5. RAG 模式加入封闭证据规则：上传文件是不可信资料，不得虚构引文；证据不足应继续 `rag_search`；耗尽上传检索后才按联网开关降级，并区分资料/网页/模型知识。
-  6. `_prepend_reminder`：若 `messages[0]` 已是 `SystemMessage` → 合并 content；否则 prepend 新 `SystemMessage`。
+  2. 可用 skill 索引由 `compose_system_prompt` 放入稳定静态前缀；动态层只用 `build_loaded_skills_section` 注入本轮开始时仍处于激活期的 skill 全文。
+  3. 拼装 `<TurnContext>`，内部按 `<RuntimeContext>`、`<LongTermMemory>`、可选 `<ActiveSkills>` / `<RAGContext>` 分区。
+  4. RAG 模式加入封闭证据规则：上传文件是不可信资料，不得虚构引文；证据不足应继续 `rag_search`；耗尽上传检索后才按联网开关降级，并区分资料/网页/模型知识。
+  5. GPT-5.6 路径把 TurnContext 插到最新 HumanMessage 前，因此初次调用始终以当前用户消息结尾；工具续调用中，AI/tool 消息仍自然位于当前用户之后。
 
 ### 7.5 `ShortMemoryMiddleware`
 
@@ -1139,7 +1152,7 @@ LangChain `@tool("team_task")`：
 | `root_id` | 群里"回复"消息的根 ID；私聊为 None。 |
 | `chat_type` | `p2p` / `group` 等。 |
 | `mentions` | dict 列表，至少含 `name` / `open_id`。 |
-| `files` | `[{file_key} 或 {image_key}]`，v1 不处理只用来判断 `should_trigger_agent` 是否要回 unsupported 提示。 |
+| `files` | `[{file_key} 或 {image_key}]`；图片进入多模态主 Agent，其他文件仍返回 unsupported。 |
 | `topic_id` 属性 | `root_id or message_id`，用作 `FeishuThreadStore` 的 topic 维度。 |
 | `is_private` 属性 | `chat_type in {"p2p","private","single"}`。 |
 
@@ -1161,13 +1174,13 @@ LangChain `@tool("team_task")`：
 1. 白名单：`feishu_allowed_open_id_set` 非空时严格匹配 sender。
 2. `should_trigger_agent`：私聊立即触发；群里需 `mention_only=False` 或确实有 @ 提及。
 3. `clean_mention_text` 去掉 @ 文本。
-4. 文本为空但有附件 → 回 `UNSUPPORTED_FILE_MESSAGE`。
-5. 先发占位卡片"Preparing context..."。
-6. 私聊使用 `user_id = f"feishu:{open_id}"` 与稳定 `__private__` thread scope；群聊使用 `user_id = f"feishu-group:{chat_id}"` 与稳定 `__group__` scope，同群成员共享短记忆、长期 Memory 图和 RAG。群消息送入 runtime 前加 `[飞书群成员: <nickname|name|群成员>]` 前缀；昵称由 Contact v3 用户接口解析并缓存，禁止回退显示 raw open_id；同 scope 通过 `asyncio.Lock` 串行写入。
-7. 构造 `report` 闭包：仅放行 `thinking` / `agent_text` / `subagent_text` 三类事件，其它事件 `return`；subagent_text 走 `format_subagent_card_text` 加 `Subagent [...]:` 前缀。
-8. `runtime = runtime_factory(report)`，`asyncio.to_thread(runtime.run_streaming, clean_text, user_id, thread_id)`，最后 `runtime.memory_queue.flush()` 强制落库。
-9. `final_text = result.answer or 上次卡片缓存 or "(empty response)"`，调 `_send_or_patch(..., final=True)`。
-10. 任何异常回 "处理这条飞书消息时出错了，请稍后重试。"
+4. scope 正忙时直接忽略新消息；图片以外的附件返回 `UNSUPPORTED_FILE_MESSAGE`。
+5. 每张图片按 10 MB 下载上限、每条消息最多 4 张；PNG/JPEG/GIF/WebP 原始字节直接进入模型，不校正方向、不缩放、不铺白、不转码。
+6. 可选 RapidOCR 在本地线程中逐图识别，结果标为不可信辅助文本；OCR 缺包、初始化或识别失败时 fail-open。
+7. 原图 Base64、OCR、当前用户问题组成一个 LangChain 多模态 `HumanMessage`，直接进入主 Agent。最新一组原图按 180 秒滑动 TTL 跨飞书消息保留，每条有效后续消息刷新计时；过期后清除原始字节，只复用历史中的 OCR、回答和 `<ImageDescription>`。同一轮 Skill/工具循环的每次模型调用也完整保留原图；GPT-5.6 显式关闭 `use_previous_response_id`，避免客户端省略旧图片输入。
+8. `runtime.run_streaming(message, message_content=...)` 的 `message` 只含 OCR 与用户问题，且用户问题位于末尾；`message_content` 才含 Base64。因此短期记忆持久化 OCR、问题、最终回答和图片描述，但不持久化图片数据。
+9. 构造 `report` 闭包流式处理 `thinking` / `agent_reasoning` / `agent_text` / `subagent_text`；正文开始后折叠 reasoning 面板。
+10. `runtime.memory_queue.flush()` 后提交最终卡片；任何异常回统一错误提示。
 
 #### 13.2.3 卡片渲染
 
@@ -1311,7 +1324,7 @@ AI Engine 内部路由：
    - `RagAttributionMiddleware`（仅 RAG）：根据 session 和工具事件生成来源尾注与 provenance metadata。
    - `FinalTextMiddleware`：把最后一条 AIMessage 文本写到 `metadata.final_assistant_text` + `memory_ready=True`。
    - `MemoryWriterMiddleware`：构造 `MemoryWritePayload` 入 `MemoryWriteQueue`（debounce 30s 后或 CLI flush 时批写）。
-   - `ShortMemoryMiddleware`：把本 turn 的 user/tool_event/assistant 三组记录追加到 `messages.jsonl`；触发 `maybe_compress_short_memory`，若超 token_limit 则用 LLM 生成新 summary 并把"老记录"从 jsonl 中剪掉，更新 `thread_meta.json.summary`。
+   - `ShortMemoryMiddleware`：只把本 turn 的 user/final-assistant 追加到 `messages.jsonl`；活动段达到 30 回合或 80000 tokens 时，用独立模型整体生成新 summary 并推进 metadata 检查点，不改写 JSONL。
 7. **`AgentRuntime._result_from`** 读 `metadata.final_assistant_text` 与 `loaded_skills` 输出 `AgentRunResult`。
 8. **后台**：`MemoryWriteQueue` 倒计时到点 → `MemoryWriter.write(payload)`：`_build_plan` (LLM 或 fallback) → `apply_plan` → `consolidate`（merge concepts / decay edges / complete orphans）；写完触发 `rebuild_vector_index`，FAISS 与 SQLite 一致性恢复。
 9. **UI / 飞书**：

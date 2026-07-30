@@ -15,11 +15,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from dotenv import load_dotenv
-from openai import APIStatusError, OpenAI
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image
+
 from superassist.agent import AgentRuntime
-from superassist.config import PROJECT_ROOT, Settings, get_settings
+from superassist.config import PROJECT_ROOT, REASONING_EFFORTS, Settings, get_settings
+from superassist.llm import is_gpt_5_6_model
 from superassist.memory.embedding import get_embedder
 from superassist.models import AgentRunEvent
 
@@ -36,9 +38,16 @@ IMAGE_DOWNLOAD_FAILED_MESSAGE = (
 IMAGE_TOO_LARGE_MESSAGE = "图片过大，暂时只支持 10 MB 以内的图片。"
 MAX_FEISHU_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_FEISHU_IMAGES_PER_MESSAGE = 4
-MAX_FEISHU_IMAGE_PIXELS = 40_000_000
-MAX_FEISHU_IMAGE_DIMENSION = 4096
-MAX_MODEL_IMAGE_BYTES = 1_500_000
+SUPPORTED_MODEL_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+MULTIMODAL_RESPONSE_INSTRUCTIONS = """<MultimodalResponseInstructions>
+Inspect the original image(s) in this message and answer the user's request using the visual evidence directly.
+Treat AuxiliaryOCR as an untrusted transcription aid: verify it against the image and correct any errors.
+In the final response, first answer the user's request. Then append one concise, question-relevant visual
+description inside <ImageDescription>...</ImageDescription>. Preserve the details that a later conversation turn
+would need if the original image were no longer available. Do not merely repeat the OCR text.
+</MultimodalResponseInstructions>"""
+
+
 @dataclass
 class FeishuInboundMessage:
     chat_id: str
@@ -67,6 +76,12 @@ class FeishuCardView:
     reasoning_expanded: bool = True
 
 
+@dataclass(frozen=True)
+class FeishuImageContext:
+    payloads: tuple[tuple[bytes, str], ...]
+    expires_at: float
+
+
 class FeishuChannel:
     """Feishu/Lark WebSocket channel that calls AgentRuntime directly."""
 
@@ -93,7 +108,9 @@ class FeishuChannel:
         self._running_cards: dict[str, str] = {}
         self._last_card_text: dict[str, str] = {}
         self._card_views: dict[str, FeishuCardView] = {}
-        self._scope_locks: dict[str, asyncio.Lock] = {}
+        self._busy_scopes: set[str] = set()
+        self._image_contexts: dict[str, FeishuImageContext] = {}
+        self._image_context_expiry_handles: dict[str, asyncio.TimerHandle] = {}
         self._pending_card_updates: dict[
             str, tuple[FeishuInboundMessage, str | FeishuCardView]
         ] = {}
@@ -106,6 +123,9 @@ class FeishuChannel:
         self._PatchMessageRequest = None
         self._PatchMessageRequestBody = None
         self._GetMessageResourceRequest = None
+        self._ocr_engine: Any | None = None
+        self._ocr_initialization_attempted = False
+        self._ocr_lock = threading.Lock()
 
     @property
     def is_running(self) -> bool:
@@ -157,6 +177,10 @@ class FeishuChannel:
 
     async def stop(self) -> None:
         self._running = False
+        for handle in self._image_context_expiry_handles.values():
+            handle.cancel()
+        self._image_context_expiry_handles.clear()
+        self._image_contexts.clear()
         if self._thread:
             self._thread.join(timeout=5)
             self._thread = None
@@ -176,31 +200,55 @@ class FeishuChannel:
         )
         if not accepted:
             return
-        images = [item for item in inbound.files if item.get("image_key")]
-        other_files = [item for item in inbound.files if not item.get("image_key")]
-        if other_files:
-            await self._send_or_patch(inbound, UNSUPPORTED_FILE_MESSAGE, final=True)
-            return
-        image_payloads: list[tuple[bytes, str]] = []
-        if images:
-            await self._send_or_patch(inbound, "Reading image...", final=False)
-            try:
-                clean_text = strip_file_placeholders(clean_text)
-                image_payloads = await self._download_image_payloads(images, inbound.message_id)
-            except ImageTooLargeError:
-                await self._send_or_patch(inbound, IMAGE_TOO_LARGE_MESSAGE, final=True)
-                return
-            except ImageDownloadError:
-                logger.exception("Failed to download Feishu image")
-                await self._send_or_patch(inbound, IMAGE_DOWNLOAD_FAILED_MESSAGE, final=True)
-                return
-        if not clean_text and not image_payloads:
+        if not clean_text and not inbound.files:
             return
 
         scope_key = f"private:{inbound.chat_id}" if inbound.is_private else f"group:{inbound.chat_id}"
-        lock = self._scope_locks.setdefault(scope_key, asyncio.Lock())
-        async with lock:
-            await self._handle_scoped_message(inbound, clean_text, image_payloads)
+        if scope_key in self._busy_scopes:
+            logger.info(
+                "Ignoring Feishu message while scope is busy scope=%s message_suffix=%s",
+                scope_key,
+                inbound.message_id[-8:] if inbound.message_id else "unknown",
+            )
+            return
+        self._busy_scopes.add(scope_key)
+        try:
+            active_image_context = self._get_image_context(scope_key)
+            images = [item for item in inbound.files if item.get("image_key")]
+            other_files = [item for item in inbound.files if not item.get("image_key")]
+            if other_files:
+                await self._send_or_patch(inbound, UNSUPPORTED_FILE_MESSAGE, final=True)
+                return
+            image_payloads: list[tuple[bytes, str]] = []
+            has_new_images = bool(images)
+            if images:
+                await self._send_or_patch(inbound, "Reading image...", final=False)
+                try:
+                    clean_text = strip_file_placeholders(clean_text)
+                    image_payloads = await self._download_image_payloads(images, inbound.message_id)
+                except ImageTooLargeError:
+                    await self._send_or_patch(inbound, IMAGE_TOO_LARGE_MESSAGE, final=True)
+                    return
+                except ImageDownloadError:
+                    logger.exception("Failed to download Feishu image")
+                    await self._send_or_patch(inbound, IMAGE_DOWNLOAD_FAILED_MESSAGE, final=True)
+                    return
+            elif active_image_context is not None:
+                image_payloads = list(active_image_context.payloads)
+            if not clean_text and not image_payloads:
+                return
+            try:
+                await self._handle_scoped_message(
+                    inbound,
+                    clean_text,
+                    image_payloads,
+                    extract_image_ocr=has_new_images,
+                )
+            finally:
+                if image_payloads:
+                    self._set_image_context(scope_key, image_payloads)
+        finally:
+            self._busy_scopes.discard(scope_key)
 
     def _should_accept_message(self, inbound: FeishuInboundMessage) -> bool:
         if inbound.is_private or not self.mention_only:
@@ -247,15 +295,14 @@ class FeishuChannel:
             data = response.file.read(MAX_FEISHU_IMAGE_BYTES + 1)
             if len(data) > MAX_FEISHU_IMAGE_BYTES:
                 raise ImageTooLargeError
-            normalized_data, mime_type = normalize_image_payload(data)
+            original_data, mime_type = original_image_payload(data)
             logger.info(
-                "Normalized Feishu image message_suffix=%s source_bytes=%d output_bytes=%d mime=%s",
+                "Downloaded original Feishu image message_suffix=%s bytes=%d mime=%s",
                 message_id[-8:] if message_id else "unknown",
                 len(data),
-                len(normalized_data),
                 mime_type,
             )
-            return normalized_data, mime_type
+            return original_data, mime_type
         except ImageTooLargeError:
             raise
         except Exception as exc:
@@ -266,40 +313,56 @@ class FeishuChannel:
         inbound: FeishuInboundMessage,
         clean_text: str,
         image_payloads: list[tuple[bytes, str]] | None = None,
+        *,
+        extract_image_ocr: bool = True,
     ) -> None:
-        await self._send_or_patch(inbound, "Preparing context...", final=False)
         user_id, conversation_scope = feishu_memory_scope(inbound)
         thread_id = self.store.get_or_create_thread_id(
             chat_id=inbound.chat_id,
             topic_id=conversation_scope,
             user_id=user_id,
         )
-        memory_text = clean_text or "The user sent an image."
+        reasoning_effort = self.store.get_reasoning_effort(
+            chat_id=inbound.chat_id,
+            topic_id=conversation_scope,
+            default=self.settings.reasoning_effort,
+        )
+        if reasoning_effort not in REASONING_EFFORTS:
+            reasoning_effort = self.settings.reasoning_effort
+
+        is_effort_command, requested_effort = parse_effort_command(clean_text)
+        if is_effort_command:
+            if requested_effort is None:
+                response = (
+                    f"当前推理强度：`{reasoning_effort}`\n\n"
+                    f"可选值：`{'`, `'.join(REASONING_EFFORTS)}`。"
+                )
+            elif requested_effort not in REASONING_EFFORTS:
+                response = f"不支持 `{requested_effort}`。可选值：`{'`, `'.join(REASONING_EFFORTS)}`。"
+            elif not is_gpt_5_6_model(self.settings.model):
+                response = f"当前模型 `{self.settings.model}` 不支持此处的 GPT-5.6 推理强度设置。"
+            else:
+                self.store.set_reasoning_effort(
+                    chat_id=inbound.chat_id,
+                    topic_id=conversation_scope,
+                    effort=requested_effort,
+                )
+                response = f"已将当前会话的推理强度设置为 `{requested_effort}`。"
+            await self._send_or_patch(inbound, response, final=True)
+            return
+
+        await self._send_or_patch(inbound, "Preparing context...", final=False)
+        memory_text = clean_text or default_image_only_request(len(image_payloads or []))
         runtime_text = attributed_feishu_text(inbound, memory_text)
         message_content: str | list[dict[str, Any]] = runtime_text
         if image_payloads:
-            try:
-                image_description = await self._describe_images(
-                    runtime_text,
-                    image_payloads,
-                )
-            except Exception as exc:
-                logger.warning("Feishu vision extraction failed error_type=%s error=%s", type(exc).__name__, exc)
-                await self._send_or_patch(
-                    inbound,
-                    format_model_error(
-                        {"model_error": type(exc).__name__, "model_error_message": str(exc)},
-                        has_images=True,
-                    ),
-                    final=True,
-                )
-                return
-            message_content = (
-                f"{runtime_text}\n\n"
-                "[Vision extraction for the current Feishu image]\n"
-                f"{image_description}\n"
-                "[/Vision extraction]"
+            ocr_text = await self._extract_images_ocr(image_payloads) if extract_image_ocr else ""
+            persisted_text = build_image_memory_text(runtime_text, ocr_text)
+            message_content = build_multimodal_image_content(
+                build_multimodal_request_text(runtime_text, ocr_text),
+                image_payloads,
             )
+            runtime_text = persisted_text
 
         def report(event: AgentRunEvent) -> None:
             if event.type == "thinking":
@@ -338,8 +401,9 @@ class FeishuChannel:
                     view,
                 )
 
+        runtime: AgentRuntime | None = None
         try:
-            runtime = self._create_runtime(report)
+            runtime = self._create_runtime(report, reasoning_effort=reasoning_effort)
             runtime_kwargs: dict[str, Any] = {"user_id": user_id, "thread_id": thread_id}
             if image_payloads:
                 runtime_kwargs["message_content"] = message_content
@@ -372,61 +436,122 @@ class FeishuChannel:
             logger.exception("Feishu agent run failed")
             await self._flush_card_updates(inbound.message_id)
             await self._send_or_patch(inbound, "处理这条飞书消息时出错了，请稍后重试。", final=True)
+        finally:
+            close = getattr(runtime, "close", None)
+            if callable(close):
+                close()
 
     def _create_runtime(
         self,
         reporter: Callable[[AgentRunEvent], None],
+        *,
+        reasoning_effort: str,
     ) -> AgentRuntime:
         if self.runtime_factory is None:
-            return AgentRuntime(self.settings, run_event_reporter=reporter)
+            runtime_settings = self.settings.model_copy(update={"reasoning_effort": reasoning_effort})
+            return AgentRuntime(runtime_settings, run_event_reporter=reporter)
         return self.runtime_factory(reporter)
 
-    async def _describe_images(
-        self,
-        runtime_text: str,
-        image_payloads: list[tuple[bytes, str]],
-    ) -> str:
-        prompt = (
-            "Analyze the attached image(s) for another assistant. Faithfully describe all visible "
-            "objects, layout, colors, people, and context. Transcribe visible text verbatim. "
-            "Do not invent uncertain details. The user's request is:\n"
-            f"{runtime_text}"
-        )
-        content = build_responses_image_content(prompt, image_payloads)
+    async def _extract_images_ocr(self, image_payloads: list[tuple[bytes, str]]) -> str:
+        if not self.settings.feishu_image_ocr_enabled or self.settings.feishu_image_ocr_max_chars <= 0:
+            return ""
+        try:
+            text = await asyncio.to_thread(self._extract_images_ocr_sync, image_payloads)
+        except Exception as exc:  # noqa: BLE001 - optional OCR must never block original-image input
+            logger.warning("Local Feishu OCR unavailable error_type=%s", type(exc).__name__)
+            return ""
+        bounded = text[: self.settings.feishu_image_ocr_max_chars].strip()
         logger.info(
-            "Feishu vision request model=%s base_url=%s images=%d total_bytes=%d",
-            self.settings.model,
-            self.settings.base_url,
+            "Local Feishu OCR completed images=%d chars=%d truncated=%s",
             len(image_payloads),
-            sum(len(data) for data, _mime_type in image_payloads),
+            len(bounded),
+            len(text) > len(bounded),
+        )
+        return bounded
+
+    def _extract_images_ocr_sync(self, image_payloads: list[tuple[bytes, str]]) -> str:
+        with self._ocr_lock:
+            engine = self._get_ocr_engine()
+            image_texts: list[str] = []
+            for index, (data, _mime_type) in enumerate(image_payloads, start=1):
+                with Image.open(io.BytesIO(data)) as image:
+                    pixels = np.asarray(image.convert("RGB"))
+                output = engine(pixels)
+                results = output[0] if isinstance(output, tuple) else output
+                lines = [
+                    str(item[1]).strip()
+                    for item in (results or [])
+                    if isinstance(item, (list, tuple)) and len(item) > 1 and str(item[1]).strip()
+                ]
+                if lines:
+                    image_texts.append(f"[Image {index}]\n" + "\n".join(lines))
+            return "\n\n".join(image_texts)
+
+    def _get_ocr_engine(self) -> Any:
+        if self._ocr_engine is not None:
+            return self._ocr_engine
+        if self._ocr_initialization_attempted:
+            raise RuntimeError("RapidOCR initialization previously failed")
+        self._ocr_initialization_attempted = True
+        from rapidocr_onnxruntime import RapidOCR
+
+        self._ocr_engine = RapidOCR()
+        return self._ocr_engine
+
+    def _get_image_context(self, scope_key: str) -> FeishuImageContext | None:
+        context = self._image_contexts.get(scope_key)
+        if context is None:
+            return None
+        if self._monotonic_clock() >= context.expires_at:
+            self._clear_image_context(scope_key)
+            return None
+        return context
+
+    def _set_image_context(self, scope_key: str, payloads: list[tuple[bytes, str]]) -> None:
+        if not payloads:
+            self._clear_image_context(scope_key)
+            return
+        expires_at = self._monotonic_clock() + self.settings.feishu_image_context_ttl_seconds
+        self._image_contexts[scope_key] = FeishuImageContext(tuple(payloads), expires_at)
+        self._schedule_image_context_expiry(scope_key, expires_at)
+
+    def _schedule_image_context_expiry(self, scope_key: str, expires_at: float) -> None:
+        previous = self._image_context_expiry_handles.pop(scope_key, None)
+        if previous is not None:
+            previous.cancel()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._image_context_expiry_handles[scope_key] = loop.call_later(
+            self.settings.feishu_image_context_ttl_seconds,
+            self._expire_image_context,
+            scope_key,
+            expires_at,
         )
 
-        def invoke() -> str:
-            client = OpenAI(
-                api_key=self.settings.api_key,
-                base_url=self.settings.base_url,
-                timeout=60,
-                max_retries=2,
+    def _expire_image_context(self, scope_key: str, expected_expires_at: float) -> None:
+        context = self._image_contexts.get(scope_key)
+        if context is None or context.expires_at != expected_expires_at:
+            return
+        remaining = context.expires_at - self._monotonic_clock()
+        if remaining > 0:
+            loop = asyncio.get_running_loop()
+            self._image_context_expiry_handles[scope_key] = loop.call_later(
+                remaining,
+                self._expire_image_context,
+                scope_key,
+                expected_expires_at,
             )
-            try:
-                response = client.responses.create(
-                    model=self.settings.model,
-                    input=[{"role": "user", "content": content}],
-                    max_output_tokens=1200,
-                )
-            except APIStatusError as exc:
-                response_url = str(getattr(exc.response, "url", ""))
-                response_body = str(getattr(exc.response, "text", ""))[:1000]
-                raise VisionAPIError(
-                    f"status={exc.status_code} url={response_url} "
-                    f"model={self.settings.model} response={response_body or '(empty)'}"
-                ) from exc
-            return response.output_text or ""
+            return
+        self._clear_image_context(scope_key)
+        logger.info("Expired full Feishu image context scope=%s", scope_key)
 
-        description = (await asyncio.to_thread(invoke)).strip()
-        if not description:
-            raise ImageDownloadError("Vision model returned an empty image description")
-        return description
+    def _clear_image_context(self, scope_key: str) -> None:
+        self._image_contexts.pop(scope_key, None)
+        handle = self._image_context_expiry_handles.pop(scope_key, None)
+        if handle is not None:
+            handle.cancel()
 
     def _queue_card_update(self, inbound: FeishuInboundMessage, text: str | FeishuCardView) -> None:
         message_id = inbound.message_id
@@ -621,6 +746,14 @@ def feishu_memory_scope(inbound: FeishuInboundMessage) -> tuple[str, str]:
     return f"feishu-group:{inbound.chat_id}", "__group__"
 
 
+def parse_effort_command(text: str) -> tuple[bool, str | None]:
+    match = re.fullmatch(r"/effort(?:\s+|=|$)(.*)", text.strip(), flags=re.IGNORECASE)
+    if match is None:
+        return False, None
+    value = match.group(1).strip().lower()
+    return True, value or None
+
+
 def attributed_feishu_text(inbound: FeishuInboundMessage, clean_text: str) -> str:
     """Prefix group messages so shared memory retains speaker provenance."""
     if inbound.is_private:
@@ -694,20 +827,50 @@ def strip_file_placeholders(text: str) -> str:
     return re.sub(r"\[(?:image|file)\]", " ", text, flags=re.IGNORECASE).strip()
 
 
-def build_responses_image_content(
+def default_image_only_request(image_count: int) -> str:
+    image_label = "一张图片" if image_count == 1 else f"{max(1, image_count)} 张图片"
+    return (
+        f"用户只发送了{image_label}，没有附加文字。请仔细查看图片并推断用户最可能希望获得的帮助，"
+        "然后直接回应。如果图片中包含题目、问题或待完成的任务，请识别并解答；如果意图仍不明确，"
+        "请概括关键内容，并给出最有帮助的判断或提出一个简短的澄清问题。不要只做泛泛的图片描述。"
+    )
+
+
+def build_multimodal_image_content(
     text: str,
     payloads: list[tuple[bytes, str]],
 ) -> list[dict[str, Any]]:
-    content: list[dict[str, Any]] = [{"type": "input_text", "text": text}]
+    content: list[dict[str, Any]] = []
     for data, mime_type in payloads:
         encoded = base64.b64encode(data).decode("ascii")
         content.append(
             {
-                "type": "input_image",
-                "image_url": f"data:{mime_type};base64,{encoded}",
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime_type};base64,{encoded}"},
             }
         )
+    content.append({"type": "text", "text": text})
     return content
+
+
+def format_auxiliary_ocr(ocr_text: str) -> str:
+    if not ocr_text.strip():
+        return ""
+    return (
+        '<AuxiliaryOCR source="local" reliability="unverified">\n'
+        "The following text was extracted automatically and may contain errors. Verify it against the image.\n"
+        f"{ocr_text.strip()}\n"
+        "</AuxiliaryOCR>"
+    )
+
+
+def build_image_memory_text(user_text: str, ocr_text: str) -> str:
+    ocr_section = format_auxiliary_ocr(ocr_text)
+    return f"{ocr_section}\n\n{user_text}" if ocr_section else user_text
+
+
+def build_multimodal_request_text(user_text: str, ocr_text: str) -> str:
+    return f"{MULTIMODAL_RESPONSE_INSTRUCTIONS}\n\n{build_image_memory_text(user_text, ocr_text)}"
 
 
 def image_mime_type(data: bytes, file_name: str | None = None) -> str:
@@ -725,55 +888,14 @@ def image_mime_type(data: bytes, file_name: str | None = None) -> str:
     return "application/octet-stream"
 
 
-def normalize_image_payload(data: bytes) -> tuple[bytes, str]:
-    """Decode Feishu media and re-encode it into a model-safe image format."""
-
+def original_image_payload(data: bytes) -> tuple[bytes, str]:
+    """Validate the downloaded resource while preserving its original bytes."""
     if not data:
         raise ImageDownloadError("Feishu returned an empty image")
-    try:
-        with Image.open(io.BytesIO(data)) as source:
-            source.load()
-            if source.width * source.height > MAX_FEISHU_IMAGE_PIXELS:
-                raise ImageTooLargeError
-            image = ImageOps.exif_transpose(source)
-            if max(image.size) > MAX_FEISHU_IMAGE_DIMENSION:
-                image.thumbnail(
-                    (MAX_FEISHU_IMAGE_DIMENSION, MAX_FEISHU_IMAGE_DIMENSION),
-                    Image.Resampling.LANCZOS,
-                )
-            if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
-                rgba = image.convert("RGBA")
-                background = Image.new("RGBA", rgba.size, "white")
-                background.alpha_composite(rgba)
-                model_image = background.convert("RGB")
-            else:
-                model_image = image.convert("RGB")
-            normalized = _encode_model_image(model_image)
-    except ImageTooLargeError:
-        raise
-    except (OSError, UnidentifiedImageError) as exc:
-        raise ImageDownloadError("Feishu resource is not a supported image") from exc
-    return normalized, "image/jpeg"
-
-
-def _encode_model_image(image: Image.Image) -> bytes:
-    quality = 90
-    while True:
-        output = io.BytesIO()
-        image.save(output, format="JPEG", quality=quality, optimize=True)
-        encoded = output.getvalue()
-        if encoded and len(encoded) <= MAX_MODEL_IMAGE_BYTES:
-            return encoded
-        if quality > 70:
-            quality -= 10
-            continue
-        if max(image.size) <= 512:
-            raise ImageTooLargeError
-        image.thumbnail(
-            (max(512, int(image.width * 0.75)), max(512, int(image.height * 0.75))),
-            Image.Resampling.LANCZOS,
-        )
-        quality = 85
+    mime_type = image_mime_type(data)
+    if mime_type not in SUPPORTED_MODEL_IMAGE_MIME_TYPES:
+        raise ImageDownloadError("Feishu resource is not a supported model image")
+    return data, mime_type
 
 
 def format_model_error(metadata: dict[str, Any], *, has_images: bool) -> str:
@@ -790,10 +912,6 @@ class ImageTooLargeError(ValueError):
 
 
 class ImageDownloadError(RuntimeError):
-    pass
-
-
-class VisionAPIError(RuntimeError):
     pass
 
 

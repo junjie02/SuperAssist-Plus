@@ -2,12 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from langchain_core.messages import HumanMessage
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
 
-from superassist.middlewares import DynamicContextMiddleware, ToolEventMiddleware
 from superassist.config import Settings
+from superassist.middlewares import DynamicContextMiddleware, ToolEventMiddleware
 from superassist.skills import (
     active_skill_names,
     build_available_skills_section,
@@ -123,7 +122,7 @@ def test_reading_skill_reference_refreshes_activation() -> None:
     assert request.state["skill_activations"] == {"gongkao-huasheng13": 1200.0}
 
 
-def test_dynamic_context_injects_available_and_loaded_skills() -> None:
+def test_dynamic_context_injects_only_active_skill_content() -> None:
     middleware = DynamicContextMiddleware(300, clock=lambda: 1100.0)
 
     class Request:
@@ -141,14 +140,15 @@ def test_dynamic_context_injects_available_and_loaded_skills() -> None:
             return kwargs["messages"]
 
     merged = middleware.wrap_model_call(Request(), lambda value: value)
-    content = str(merged[0].content)
+    content = str(merged[-2].content)
 
-    assert "<available_skills>" in content
+    assert "<available_skills>" not in content
+    assert "<ActiveSkills>" in content
     assert '<skill name="deep-research">' in content
     assert "# Deep Research Skill" in content
 
 
-def test_expired_skill_keeps_index_but_drops_full_content() -> None:
+def test_expired_skill_drops_full_content_from_turn_context() -> None:
     middleware = DynamicContextMiddleware(300, clock=lambda: 1300.0)
 
     class Request:
@@ -166,10 +166,10 @@ def test_expired_skill_keeps_index_but_drops_full_content() -> None:
             return kwargs["messages"]
 
     merged = middleware.wrap_model_call(Request(), lambda value: value)
-    content = str(merged[0].content)
+    content = str(merged[-2].content)
 
-    assert "<available_skills>" in content
-    assert "<name>deep-research</name>" in content
+    assert "<available_skills>" not in content
+    assert "<ActiveSkills>" not in content
     assert '<skill name="deep-research">' not in content
     assert "# Deep Research Skill" not in content
     assert active_skill_names({"deep-research": 1000.0}, 300, now=1300.0) == []
@@ -193,7 +193,7 @@ def test_newly_loaded_skill_is_not_duplicated_in_same_turn_context() -> None:
             return kwargs["messages"]
 
     merged = middleware.wrap_model_call(Request(), lambda value: value)
-    content = str(merged[0].content)
+    content = str(merged[-2].content)
 
-    assert "<name>deep-research</name>" in content
+    assert "<ActiveSkills>" not in content
     assert '<skill name="deep-research">' not in content

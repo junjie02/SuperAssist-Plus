@@ -1,5 +1,6 @@
-from langchain_core.messages import AIMessage
 import json
+
+from langchain_core.messages import AIMessage
 
 from superassist.config import Settings
 from superassist.memory.service import MemoryService, MemoryWritePayload
@@ -131,10 +132,15 @@ def test_memory_writer_llm_payload_omits_embeddings(tmp_path) -> None:
                 "type": "concept",
                 "title": "Interview prep",
                 "description": "Useful context.",
+                "user_id": "u",
                 "importance": 0.7,
+                "grounded_in": ["event_0"],
+                "source": "test",
+                "updated_at": "2026-07-30T08:00:00+00:00",
                 "access_count": 3,
                 "embedding": [0.1, 0.2, 0.3],
-                "metadata": {"thread_id": "t", "source": "test"},
+                "reasoning": "internal",
+                "metadata": {"thread_id": "t"},
             }
         ],
         "working": [],
@@ -148,7 +154,11 @@ def test_memory_writer_llm_payload_omits_embeddings(tmp_path) -> None:
         event_id=event_id,
         user_message="Prepare an interview answer.",
         assistant_answer="Drafted.",
-        tool_events=[{"name": "task", "content": "x" * 2000}],
+        tool_events=[
+            {"type": "tool_start", "tool": "task", "args": {"prompt": "private"}},
+            {"type": "tool_result", "tool": "task", "status": "success", "content": "x" * 2000},
+            {"type": "tool_result", "tool": "web_fetch", "status": "error", "content": "failed " + "y" * 1000},
+        ],
         memory_context=raw_context,
     )
     model = JsonModel()
@@ -157,9 +167,30 @@ def test_memory_writer_llm_payload_omits_embeddings(tmp_path) -> None:
     writer.write(payload)
 
     human_message = model.calls[0][0][0][1]
-    sent_payload = json.loads(human_message[1])
-    assert "embedding" not in human_message[1]
-    assert len(sent_payload["tool_events"][0]["content"]) < 1100
+    wrapped_input = human_message[1]
+    sent_payload = json.loads(wrapped_input[wrapped_input.index("{") : wrapped_input.rindex("}") + 1])
+    assert wrapped_input.startswith('<MemoryWriteInput format="json">')
+    assert "embedding" not in wrapped_input
+    assert "access_count" not in wrapped_input
+    assert "reasoning" not in sent_payload["memory_context"]["immediate"][0]
+    assert sent_payload["memory_context"]["immediate"][0] == {
+        "tier": "",
+        "id": "node_1",
+        "type": "concept",
+        "title": "Interview prep",
+        "description": "Useful context.",
+        "user_id": "u",
+        "importance": 0.7,
+        "grounded_in": ["event_0"],
+        "source": "test",
+        "updated_at": "2026-07-30T08:00:00+00:00",
+    }
+    assert sent_payload["tool_events"] == [
+        {"name": "task", "status": "success", "error_summary": ""},
+        {"name": "web_fetch", "status": "error", "error_summary": "failed " + "y" * 493 + "..."},
+    ]
+    assert "private" not in wrapped_input
+    assert "x" * 100 not in wrapped_input
 
 
 def test_memory_writer_prompt_uses_cognifold_update_plan() -> None:
@@ -168,6 +199,42 @@ def test_memory_writer_prompt_uses_cognifold_update_plan() -> None:
     assert "grounded_in" in MEMORY_WRITER_PROMPT
     assert "GROUNDS" in MEMORY_WRITER_PROMPT
     assert "ADD_NODE" in MEMORY_WRITER_PROMPT
+    assert '"operations":[]' in MEMORY_WRITER_PROMPT
+
+
+def test_memory_writer_fallback_returns_empty_plan_for_greeting(tmp_path) -> None:
+    service = make_service(tmp_path)
+    event_id, _ = service.prepare_turn("u", "t", "hello")
+    payload = MemoryWritePayload(
+        user_id="u",
+        thread_id="t",
+        event_id=event_id,
+        user_message="hello",
+        assistant_answer="Hello!",
+        tool_events=[],
+    )
+
+    result = MemoryWriter(service, ExplodingModel()).write(payload)
+
+    assert result["nodes"] == 0
+    assert service.store.list_nodes("u") == []
+
+
+def test_memory_writer_fallback_keeps_short_durable_preference(tmp_path) -> None:
+    service = make_service(tmp_path)
+    event_id, _ = service.prepare_turn("u", "t", "我喜欢蓝色")
+    payload = MemoryWritePayload(
+        user_id="u",
+        thread_id="t",
+        event_id=event_id,
+        user_message="我喜欢蓝色",
+        assistant_answer="记住了。",
+        tool_events=[],
+    )
+
+    result = MemoryWriter(service, ExplodingModel()).write(payload)
+
+    assert result["nodes"] == 2
 
 
 def test_memory_writer_applies_operations_plan(tmp_path) -> None:

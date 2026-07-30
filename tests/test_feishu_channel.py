@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import threading
 import time
 from types import SimpleNamespace
 
@@ -14,16 +15,20 @@ from superassist.channels.feishu import (
     FeishuChannel,
     FeishuInboundMessage,
     ImageDownloadError,
-    build_responses_image_content,
-    build_card_content,
-    clean_mention_text,
     attributed_feishu_text,
+    build_card_content,
+    build_image_memory_text,
+    build_multimodal_image_content,
+    build_multimodal_request_text,
+    clean_mention_text,
+    default_image_only_request,
     feishu_memory_scope,
-    format_subagent_card_text,
     format_model_error,
+    format_subagent_card_text,
     image_mime_type,
     load_feishu_settings,
-    normalize_image_payload,
+    original_image_payload,
+    parse_effort_command,
     parse_feishu_content,
     parse_feishu_event,
     should_trigger_agent,
@@ -100,56 +105,61 @@ def test_image_mime_type_uses_content_signature() -> None:
     assert image_mime_type(b"\xff\xd8\xffrest") == "image/jpeg"
 
 
-def test_normalize_image_payload_reencodes_valid_image() -> None:
+def test_original_image_payload_preserves_png_bytes_and_mime_type() -> None:
     source = io.BytesIO()
     Image.new("RGBA", (32, 24), (255, 0, 0, 128)).save(source, format="PNG")
+    original = source.getvalue()
 
-    normalized, mime_type = normalize_image_payload(source.getvalue())
+    payload, mime_type = original_image_payload(original)
 
-    assert mime_type == "image/jpeg"
-    assert normalized.startswith(b"\xff\xd8\xff")
-    with Image.open(io.BytesIO(normalized)) as image:
-        assert image.size == (32, 24)
-
-
-def test_normalize_image_payload_rejects_non_image() -> None:
-    with pytest.raises(ImageDownloadError, match="supported image"):
-        normalize_image_payload(b"not an image")
+    assert mime_type == "image/png"
+    assert payload == original
+    assert payload is original
 
 
-def test_responses_image_content_uses_input_image_parts() -> None:
-    content = build_responses_image_content("Describe it", [(b"image", "image/jpeg")])
+def test_original_image_payload_rejects_non_image() -> None:
+    with pytest.raises(ImageDownloadError, match="supported model image"):
+        original_image_payload(b"not an image")
+
+
+def test_multimodal_image_content_uses_langchain_image_and_text_parts() -> None:
+    content = build_multimodal_image_content("Describe it", [(b"image", "image/jpeg")])
 
     assert content == [
-        {"type": "input_text", "text": "Describe it"},
-        {"type": "input_image", "image_url": "data:image/jpeg;base64,aW1hZ2U="},
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/jpeg;base64,aW1hZ2U="},
+        },
+        {"type": "text", "text": "Describe it"},
     ]
 
 
-def test_describe_images_uses_responses_api(monkeypatch, tmp_path) -> None:
-    captured = {}
+def test_image_memory_text_keeps_ocr_before_current_user_request() -> None:
+    text = build_image_memory_text("请讲解这道题", "[Image 1]\nx + 1 = 2")
 
-    class Responses:
-        def create(self, **kwargs):
-            captured.update(kwargs)
-            return SimpleNamespace(output_text="A test image.")
+    assert '<AuxiliaryOCR source="local" reliability="unverified">' in text
+    assert "may contain errors" in text
+    assert text.endswith("请讲解这道题")
 
-    class Client:
-        def __init__(self, **_kwargs):
-            self.responses = Responses()
 
-    monkeypatch.setattr("superassist.channels.feishu.OpenAI", Client)
-    settings = _settings(tmp_path).model_copy(
-        update={"api_key": "secret", "model": "vision-model"}
-    )
-    channel = FeishuChannel(settings)
+def test_multimodal_request_requires_reusable_model_visual_description() -> None:
+    text = build_multimodal_request_text("请讲解这道题", "OCR")
 
-    description = _run(channel._describe_images("What is shown?", [(b"image", "image/jpeg")]))
+    assert "original image(s)" in text
+    assert "<ImageDescription>...</ImageDescription>" in text
+    assert "Do not merely repeat the OCR text" in text
+    assert text.endswith("请讲解这道题")
 
-    assert description == "A test image."
-    assert captured["model"] == "vision-model"
-    assert captured["input"][0]["content"][0]["type"] == "input_text"
-    assert captured["input"][0]["content"][1]["type"] == "input_image"
+
+def test_default_image_only_request_infers_intent_and_answers_visible_problem() -> None:
+    single = default_image_only_request(1)
+    multiple = default_image_only_request(2)
+
+    assert "一张图片" in single
+    assert "推断用户最可能希望获得的帮助" in single
+    assert "题目、问题或待完成的任务，请识别并解答" in single
+    assert "不要只做泛泛的图片描述" in single
+    assert "2 张图片" in multiple
 
 
 def test_format_model_error_includes_bounded_provider_detail() -> None:
@@ -303,6 +313,24 @@ def test_thread_store_rotates_when_scope_owner_changes(tmp_path) -> None:
     assert store.list_entries()[0]["user_id"] == "feishu-group:chat"
 
 
+def test_thread_store_persists_reasoning_effort(tmp_path) -> None:
+    path = tmp_path / "feishu_threads.json"
+    store = FeishuThreadStore(path)
+    store.get_or_create_thread_id(chat_id="chat", topic_id="scope", user_id="feishu:ou")
+
+    store.set_reasoning_effort(chat_id="chat", topic_id="scope", effort="high")
+
+    reloaded = FeishuThreadStore(path)
+    assert reloaded.get_reasoning_effort(chat_id="chat", topic_id="scope", default="medium") == "high"
+
+
+def test_parse_effort_command() -> None:
+    assert parse_effort_command("/effort") == (True, None)
+    assert parse_effort_command("/EFFORT high") == (True, "high")
+    assert parse_effort_command("/effort=xhigh") == (True, "xhigh")
+    assert parse_effort_command("explain effort") == (False, None)
+
+
 def test_build_card_content_uses_update_multi() -> None:
     card = json.loads(build_card_content("hello"))
 
@@ -381,7 +409,101 @@ def test_feishu_channel_uses_one_runtime_per_message(tmp_path) -> None:
 
     _run(go())
 
-def test_feishu_image_is_described_before_reaching_runtime(tmp_path) -> None:
+
+def test_feishu_channel_discards_messages_received_while_scope_is_busy(tmp_path) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+
+    class Runtime:
+        def __init__(self, _reporter):
+            self.memory_queue = SimpleNamespace(flush=lambda: None)
+
+        def run_streaming(self, message, *, user_id, thread_id):
+            calls.append(message)
+            if message == "first":
+                started.set()
+                release.wait(timeout=3)
+            return AgentRunResult(thread_id=thread_id, answer=f"done: {message}", metadata={})
+
+    async def go():
+        channel = FeishuChannel(_settings(tmp_path), runtime_factory=lambda reporter: Runtime(reporter))
+        replied_message_ids: list[str] = []
+
+        async def reply(message_id, _text):
+            replied_message_ids.append(message_id)
+            return f"card_{message_id}"
+
+        async def update(_message_id, _text):
+            return None
+
+        channel._reply_card = reply
+        channel._update_card = update
+        first = asyncio.create_task(
+            channel.handle_inbound(FeishuInboundMessage("chat", "msg_1", "ou", "first", chat_type="p2p"))
+        )
+        assert await asyncio.to_thread(started.wait, 2)
+
+        await asyncio.wait_for(
+            channel.handle_inbound(FeishuInboundMessage("chat", "msg_2", "ou", "second", chat_type="p2p")),
+            timeout=0.2,
+        )
+        assert calls == ["first"]
+        assert "msg_2" not in replied_message_ids
+
+        release.set()
+        await first
+        await channel.handle_inbound(FeishuInboundMessage("chat", "msg_3", "ou", "third", chat_type="p2p"))
+
+        assert calls == ["first", "third"]
+        assert replied_message_ids == ["msg_1", "msg_3"]
+
+    _run(go())
+
+
+def test_feishu_effort_command_persists_and_applies_to_next_message(monkeypatch, tmp_path) -> None:
+    runtime_efforts: list[str] = []
+
+    class Runtime:
+        def __init__(self, settings, *, run_event_reporter):
+            runtime_efforts.append(settings.reasoning_effort)
+            self.memory_queue = SimpleNamespace(flush=lambda: None)
+
+        def run_streaming(self, message, *, user_id, thread_id):
+            return AgentRunResult(thread_id=thread_id, answer="done", metadata={})
+
+        def close(self):
+            return None
+
+    async def go():
+        monkeypatch.setattr("superassist.channels.feishu.AgentRuntime", Runtime)
+        channel = FeishuChannel(
+            _settings(tmp_path, SUPERASSIST_MODEL="gpt-5.6-sol", SUPERASSIST_REASONING_EFFORT="medium")
+        )
+        replies: list[str] = []
+
+        async def reply(_message_id, text):
+            replies.append(text)
+            return "card"
+
+        async def update(_message_id, text):
+            replies.append(text)
+
+        channel._reply_card = reply
+        channel._update_card = update
+        await channel.handle_inbound(FeishuInboundMessage("chat", "cmd_1", "ou", "/effort high", chat_type="p2p"))
+        await channel.handle_inbound(FeishuInboundMessage("chat", "msg_1", "ou", "solve it", chat_type="p2p"))
+        await channel.handle_inbound(FeishuInboundMessage("chat", "cmd_2", "ou", "/effort", chat_type="p2p"))
+
+        assert runtime_efforts == ["high"]
+        assert any("`high`" in text for text in replies)
+        assert channel.store.get_reasoning_effort(
+            chat_id="chat", topic_id="__private__", default="medium"
+        ) == "high"
+
+    _run(go())
+
+def test_feishu_image_and_ocr_reach_main_runtime_in_one_multimodal_call(tmp_path) -> None:
     received = []
 
     class Runtime:
@@ -408,10 +530,10 @@ def test_feishu_image_is_described_before_reaching_runtime(tmp_path) -> None:
 
         channel._download_image_payloads = download_payloads
 
-        async def describe_images(_text, _payloads):
-            return "A small test image."
+        async def extract_images_ocr(_payloads):
+            return "A small OCR result."
 
-        channel._describe_images = describe_images
+        channel._extract_images_ocr = extract_images_ocr
         channel._reply_card = reply
         channel._update_card = update
         await channel.handle_inbound(
@@ -427,15 +549,156 @@ def test_feishu_image_is_described_before_reaching_runtime(tmp_path) -> None:
 
         assert len(received) == 1
         message, content = received[0]
-        assert message == "The user sent an image."
-        assert content == (
-            "The user sent an image.\n\n"
-            "[Vision extraction for the current Feishu image]\n"
-            "A small test image.\n"
-            "[/Vision extraction]"
-        )
+        assert "A small OCR result." in message
+        assert message.endswith("不要只做泛泛的图片描述。")
+        assert "一张图片" in message
+        assert "识别并解答" in message
+        assert "data:image/png;base64,aW1hZ2U=" not in message
+        assert isinstance(content, list)
+        assert content[0] == {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+        }
+        assert content[-1]["type"] == "text"
+        assert "<ImageDescription>...</ImageDescription>" in content[-1]["text"]
+        assert content[-1]["text"].endswith("不要只做泛泛的图片描述。")
 
     _run(go())
+
+
+def test_feishu_full_image_context_uses_sliding_three_minute_ttl(tmp_path) -> None:
+    now = [0.0]
+    received = []
+    ocr_calls = []
+
+    class Runtime:
+        def __init__(self, _reporter):
+            self.memory_queue = SimpleNamespace(flush=lambda: None)
+
+        def run_streaming(self, message, *, user_id, thread_id, message_content=None):
+            received.append((message, message_content))
+            return AgentRunResult(
+                thread_id=thread_id,
+                answer="done\n\n<ImageDescription>visible details</ImageDescription>",
+                metadata={},
+            )
+
+    async def go():
+        channel = FeishuChannel(
+            _settings(tmp_path, SUPERASSIST_FEISHU_IMAGE_CONTEXT_TTL_SECONDS=180),
+            runtime_factory=lambda reporter: Runtime(reporter),
+            monotonic_clock=lambda: now[0],
+        )
+
+        async def download_payloads(_images, _message_id):
+            return [(b"original-image", "image/png")]
+
+        async def extract_images_ocr(payloads):
+            ocr_calls.append(payloads)
+            return "OCR once"
+
+        async def reply(_message_id, _text):
+            return "card"
+
+        async def update(_message_id, _text):
+            return None
+
+        channel._download_image_payloads = download_payloads
+        channel._extract_images_ocr = extract_images_ocr
+        channel._reply_card = reply
+        channel._update_card = update
+
+        await channel.handle_inbound(
+            FeishuInboundMessage(
+                "chat",
+                "msg_image",
+                "ou",
+                "[image]",
+                chat_type="p2p",
+                files=[{"image_key": "img_1"}],
+            )
+        )
+
+        now[0] = 120.0
+        await channel.handle_inbound(
+            FeishuInboundMessage("chat", "msg_followup", "ou", "继续分析细节", chat_type="p2p")
+        )
+
+        now[0] = 301.0
+        await channel.handle_inbound(
+            FeishuInboundMessage("chat", "msg_expired", "ou", "现在总结一下", chat_type="p2p")
+        )
+
+        assert len(received) == 3
+        first_message, first_content = received[0]
+        second_message, second_content = received[1]
+        third_message, third_content = received[2]
+        assert "OCR once" in first_message
+        assert first_content[0]["image_url"]["url"].endswith("b3JpZ2luYWwtaW1hZ2U=")
+        assert second_message == "继续分析细节"
+        assert second_content[0] == first_content[0]
+        assert third_message == "现在总结一下"
+        assert third_content is None
+        assert len(ocr_calls) == 1
+        assert channel._image_contexts == {}
+
+    _run(go())
+
+
+def test_feishu_ocr_failure_is_non_fatal(tmp_path) -> None:
+    async def go():
+        channel = FeishuChannel(_settings(tmp_path))
+
+        def fail(_payloads):
+            raise RuntimeError("OCR unavailable")
+
+        channel._extract_images_ocr_sync = fail
+        result = await channel._extract_images_ocr([(b"not-decoded", "image/jpeg")])
+
+        assert result == ""
+
+    _run(go())
+
+
+def test_feishu_ocr_can_be_disabled(tmp_path) -> None:
+    async def go():
+        channel = FeishuChannel(
+            _settings(tmp_path, SUPERASSIST_FEISHU_IMAGE_OCR_ENABLED=False)
+        )
+
+        def unexpected(_payloads):
+            raise AssertionError("OCR should not run")
+
+        channel._extract_images_ocr_sync = unexpected
+        result = await channel._extract_images_ocr([(b"image", "image/jpeg")])
+
+        assert result == ""
+
+    _run(go())
+
+
+def test_feishu_local_ocr_collects_multiple_images_and_truncates(tmp_path) -> None:
+    source = io.BytesIO()
+    Image.new("RGB", (4, 4), "white").save(source, format="JPEG")
+    channel = FeishuChannel(
+        _settings(tmp_path, SUPERASSIST_FEISHU_IMAGE_OCR_MAX_CHARS=28)
+    )
+    calls = []
+
+    def engine(pixels):
+        calls.append(pixels.shape)
+        return ([[None, "first line", 0.99], [None, "second line", 0.98]], 0.1)
+
+    channel._ocr_engine = engine
+    text = _run(
+        channel._extract_images_ocr(
+            [(source.getvalue(), "image/jpeg"), (source.getvalue(), "image/jpeg")]
+        )
+    )
+
+    assert calls == [(4, 4, 3), (4, 4, 3)]
+    assert text.startswith("[Image 1]\nfirst line")
+    assert len(text) <= 28
 
 
 def test_download_image_payloads_uses_message_id_and_image_key(tmp_path) -> None:

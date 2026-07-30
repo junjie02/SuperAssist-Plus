@@ -3,11 +3,21 @@ from __future__ import annotations
 import json
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+ReasoningEffort = Literal["none", "low", "medium", "high", "xhigh", "max"]
+REASONING_EFFORTS: tuple[ReasoningEffort, ...] = (
+    "none",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+)
 
 
 class Settings(BaseSettings):
@@ -19,6 +29,13 @@ class Settings(BaseSettings):
     base_url: str = Field(default="https://api.openai.com/v1", alias="SUPERASSIST_BASE_URL")
     temperature: float | None = Field(default=None, alias="SUPERASSIST_TEMPERATURE")
     max_tokens: int | None = Field(default=None, alias="SUPERASSIST_MAX_TOKENS")
+    reasoning_effort: ReasoningEffort = Field(default="medium", alias="SUPERASSIST_REASONING_EFFORT")
+    model_input_log_enabled: bool = Field(default=False, alias="SUPERASSIST_MODEL_INPUT_LOG_ENABLED")
+    model_input_log_max_bytes: int = Field(
+        default=50 * 1024 * 1024,
+        ge=1024,
+        alias="SUPERASSIST_MODEL_INPUT_LOG_MAX_BYTES",
+    )
     data_dir: Path = Field(default=Path(".superassist"), alias="SUPERASSIST_DATA_DIR")
     db_url: str = Field(default="", alias="SUPERASSIST_DB_URL")
     tool_workspace_dir: Path | None = Field(default=None, alias="SUPERASSIST_TOOL_WORKSPACE_DIR")
@@ -32,7 +49,11 @@ class Settings(BaseSettings):
     subagent_max_concurrent: int = Field(default=3, alias="SUPERASSIST_SUBAGENT_MAX_CONCURRENT")
     subagent_timeout_seconds: int = Field(default=900, alias="SUPERASSIST_SUBAGENT_TIMEOUT_SECONDS")
     subagent_max_turns: int = Field(default=20, alias="SUPERASSIST_SUBAGENT_MAX_TURNS")
-    memory_llm_writer_enabled: bool = Field(default=False, alias="SUPERASSIST_MEMORY_LLM_WRITER_ENABLED")
+    memory_llm_writer_enabled: bool = Field(default=True, alias="SUPERASSIST_MEMORY_LLM_WRITER_ENABLED")
+    memory_model: str = Field(default="deepseek-v4-flash", alias="SUPERASSIST_MEMORY_MODEL")
+    memory_api_key: str = Field(default="", alias="SUPERASSIST_MEMORY_API_KEY")
+    memory_base_url: str = Field(default="", alias="SUPERASSIST_MEMORY_BASE_URL")
+    memory_max_tokens: int | None = Field(default=None, alias="SUPERASSIST_MEMORY_MAX_TOKENS")
     short_memory_token_limit: int = Field(default=80000, alias="SUPERASSIST_SHORT_MEMORY_TOKEN_LIMIT")
     short_memory_keep_recent_turns: int = Field(default=30, alias="SUPERASSIST_SHORT_MEMORY_KEEP_RECENT_TURNS")
     short_memory_summary_target_tokens: int = Field(
@@ -40,7 +61,7 @@ class Settings(BaseSettings):
         alias="SUPERASSIST_SHORT_MEMORY_SUMMARY_TARGET_TOKENS",
     )
     short_memory_enable_tool_events: bool = Field(
-        default=True,
+        default=False,
         alias="SUPERASSIST_SHORT_MEMORY_ENABLE_TOOL_EVENTS",
     )
     skill_active_ttl_seconds: int = Field(
@@ -82,6 +103,21 @@ class Settings(BaseSettings):
     feishu_active_session_seconds: int = Field(
         default=180,
         alias="SUPERASSIST_FEISHU_ACTIVE_SESSION_SECONDS",
+    )
+    feishu_image_ocr_enabled: bool = Field(
+        default=True,
+        alias="SUPERASSIST_FEISHU_IMAGE_OCR_ENABLED",
+    )
+    feishu_image_ocr_max_chars: int = Field(
+        default=12000,
+        ge=0,
+        le=100000,
+        alias="SUPERASSIST_FEISHU_IMAGE_OCR_MAX_CHARS",
+    )
+    feishu_image_context_ttl_seconds: int = Field(
+        default=180,
+        ge=1,
+        alias="SUPERASSIST_FEISHU_IMAGE_CONTEXT_TTL_SECONDS",
     )
     wecom_bot_id: str = Field(default="", alias="SUPERASSIST_WECOM_BOT_ID")
     wecom_bot_secret: str = Field(default="", alias="SUPERASSIST_WECOM_BOT_SECRET")
@@ -128,6 +164,10 @@ class Settings(BaseSettings):
     @property
     def rag_dir(self) -> Path:
         return self.data_dir / "rag"
+
+    @property
+    def model_input_log_path(self) -> Path:
+        return self.data_dir / "logs" / "model-input.jsonl"
 
     @property
     def feishu_allowed_open_id_set(self) -> set[str]:

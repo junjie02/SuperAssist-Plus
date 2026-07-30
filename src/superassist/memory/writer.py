@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 from collections import deque
 from typing import Any
@@ -45,19 +46,22 @@ class MemoryWriter:
                         ("system", MEMORY_WRITER_PROMPT),
                         (
                             "human",
-                            json.dumps(
+                            "<MemoryWriteInput format=\"json\">\n"
+                            + json.dumps(
                                 {
                                     "user_message": payload.user_message,
                                     "assistant_answer": payload.assistant_answer,
-                                    "tool_events": _compact_tool_events(payload.tool_events),
+                                    "tool_events": compact_tool_events(payload.tool_events),
                                     "memory_context": _compact_memory_context(payload.memory_context or {}),
                                 },
                                 ensure_ascii=False,
-                            ),
+                                separators=(",", ":"),
+                            )
+                            + "\n</MemoryWriteInput>",
                         ),
                     ]
                 )
-                return UpdatePlan.parse(_extract_json(str(response.content)))
+                return UpdatePlan.parse(_extract_json(_response_text(response.content)))
             except Exception as exc:
                 logger.warning("LLM memory writer failed; using fallback plan: %s", exc)
         return self._fallback_plan(payload)
@@ -65,7 +69,7 @@ class MemoryWriter:
     @staticmethod
     def _fallback_plan(payload: MemoryWritePayload) -> UpdatePlan:
         text = payload.user_message.strip()
-        if not text or len(text) < 12:
+        if not text or _is_pure_greeting(text):
             return UpdatePlan()
         answer = (payload.assistant_answer or "").strip()
         return UpdatePlan.from_legacy(
@@ -90,6 +94,36 @@ class MemoryWriter:
         )
 
 
+def _is_pure_greeting(text: str) -> bool:
+    normalized = re.sub(r"[\W_]+", "", text.casefold())
+    return normalized in {
+        "hi",
+        "hello",
+        "hey",
+        "goodmorning",
+        "goodafternoon",
+        "goodevening",
+        "thanks",
+        "thankyou",
+        "你好",
+        "你好呀",
+        "你好啊",
+        "您好",
+        "嗨",
+        "哈喽",
+        "哈啰",
+        "早上好",
+        "上午好",
+        "中午好",
+        "下午好",
+        "晚上好",
+        "在吗",
+        "谢谢",
+        "多谢",
+        "辛苦了",
+    }
+
+
 def _extract_json(text: str) -> dict[str, Any]:
     cleaned = text.strip()
     if cleaned.startswith("```"):
@@ -104,16 +138,50 @@ def _extract_json(text: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _compact_tool_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _response_text(content: Any) -> str:
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and str(item.get("type") or "").lower() not in {
+                "reasoning",
+                "thinking",
+                "reasoning_content",
+                "chain_of_thought",
+            }:
+                value = item.get("text")
+                if isinstance(value, str):
+                    parts.append(value)
+        text = "\n".join(parts)
+    else:
+        text = str(content or "")
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
+def compact_tool_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Project completed tool calls to the only fields memory work may see."""
+
     compact: list[dict[str, Any]] = []
-    for event in events[:20]:
+    for event in events:
+        event_type = event.get("type")
+        if event_type not in {None, "tool_result"}:
+            continue
+        status = str(event.get("status") or "success")
+        error = event.get("error_summary", event.get("error"))
+        if status == "error" and error is None:
+            error = event.get("content")
         compact.append(
             {
-                "name": event.get("name") or event.get("tool") or "",
-                "content": _preview(str(event.get("content") or event.get("error") or ""), 1000),
-                "status": event.get("status", "success"),
+                "name": event.get("tool") or event.get("name") or "",
+                "status": status,
+                "error_summary": _preview(str(error or ""), 500),
             }
         )
+        if len(compact) >= 20:
+            break
     return compact
 
 
@@ -135,18 +203,17 @@ def _compact_memory_node(node: Any) -> dict[str, Any]:
         raw = node
     else:
         raw = {}
-    metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
     return {
+        "tier": raw.get("tier", ""),
         "id": raw.get("id", ""),
         "type": raw.get("type", ""),
         "title": _preview(str(raw.get("title") or ""), 160),
         "description": _preview(str(raw.get("description") or ""), 1200),
+        "user_id": raw.get("user_id", ""),
         "importance": raw.get("importance", 0.5),
-        "access_count": raw.get("access_count", 0),
-        "reasoning": _preview(str(raw.get("reasoning") or ""), 500),
         "grounded_in": list(raw.get("grounded_in") or [])[:10],
-        "source": metadata.get("source", ""),
-        "thread_id": metadata.get("thread_id", ""),
+        "source": raw.get("source", ""),
+        "updated_at": raw.get("updated_at", ""),
     }
 
 

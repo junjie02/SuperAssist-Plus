@@ -13,17 +13,20 @@ call — there is no outer LangGraph state graph. This runtime only:
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 from superassist.agent.factory import AgentBundle, build_agent
-from superassist.agent.prompts import SYSTEM_PROMPT, subagent_section as subagent_prompt_section, team_section as team_prompt_section
-from superassist.agent.short_memory import load_short_memory
-from superassist.agent.streaming import StreamParts, accumulate_stream_parts, clean_answer_text
+from superassist.agent.prompts import SYSTEM_PROMPT
+from superassist.agent.prompts import subagent_section as subagent_prompt_section
+from superassist.agent.prompts import team_section as team_prompt_section
+from superassist.agent.short_memory import format_short_memory_section, load_short_memory
 from superassist.agent.state import SuperAssistState
+from superassist.agent.streaming import StreamParts, accumulate_stream_parts, clean_answer_text
 from superassist.config import Settings, get_settings
 from superassist.llm import is_minimax_model
 from superassist.models import AgentRunEvent, AgentRunResult
@@ -34,6 +37,8 @@ from superassist.run_events import run_event_reporter_context
 from superassist.skills import active_skill_activations, active_skill_names
 from superassist.teams import set_team_supervisor
 from superassist.teams.context import team_thread_context
+
+logger = logging.getLogger(__name__)
 
 
 class AgentRuntime:
@@ -68,6 +73,10 @@ class AgentRuntime:
     @property
     def model(self) -> Any:
         return self._bundle.model
+
+    @property
+    def memory_model(self) -> Any:
+        return self._bundle.memory_model
 
     @property
     def memory(self) -> Any:
@@ -173,6 +182,8 @@ class AgentRuntime:
         last_values: dict[str, Any] | None = None
         stream_buffers: dict[str, StreamParts] = {}
         current_message_id: str | None = None
+        usage_totals = {"input_tokens": 0, "output_tokens": 0, "cache_read": 0}
+        seen_usage: set[tuple[str, int, int, int]] = set()
         previous_seen = self._active_agent_text_seen
         self._active_agent_text_seen = set()
         try:
@@ -199,6 +210,7 @@ class AgentRuntime:
                         else:
                             mode, chunk = "values", item
                         if mode == "messages":
+                            _accumulate_stream_usage(usage_totals, seen_usage, chunk)
                             reasoning, text, current_message_id = accumulate_stream_parts(
                                 stream_buffers, current_message_id, chunk
                             )
@@ -211,7 +223,24 @@ class AgentRuntime:
                             last_values = chunk
         finally:
             self._active_agent_text_seen = previous_seen
-        return last_values or dict(state)
+        result = last_values or dict(state)
+        if usage_totals["input_tokens"]:
+            usage_totals["cache_hit_rate"] = round(
+                usage_totals["cache_read"] / usage_totals["input_tokens"],
+                4,
+            )
+            metadata = dict(result.get("metadata") or {})
+            metadata["model_usage"] = usage_totals
+            result = {**result, "metadata": metadata}
+            logger.info(
+                "Model token usage thread_id=%s input=%d output=%d cache_read=%d cache_hit_rate=%.2f%%",
+                thread_id,
+                usage_totals["input_tokens"],
+                usage_totals["output_tokens"],
+                usage_totals["cache_read"],
+                usage_totals["cache_hit_rate"] * 100,
+            )
+        return result
 
     # -- Helpers -----------------------------------------------------------
 
@@ -244,7 +273,11 @@ class AgentRuntime:
             **self._tool_compatibility_metadata(),
         }
         return {
-            "messages": [*history.messages, HumanMessage(content=message_content or message)],
+            "messages": [
+                SystemMessage(content=format_short_memory_section(history.summary)),
+                *history.messages,
+                HumanMessage(content=message_content or message),
+            ],
             "input": message,
             "user_id": user_id,
             "thread_id": resolved_thread_id,
@@ -263,6 +296,7 @@ class AgentRuntime:
             path,
             metadata,
             keep_recent_turns=self.settings.short_memory_keep_recent_turns,
+            token_limit=self.settings.short_memory_token_limit,
         )
 
     def _load_thread_metadata(self, thread_id: str) -> dict[str, Any]:
@@ -338,6 +372,32 @@ def _last_ai_text(messages: list[BaseMessage]) -> str:
             if text:
                 return text
     return ""
+
+
+def _accumulate_stream_usage(
+    totals: dict[str, Any],
+    seen: set[tuple[str, int, int, int]],
+    chunk: Any,
+) -> None:
+    message = chunk[0] if isinstance(chunk, tuple) and chunk else chunk
+    usage = getattr(message, "usage_metadata", None)
+    if not isinstance(usage, dict):
+        return
+    input_tokens = int(usage.get("input_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or 0)
+    total_tokens = int(usage.get("total_tokens") or input_tokens + output_tokens)
+    response_metadata = getattr(message, "response_metadata", None)
+    response_metadata = response_metadata if isinstance(response_metadata, dict) else {}
+    usage_id = str(getattr(message, "id", "") or response_metadata.get("id") or id(message))
+    fingerprint = (usage_id, input_tokens, output_tokens, total_tokens)
+    if fingerprint in seen:
+        return
+    seen.add(fingerprint)
+    input_details = usage.get("input_token_details")
+    input_details = input_details if isinstance(input_details, dict) else {}
+    totals["input_tokens"] += input_tokens
+    totals["output_tokens"] += output_tokens
+    totals["cache_read"] += int(input_details.get("cache_read") or 0)
 
 
 __all__ = ["AgentRuntime", "SYSTEM_PROMPT", "subagent_prompt_section", "team_prompt_section"]

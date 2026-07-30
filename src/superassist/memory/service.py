@@ -234,6 +234,49 @@ class MemoryService:
         return self.embedder.embed(text)
 
 
+def project_memory_recall(recall: MemoryRecall) -> dict[str, list[dict[str, Any]]]:
+    """Return the explicit memory fields exposed to model-facing consumers."""
+
+    projected: dict[str, list[dict[str, Any]]] = {}
+    for tier in ("immediate", "working", "background", "buffer"):
+        projected[tier] = [
+            {
+                "tier": tier,
+                "id": node.id,
+                "type": node.type.value,
+                "title": node.title,
+                "description": node.description,
+                "user_id": node.user_id,
+                "updated_at": node.updated_at.isoformat(),
+            }
+            for node in getattr(recall, tier)
+        ]
+    return projected
+
+
+def project_memory_write_context(recall: MemoryRecall) -> dict[str, list[dict[str, Any]]]:
+    """Return the allowlisted fields used only by the memory updater."""
+
+    projected: dict[str, list[dict[str, Any]]] = {}
+    for tier in ("immediate", "working", "background", "buffer"):
+        projected[tier] = [
+            {
+                "tier": tier,
+                "id": node.id,
+                "type": node.type.value,
+                "title": node.title,
+                "description": node.description,
+                "user_id": node.user_id,
+                "importance": node.importance,
+                "grounded_in": list(node.grounded_in),
+                "source": str(node.metadata.get("source") or ""),
+                "updated_at": node.updated_at.isoformat(),
+            }
+            for node in getattr(recall, tier)
+        ]
+    return projected
+
+
 def _to_recall(context: Any) -> MemoryRecall:
     return MemoryRecall(
         immediate=context.immediate,
@@ -284,4 +327,10 @@ def _merge_text(left: str, right: str) -> str:
     return f"{left}\n{right}".strip()
 
 
-__all__ = ["MemoryService", "MemoryWritePayload", "TurnMemoryContexts"]
+__all__ = [
+    "MemoryService",
+    "MemoryWritePayload",
+    "TurnMemoryContexts",
+    "project_memory_recall",
+    "project_memory_write_context",
+]

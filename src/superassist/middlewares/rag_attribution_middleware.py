@@ -10,6 +10,7 @@ from langchain_core.messages import AIMessage
 from langgraph.runtime import Runtime
 
 from superassist.agent.state import SuperAssistState
+from superassist.agent.streaming import clean_answer_text
 from superassist.rag.context import current_rag_session
 
 _URL_PATTERN = re.compile(r"https?://[^\s<>()\]}'\"]+")
@@ -66,7 +67,7 @@ class RagAttributionMiddleware(AgentMiddleware[SuperAssistState]):
 def _last_ai_text(messages: list[Any]) -> str:
     for message in reversed(messages):
         if isinstance(message, AIMessage):
-            text = str(message.content or "").strip()
+            text = clean_answer_text(message.content)
             if text:
                 return text
     return ""
