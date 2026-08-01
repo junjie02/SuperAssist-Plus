@@ -50,7 +50,9 @@ class MemoryWriter:
                             + json.dumps(
                                 {
                                     "user_message": payload.user_message,
+                                    "user_message_created_at": payload.user_message_created_at,
                                     "assistant_answer": payload.assistant_answer,
+                                    "assistant_message_created_at": payload.assistant_message_created_at,
                                     "tool_events": compact_tool_events(payload.tool_events),
                                     "memory_context": _compact_memory_context(payload.memory_context or {}),
                                 },
@@ -213,6 +215,7 @@ def _compact_memory_node(node: Any) -> dict[str, Any]:
         "importance": raw.get("importance", 0.5),
         "grounded_in": list(raw.get("grounded_in") or [])[:10],
         "source": raw.get("source", ""),
+        "created_at": raw.get("created_at", ""),
         "updated_at": raw.get("updated_at", ""),
     }
 

@@ -34,7 +34,7 @@ SECTION_CORE_STRUCTURE = """## 图谱结构
 - **EVENT (事件)**: 每次对话的概括 — 标题概括主题，描述总结内容和结论
 - **CONCEPT (概念)**: 从对话中提取的持久知识点、用户偏好、项目上下文、事实信息
 - **INTENT (意图)**: 学习目标、待办事项、知识缺口、跟进需求
-- **TIME (时间)**: 截止日期、学习计划时间锚点
+- **TIME (时间)**: 对未来回忆有意义的截止日期、计划时间、事件发生时间或时间顺序锚点；不要为每个回合机械创建
 """
 
 SECTION_CORE_EDGES = """## 边类型 (语义关系)
@@ -51,6 +51,7 @@ SECTION_CORE_EDGES = """## 边类型 (语义关系)
 | `PART_OF` | 0.7 | 层级/包含关系 | concept → concept |
 | `DERIVED_FROM` | 0.6 | 间接派生/抽象 | concept → concept |
 | `DEADLINE_FOR` | 0.6 | 时间约束 | time → event/concept/intent |
+| `OCCURRED_AT` | 0.8 | 事件发生时间 | event → time |
 | `RELATED_TO` | 0.5 | 通用关系 (无更具体类型时使用) | concept → concept |
 
 **重要**: 始终指定 `edge_type` — 它描述语义关系:
@@ -59,6 +60,7 @@ SECTION_CORE_EDGES = """## 边类型 (语义关系)
 - concept → intent: 使用 `TRIGGERS` (模式暗示行动)
 - concept → concept: 使用 `DERIVED_FROM`、`PART_OF` 或 `RELATED_TO`
 - time → intent: 使用 `DEADLINE_FOR`
+- event → time: 仅在记录事件实际发生/接收时间时使用 `OCCURRED_AT`
 
 权重可选 (根据 edge_type 使用默认值)。
 
@@ -268,6 +270,8 @@ SECTION_CORE_RULES = """## 重要规则
    - 你在引用它的操作之前为它创建了 ADD_NODE
    - 操作按顺序执行, 所以 ADD_NODE 必须在 ADD_EDGE/UPDATE_NODE 之前
 9. 使用 "current_event" 作为当前对话事件节点的 ref
+10. `user_message_created_at` 和 `assistant_message_created_at` 是系统记录的消息时间，不是用户原话。仅当时间会影响截止日期、计划、事件日期、先后顺序或未来召回时创建/更新时间节点；普通对话不要创建 TIME
+11. 不要仅凭消息接收时间推断用户明确陈述了某个日期。若消息接收时间本身具有持久意义，可创建 TIME 并用 `current_event -> time` 的 `OCCURRED_AT` 边连接；截止时间则用 `time -> event/concept/intent` 的 `DEADLINE_FOR`
 """
 
 SECTION_CORE_INTENT_DENSITY = """## 意图生成密度: QUICK (0.2)

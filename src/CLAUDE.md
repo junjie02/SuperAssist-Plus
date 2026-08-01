@@ -62,6 +62,7 @@
 | `PART_OF` | 0.7 | concept → concept | 层级/包含 |
 | `DERIVED_FROM` | 0.6 | concept → concept | 抽象/派生 |
 | `DEADLINE_FOR` | 0.6 | time → event/concept/intent | 时间约束 |
+| `OCCURRED_AT` | 0.8 | event → time | 事件发生时间 |
 | `RELATED_TO` | 0.5 | concept → concept | 兜底关联 |
 
 `MemoryGraphStore._validate_edge` 会按此表拒绝越界连接，并在 `add_or_boost_edge` 把 `weight` 强制 clip 到 `[0.0, 1.0]`。
@@ -496,9 +497,10 @@ RunEventReporter = Callable[[AgentRunEvent], None]
 7. 调 `_add_grounding_edges` 按 `_GROUNDING_RULES` 自动加边：
    - event → concept: `GROUNDS`
    - event → intent: `GROUNDS`
-   - event → time: `DEADLINE_FOR`（**source/target 反转**：边方向是 time → event）
    - concept → intent: `TRIGGERS`
    - concept → concept: `RELATED_TO`
+
+TIME 节点的语义边不自动推断：事件实际发生时间必须显式添加 event → time 的 `OCCURRED_AT`，截止时间必须显式添加 time → event/concept/intent 的 `DEADLINE_FOR`，避免混淆发生时间与截止时间。
 
 #### 5.6.2 `_apply_merge_nodes`
 
@@ -521,7 +523,9 @@ RunEventReporter = Callable[[AgentRunEvent], None]
 | --- | --- |
 | `user_id`, `thread_id`, `event_id` | 路由键。 |
 | `user_message` | 本 turn 用户输入。 |
+| `user_message_created_at` | 本 turn 用户消息的系统接收时间；独立于用户原始文本。 |
 | `assistant_answer` | 最终 AI 答复（来自 `FinalTextMiddleware`）。 |
+| `assistant_message_created_at` | 最终 AI 答复的系统完成时间。 |
 | `tool_events` | `state.tool_events` 的快照；writer 只投影完成事件的名称、状态与错误摘要。 |
 | `memory_context` | `state.memory_write_context`（由 `MemoryRecallMiddleware` 写入），LLM writer 用来感知"我对哪些已有节点知道什么"。 |
 
@@ -563,7 +567,7 @@ RunEventReporter = Callable[[AgentRunEvent], None]
 
 `_extract_json` 用宽松解析：剥 `\`\`\`json` 围栏 → 取首个 `{` 到末个 `}` 之间内容 → `json.loads`。
 
-`_compact_tool_events` 只保留 `tool_result` 的 `name/status/error_summary≤500`，不发送参数或成功结果。`_compact_memory_node` 只保留 `tier/id/type/title/description/user_id/importance/grounded_in/source/updated_at`，绝不发送 embedding、access_count 或内部 reasoning。
+`_compact_tool_events` 只保留 `tool_result` 的 `name/status/error_summary≤500`，不发送参数或成功结果。`_compact_memory_node` 只保留 `tier/id/type/title/description/user_id/importance/grounded_in/source/created_at/updated_at`，绝不发送 embedding、access_count 或内部 reasoning。
 
 #### 5.8.2 `MemoryWriteQueue`
 
@@ -677,7 +681,7 @@ RunEventReporter = Callable[[AgentRunEvent], None]
 
 #### 6.6.4 单 turn 写入 `turn_records`
 
-每个完成回合只追加 `{role:user, content, created_at}` 与 `{role:assistant, content, created_at}`。工具参数、原始结果与中间 assistant/tool 消息不会进入后续轮次。
+每个完成回合只追加 `{role:user, content, created_at}` 与 `{role:assistant, content, created_at}`。用户 `created_at` 在入站时生成一次；主模型初次调用、历史回放与短记忆压缩都把它渲染为用户消息尾部的 `[系统时间: ...]`，而 `state.input` 和 JSONL `content` 保持原始用户文本。工具参数、原始结果与中间 assistant/tool 消息不会进入后续轮次。
 
 #### 6.6.5 压缩 `maybe_compress_short_memory`
 
@@ -713,7 +717,7 @@ LangChain 1.x middleware 的钩子分类：`before_agent` / `after_agent`（agen
 - 钩子：`before_agent`（一次性，整个 invoke 周期只跑一次）。
 - 短路：`state.memory_event_id` 已存在 → 跳过（重入保护）。
 - 调 `MemoryService.prepare_turn_contexts(user_id, thread_id, message)`。
-- 写入 state：`memory_event_id` / `memory_recall` / `memory_write_context`。主模型 recall 只保留 `tier/id/type/title/description/user_id/updated_at`；writer 额外保留 `importance/grounded_in/source`。两者都排除 embedding、access_count 和内部 reasoning。
+- 写入 state：`memory_event_id` / `memory_recall` / `memory_write_context`。主模型 recall 只保留 `tier/id/type/title/description/user_id/created_at/updated_at`；writer 额外保留 `importance/grounded_in/source`。两者都排除 embedding、access_count 和内部 reasoning。
 
 ### 7.4 `DynamicContextMiddleware`
 
@@ -728,7 +732,7 @@ LangChain 1.x middleware 的钩子分类：`before_agent` / `after_agent`（agen
 ### 7.5 `ShortMemoryMiddleware`
 
 - 钩子：`after_agent`（**注册顺序在 DynamicContextMiddleware 之后，因此 after_agent 反向时它在 MemoryRecallMiddleware 之后、ToolEventMiddleware 之前**——但 after_agent 与 after_model 钩子不冲突）。
-- 流程见 §6.6；返回 `{"metadata": metadata, "loaded_skills": loaded_skills}` 让 LangChain 把 metadata 与 loaded skills 合并进 state（`loaded_skills` 排序去重后写回，确保跨 turn 稳定）。
+- 流程见 §6.6；返回 `{"metadata": metadata, "assistant_message_created_at": ..., "loaded_skills": loaded_skills}` 让 LangChain 把完成时间、metadata 与 loaded skills 合并进 state（`loaded_skills` 排序去重后写回，确保跨 turn 稳定）。
 - 持久化文件：`<data_dir>/threads/<thread_id>/messages.jsonl` 与 `thread_meta.json`。元数据持久化 `user_id`（Go 会话所有权与管理员审计依据）、`loaded_skills`、`summary`、`summary_updated_at`。
 
 ### 7.6 `ToolEventMiddleware`

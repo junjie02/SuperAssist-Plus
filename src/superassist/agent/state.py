@@ -19,6 +19,8 @@ class SuperAssistState(AgentState):
     user_id: str
     thread_id: str
     input: str
+    message_created_at: NotRequired[str]
+    assistant_message_created_at: NotRequired[str]
     memory_event_id: NotRequired[str]
     memory_recall: NotRequired[dict[str, Any]]
     memory_write_context: NotRequired[dict[str, Any]]

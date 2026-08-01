@@ -28,6 +28,8 @@ Do not preserve long webpage/file contents, repeated greetings, or incidental wo
 Prefer stable facts and task state over chronology unless chronology matters.
 """
 
+USER_TIMESTAMP_LABEL = "系统时间"
+
 
 @dataclass(frozen=True)
 class ShortMemoryLoad:
@@ -118,10 +120,23 @@ def turn_records(
     assistant_answer: str,
     tool_events: list[dict[str, Any]],
     include_tool_events: bool,
+    user_created_at: str | None = None,
+    assistant_created_at: str | None = None,
 ) -> list[dict[str, Any]]:
-    now = datetime.now(UTC).isoformat()
-    records: list[dict[str, Any]] = [{"role": "user", "content": user_message, "created_at": now}]
-    records.append({"role": "assistant", "content": assistant_answer, "created_at": now})
+    records: list[dict[str, Any]] = [
+        {
+            "role": "user",
+            "content": user_message,
+            "created_at": user_created_at or datetime.now(UTC).isoformat(),
+        }
+    ]
+    records.append(
+        {
+            "role": "assistant",
+            "content": assistant_answer,
+            "created_at": assistant_created_at or datetime.now(UTC).isoformat(),
+        }
+    )
     return records
 
 
@@ -140,7 +155,7 @@ def maybe_compress_short_memory(
     compacted_count = _compacted_record_count(metadata, len(records))
     active_records = records[compacted_count:]
     active_turns = sum(1 for record in active_records if record.get("role") == "user")
-    total_tokens = estimate_tokens(summary) + sum(estimate_tokens(_record_text(record)) for record in active_records)
+    total_tokens = estimate_tokens(summary) + sum(estimate_tokens(record_text(record)) for record in active_records)
     over_turn_limit = keep_recent_turns > 0 and active_turns >= keep_recent_turns
     over_token_limit = token_limit > 0 and total_tokens >= token_limit
     if not over_turn_limit and not over_token_limit:
@@ -191,7 +206,7 @@ def build_summary_prompt(
     summary_target_tokens: int,
     loaded_skills: list[str],
 ) -> str:
-    history = "\n".join(_record_text(record) for record in records)
+    history = "\n".join(record_text(record) for record in records)
     previous = previous_summary or "(none)"
     skills = ", ".join(loaded_skills) if loaded_skills else "(none)"
     return (
@@ -211,14 +226,50 @@ def record_to_message(record: dict[str, Any]) -> BaseMessage:
         return AIMessage(content=str(record.get("content") or ""))
     if role == "tool_event":
         return HumanMessage(content=_tool_event_text(record), name="tool_event")
-    return HumanMessage(content=str(record.get("content") or ""))
+    return HumanMessage(
+        content=timestamp_user_content(
+            str(record.get("content") or ""),
+            str(record.get("created_at") or ""),
+        )
+    )
 
 
-def _record_text(record: dict[str, Any]) -> str:
+def record_text(record: dict[str, Any]) -> str:
     role = str(record.get("role") or "")
     if role == "tool_event":
         return _tool_event_text(record)
-    return f"{role}: {record.get('content') or ''}"
+    content = record_to_message(record).content if role == "user" else str(record.get("content") or "")
+    return f"{role}: {content}"
+
+
+def timestamp_user_content(content: Any, created_at: str) -> Any:
+    """Append stable receipt-time metadata to a user message without changing its raw input."""
+
+    timestamp = str(created_at or "").strip()
+    if not timestamp:
+        return content
+    marker = f"[{USER_TIMESTAMP_LABEL}: {timestamp}]"
+    if isinstance(content, str):
+        return _append_timestamp_marker(content, marker)
+    if not isinstance(content, list):
+        return _append_timestamp_marker(str(content or ""), marker)
+
+    rendered = [dict(item) if isinstance(item, dict) else item for item in content]
+    for index in range(len(rendered) - 1, -1, -1):
+        item = rendered[index]
+        if not isinstance(item, dict) or str(item.get("type") or "").lower() not in {"text", "input_text"}:
+            continue
+        item["text"] = _append_timestamp_marker(str(item.get("text") or ""), marker)
+        return rendered
+    rendered.append({"type": "text", "text": marker})
+    return rendered
+
+
+def _append_timestamp_marker(text: str, marker: str) -> str:
+    if text.rstrip().endswith(marker):
+        return text
+    separator = "\n\n" if text.strip() else ""
+    return f"{text}{separator}{marker}"
 
 
 def _tool_event_text(record: dict[str, Any]) -> str:

@@ -1,4 +1,4 @@
-"""Inject dynamic runtime context (memory recall, skills, time) into model calls.
+"""Inject dynamic runtime context (memory recall and skills) into model calls.
 
 This is the wrap_model_call counterpart to ProAssist's DynamicContextMiddleware.
 The static system prompt is supplied via ``create_agent(system_prompt=...)``;
@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
@@ -65,13 +64,11 @@ class DynamicContextMiddleware(AgentMiddleware[SuperAssistState]):
 
         loaded_section = build_loaded_skills_section(loaded_skills)
 
-        current_time = datetime.fromtimestamp(self._clock(), UTC).replace(second=0, microsecond=0)
         reminder_lines = [
             "<TurnContext>",
             "<RuntimeContext>",
             f"- user_id: {user_id}",
             f"- thread_id: {thread_id}",
-            f"- current_time_utc: {current_time.isoformat()}",
             "</RuntimeContext>",
             '<LongTermMemory format="json">',
             json.dumps(memory_recall, ensure_ascii=False, separators=(",", ":")),

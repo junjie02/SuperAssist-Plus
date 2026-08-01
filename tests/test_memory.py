@@ -69,9 +69,53 @@ def test_event_can_trigger_intent(tmp_path: Path) -> None:
     assert edge.edge_type == EdgeType.TRIGGERS
 
 
+def test_event_can_record_occurrence_time(tmp_path: Path) -> None:
+    service = MemoryService(settings=make_settings(tmp_path))
+    event = service.store.add_node(
+        user_id="u",
+        node_type=NodeType.EVENT,
+        title="Event",
+        description="A durable event",
+        embedding=service.embed("A durable event"),
+    )
+    time_node = service.store.add_node(
+        user_id="u",
+        node_type=NodeType.TIME,
+        title="Occurred at",
+        description="2026-08-01T08:00:00+00:00",
+    )
+
+    edge = service.store.add_or_boost_edge(
+        user_id="u",
+        source_id=event.id,
+        target_id=time_node.id,
+        edge_type=EdgeType.OCCURRED_AT,
+    )
+
+    assert edge.edge_type == EdgeType.OCCURRED_AT
+
+
+def test_new_memory_node_always_has_initial_timestamps(tmp_path: Path) -> None:
+    service = MemoryService(settings=make_settings(tmp_path))
+
+    node = service.store.add_node(
+        user_id="u",
+        node_type=NodeType.CONCEPT,
+        title="Timestamped node",
+        description="Every node has storage timestamps.",
+        embedding=service.embed("Every node has storage timestamps."),
+    )
+    reloaded = service.store.get_node("u", node.id)
+
+    assert node.created_at == node.updated_at
+    assert reloaded is not None
+    assert reloaded.created_at == node.created_at
+    assert reloaded.updated_at == node.updated_at
+
+
 def test_prepare_turn_returns_pending_event_id(tmp_path: Path) -> None:
     service = MemoryService(settings=make_settings(tmp_path))
-    concept = service.store.add_node(
+    service.store.add_node(
         user_id="u",
         node_type=NodeType.CONCEPT,
         title="Prefers concise answers",

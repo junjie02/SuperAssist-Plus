@@ -7,6 +7,7 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 from superassist.agent import AgentRuntime
 from superassist.agent.runtime import SYSTEM_PROMPT
 from superassist.agent.short_memory import (
+    build_summary_prompt,
     load_short_memory,
     maybe_compress_short_memory,
     read_jsonl,
@@ -76,7 +77,7 @@ def test_dynamic_context_injects_runtime_section() -> None:
     assert isinstance(merged[-2], SystemMessage)
     assert isinstance(merged[-1], HumanMessage)
     assert merged[-1].content == "Hi"
-    assert "current_time_utc:" in str(merged[-2].content)
+    assert "current_time_utc:" not in str(merged[-2].content)
     assert "<TurnContext>" in str(merged[-2].content)
     assert "<RuntimeContext>" in str(merged[-2].content)
     assert '<LongTermMemory format="json">' in str(merged[-2].content)
@@ -407,7 +408,29 @@ def test_runtime_multimodal_content_keeps_text_input_for_memory(tmp_path) -> Non
     )
 
     assert state["input"] == "memory-safe text"
-    assert state["messages"][-1].content == content
+    rendered = state["messages"][-1].content
+    assert rendered[1] == content[1]
+    assert rendered[0]["text"].startswith("What is shown?")
+    assert f"[系统时间: {state['message_created_at']}]" in rendered[0]["text"]
+    assert content[0]["text"] == "What is shown?"
+
+
+def test_runtime_current_user_message_has_stable_timestamp_and_raw_input(tmp_path) -> None:
+    settings = Settings(
+        SUPERASSIST_DATA_DIR=tmp_path,
+        SUPERASSIST_API_KEY="",
+        SUPERASSIST_ENABLE_TOOLS=False,
+        SUPERASSIST_EMBEDDING_PROVIDER="hash",
+    )
+    runtime = AgentRuntime(settings)
+
+    state = runtime._initial_state("raw question", user_id="u", thread_id="t")
+
+    assert state["input"] == "raw question"
+    assert state["messages"][-1].content == (
+        f"raw question\n\n[系统时间: {state['message_created_at']}]"
+    )
+    datetime.fromisoformat(state["message_created_at"])
 
 
 def test_runtime_accumulates_stream_text_and_ignores_tool_calls(tmp_path) -> None:
@@ -615,6 +638,7 @@ def test_runtime_persists_only_user_and_final_assistant_in_short_memory(tmp_path
         "user_id": "user-owner",
         "thread_id": "t",
         "input": "search this",
+        "message_created_at": "2026-08-01T08:00:00+00:00",
         "messages": [
             _AIMessage(
                 content=(
@@ -641,6 +665,7 @@ def test_runtime_persists_only_user_and_final_assistant_in_short_memory(tmp_path
     records = read_jsonl(tmp_path / "threads" / "t" / "messages.jsonl")
 
     assert [record["role"] for record in records] == ["user", "assistant"]
+    assert records[0]["created_at"] == "2026-08-01T08:00:00+00:00"
     assert "<ImageDescription>" in records[1]["content"]
     assert "very long result" not in str(records)
     assert "data:image" not in str(records)
@@ -665,6 +690,7 @@ def test_memory_writer_queue_receives_only_compact_tool_completion_fields() -> N
             "thread_id": "t",
             "memory_event_id": "event_1",
             "input": "fetch it",
+            "message_created_at": "2026-08-01T08:00:00+00:00",
             "messages": [AIMessage(content="finished")],
             "tool_events": [
                 {"type": "tool_start", "tool": "web_fetch", "args": {"url": "secret"}},
@@ -682,6 +708,8 @@ def test_memory_writer_queue_receives_only_compact_tool_completion_fields() -> N
     )
 
     assert queue.payload is not None
+    assert queue.payload.user_message_created_at == "2026-08-01T08:00:00+00:00"
+    assert datetime.fromisoformat(queue.payload.assistant_message_created_at)
     assert queue.payload.tool_events == [
         {"name": "web_fetch", "status": "error", "error_summary": "provider failed"}
     ]
@@ -818,12 +846,37 @@ def test_short_memory_loads_complete_active_segment_after_checkpoint(tmp_path) -
     )
 
     assert loaded.summary == ""
-    assert loaded.messages[0].content == "user 0"
+    assert str(loaded.messages[0].content).startswith("user 0\n\n[系统时间: ")
     assert loaded.messages[-1].content == "assistant 34"
     assert checkpointed.summary == "compressed first 30 turns"
-    assert checkpointed.messages[0].content == "user 30"
+    assert str(checkpointed.messages[0].content).startswith("user 30\n\n[系统时间: ")
     assert checkpointed.messages[-1].content == "assistant 34"
     assert len([record for record in read_jsonl(path) if record["role"] == "user"]) == 35
+
+
+def test_short_memory_replays_user_timestamp_and_compressor_sees_it(tmp_path) -> None:
+    path = tmp_path / "messages.jsonl"
+    records = turn_records(
+        user_message="time-sensitive question",
+        assistant_answer="answer",
+        tool_events=[],
+        include_tool_events=False,
+        user_created_at="2026-08-01T08:00:00+00:00",
+        assistant_created_at="2026-08-01T08:01:00+00:00",
+    )
+    write_jsonl(path, records)
+
+    loaded = load_short_memory(path, {}, keep_recent_turns=30)
+    summary_prompt = build_summary_prompt(
+        previous_summary="",
+        records=records,
+        summary_target_tokens=100,
+        loaded_skills=[],
+    )
+
+    expected = "time-sensitive question\n\n[系统时间: 2026-08-01T08:00:00+00:00]"
+    assert loaded.messages[0].content == expected
+    assert expected in summary_prompt
 
 
 def test_short_memory_load_does_not_silently_trim_at_token_limit(tmp_path) -> None:
@@ -851,6 +904,7 @@ def test_short_memory_load_does_not_silently_trim_at_token_limit(tmp_path) -> No
 
 
 def test_model_memory_projection_uses_explicit_field_allowlist() -> None:
+    created_at = datetime(2026, 7, 29, 8, 0, tzinfo=UTC)
     updated_at = datetime(2026, 7, 30, 8, 0, tzinfo=UTC)
     node = MemoryNode(
         id="concept_1",
@@ -864,6 +918,7 @@ def test_model_memory_projection_uses_explicit_field_allowlist() -> None:
         reasoning="Created because the user stated a preference.",
         grounded_in=["event_1"],
         metadata={"source": "test"},
+        created_at=created_at,
         updated_at=updated_at,
     )
 
@@ -877,6 +932,7 @@ def test_model_memory_projection_uses_explicit_field_allowlist() -> None:
             "title": "Preferred answer style",
             "description": "The user prefers concise answers.",
             "user_id": "feishu:user_1",
+            "created_at": created_at.isoformat(),
             "updated_at": updated_at.isoformat(),
         }
     ]
@@ -898,6 +954,7 @@ def test_model_memory_projection_uses_explicit_field_allowlist() -> None:
             "importance": 0.9,
             "grounded_in": ["event_1"],
             "source": "test",
+            "created_at": created_at.isoformat(),
             "updated_at": updated_at.isoformat(),
         }
     ]
@@ -994,6 +1051,9 @@ def test_runtime_sends_write_context_to_memory_writer(tmp_path) -> None:
     assert captured
     assert captured[0].memory_context is not None
     assert set(captured[0].memory_context) == {"immediate", "working", "background", "buffer"}
+    records = read_jsonl(tmp_path / "threads" / "t" / "messages.jsonl")
+    assert records[0]["created_at"] == captured[0].user_message_created_at
+    assert records[1]["created_at"] == captured[0].assistant_message_created_at
 
 
 def test_runtime_returns_model_error_without_crashing(tmp_path, monkeypatch) -> None:

@@ -136,6 +136,7 @@ def test_memory_writer_llm_payload_omits_embeddings(tmp_path) -> None:
                 "importance": 0.7,
                 "grounded_in": ["event_0"],
                 "source": "test",
+                "created_at": "2026-07-29T08:00:00+00:00",
                 "updated_at": "2026-07-30T08:00:00+00:00",
                 "access_count": 3,
                 "embedding": [0.1, 0.2, 0.3],
@@ -153,7 +154,9 @@ def test_memory_writer_llm_payload_omits_embeddings(tmp_path) -> None:
         thread_id="t",
         event_id=event_id,
         user_message="Prepare an interview answer.",
+        user_message_created_at="2026-08-01T08:00:00+00:00",
         assistant_answer="Drafted.",
+        assistant_message_created_at="2026-08-01T08:01:00+00:00",
         tool_events=[
             {"type": "tool_start", "tool": "task", "args": {"prompt": "private"}},
             {"type": "tool_result", "tool": "task", "status": "success", "content": "x" * 2000},
@@ -183,8 +186,12 @@ def test_memory_writer_llm_payload_omits_embeddings(tmp_path) -> None:
         "importance": 0.7,
         "grounded_in": ["event_0"],
         "source": "test",
+        "created_at": "2026-07-29T08:00:00+00:00",
         "updated_at": "2026-07-30T08:00:00+00:00",
     }
+    assert sent_payload["user_message"] == "Prepare an interview answer."
+    assert sent_payload["user_message_created_at"] == "2026-08-01T08:00:00+00:00"
+    assert sent_payload["assistant_message_created_at"] == "2026-08-01T08:01:00+00:00"
     assert sent_payload["tool_events"] == [
         {"name": "task", "status": "success", "error_summary": ""},
         {"name": "web_fetch", "status": "error", "error_summary": "failed " + "y" * 493 + "..."},
@@ -200,6 +207,9 @@ def test_memory_writer_prompt_uses_cognifold_update_plan() -> None:
     assert "GROUNDS" in MEMORY_WRITER_PROMPT
     assert "ADD_NODE" in MEMORY_WRITER_PROMPT
     assert '"operations":[]' in MEMORY_WRITER_PROMPT
+    assert "user_message_created_at" in MEMORY_WRITER_PROMPT
+    assert "OCCURRED_AT" in MEMORY_WRITER_PROMPT
+    assert "普通对话不要创建 TIME" in MEMORY_WRITER_PROMPT
 
 
 def test_memory_writer_fallback_returns_empty_plan_for_greeting(tmp_path) -> None:

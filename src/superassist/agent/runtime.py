@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -24,7 +25,7 @@ from superassist.agent.factory import AgentBundle, build_agent
 from superassist.agent.prompts import SYSTEM_PROMPT
 from superassist.agent.prompts import subagent_section as subagent_prompt_section
 from superassist.agent.prompts import team_section as team_prompt_section
-from superassist.agent.short_memory import format_short_memory_section, load_short_memory
+from superassist.agent.short_memory import format_short_memory_section, load_short_memory, timestamp_user_content
 from superassist.agent.state import SuperAssistState
 from superassist.agent.streaming import StreamParts, accumulate_stream_parts, clean_answer_text
 from superassist.config import Settings, get_settings
@@ -253,6 +254,7 @@ class AgentRuntime:
         message_content: str | list[dict[str, Any]] | None = None,
     ) -> SuperAssistState:
         resolved_thread_id = thread_id or f"thread_{uuid4().hex[:12]}"
+        message_created_at = datetime.now(UTC).isoformat()
         thread_metadata = self._load_thread_metadata(resolved_thread_id)
         history = self._load_history(resolved_thread_id, thread_metadata)
         skill_activations = active_skill_activations(
@@ -272,13 +274,15 @@ class AgentRuntime:
             "active_skills_at_turn_start": loaded_skills,
             **self._tool_compatibility_metadata(),
         }
+        current_content = message if message_content is None else message_content
         return {
             "messages": [
                 SystemMessage(content=format_short_memory_section(history.summary)),
                 *history.messages,
-                HumanMessage(content=message_content or message),
+                HumanMessage(content=timestamp_user_content(current_content, message_created_at)),
             ],
             "input": message,
+            "message_created_at": message_created_at,
             "user_id": user_id,
             "thread_id": resolved_thread_id,
             "loaded_skills": loaded_skills,

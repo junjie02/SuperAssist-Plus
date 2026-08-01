@@ -11,7 +11,7 @@ def test_memory_ontology_is_stable() -> None:
         "PART_OF",
         "DERIVED_FROM",
         "DEADLINE_FOR",
+        "OCCURRED_AT",
         "RELATED_TO",
         "USER_FEEDBACK",
     }
-

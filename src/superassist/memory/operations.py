@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Protocol
 
 from superassist.memory.plans import (
     AddEdgeOp,
@@ -223,7 +223,6 @@ def _apply_merge_nodes(op: MergeNodesOp, ctx: ApplyContext, result: ApplyResult)
 _GROUNDING_RULES: list[tuple[NodeType, NodeType, EdgeType, bool]] = [
     (NodeType.EVENT, NodeType.CONCEPT, EdgeType.GROUNDS, False),
     (NodeType.EVENT, NodeType.INTENT, EdgeType.GROUNDS, False),
-    (NodeType.EVENT, NodeType.TIME, EdgeType.DEADLINE_FOR, True),
     (NodeType.CONCEPT, NodeType.INTENT, EdgeType.TRIGGERS, False),
     (NodeType.CONCEPT, NodeType.CONCEPT, EdgeType.RELATED_TO, False),
 ]

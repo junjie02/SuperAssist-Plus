@@ -41,6 +41,8 @@ class MemoryWritePayload:
     assistant_answer: str
     tool_events: list[dict[str, Any]]
     memory_context: dict[str, Any] | None = None
+    user_message_created_at: str = ""
+    assistant_message_created_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -247,6 +249,7 @@ def project_memory_recall(recall: MemoryRecall) -> dict[str, list[dict[str, Any]
                 "title": node.title,
                 "description": node.description,
                 "user_id": node.user_id,
+                "created_at": node.created_at.isoformat(),
                 "updated_at": node.updated_at.isoformat(),
             }
             for node in getattr(recall, tier)
@@ -270,6 +273,7 @@ def project_memory_write_context(recall: MemoryRecall) -> dict[str, list[dict[st
                 "importance": node.importance,
                 "grounded_in": list(node.grounded_in),
                 "source": str(node.metadata.get("source") or ""),
+                "created_at": node.created_at.isoformat(),
                 "updated_at": node.updated_at.isoformat(),
             }
             for node in getattr(recall, tier)

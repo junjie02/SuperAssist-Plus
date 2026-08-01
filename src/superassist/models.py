@@ -26,6 +26,7 @@ class EdgeType(str, Enum):
     PART_OF = "PART_OF"
     DERIVED_FROM = "DERIVED_FROM"
     DEADLINE_FOR = "DEADLINE_FOR"
+    OCCURRED_AT = "OCCURRED_AT"
     RELATED_TO = "RELATED_TO"
     USER_FEEDBACK = "USER_FEEDBACK"
 
@@ -39,6 +40,7 @@ EDGE_TYPE_DEFAULT_WEIGHTS: dict[EdgeType, float] = {
     EdgeType.PART_OF: 0.7,
     EdgeType.DERIVED_FROM: 0.6,
     EdgeType.DEADLINE_FOR: 0.6,
+    EdgeType.OCCURRED_AT: 0.8,
     EdgeType.RELATED_TO: 0.5,
 }
 
@@ -51,6 +53,7 @@ EDGE_TYPE_CONSTRAINTS: dict[EdgeType, tuple[set[NodeType], set[NodeType]]] = {
     EdgeType.PART_OF: ({NodeType.CONCEPT}, {NodeType.CONCEPT}),
     EdgeType.DERIVED_FROM: ({NodeType.CONCEPT}, {NodeType.CONCEPT}),
     EdgeType.DEADLINE_FOR: ({NodeType.TIME}, {NodeType.EVENT, NodeType.CONCEPT, NodeType.INTENT}),
+    EdgeType.OCCURRED_AT: ({NodeType.EVENT}, {NodeType.TIME}),
     EdgeType.RELATED_TO: ({NodeType.CONCEPT}, {NodeType.CONCEPT}),
     EdgeType.USER_FEEDBACK: ({NodeType.EVENT, NodeType.CONCEPT}, {NodeType.INTENT}),
 }

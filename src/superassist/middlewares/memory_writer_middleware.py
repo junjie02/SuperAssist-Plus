@@ -7,6 +7,7 @@ write queue fires.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
@@ -33,18 +34,21 @@ class MemoryWriterMiddleware(AgentMiddleware[SuperAssistState]):
         if not event_id:
             return None
         assistant_answer = _last_ai_text(state.get("messages") or [])
+        assistant_created_at = str(state.get("assistant_message_created_at") or "") or datetime.now(UTC).isoformat()
         self._queue.add(
             MemoryWritePayload(
                 user_id=state["user_id"],
                 thread_id=state["thread_id"],
                 event_id=event_id,
                 user_message=state.get("input") or "",
+                user_message_created_at=str(state.get("message_created_at") or ""),
                 assistant_answer=assistant_answer,
+                assistant_message_created_at=assistant_created_at,
                 tool_events=compact_tool_events(list(state.get("tool_events") or [])),
                 memory_context=dict(state.get("memory_write_context") or {}),
             )
         )
-        return None
+        return {"assistant_message_created_at": assistant_created_at}
 
 
 def _last_ai_text(messages: list[Any]) -> str:

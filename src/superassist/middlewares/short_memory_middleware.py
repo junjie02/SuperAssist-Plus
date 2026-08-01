@@ -8,6 +8,7 @@ summary checkpoints whenever the active segment reaches its turn/token limit.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from superassist.agent.short_memory import (
     estimate_tokens,
     maybe_compress_short_memory,
     read_jsonl,
+    record_text,
     turn_records,
 )
 from superassist.agent.state import SuperAssistState
@@ -50,6 +52,7 @@ class ShortMemoryMiddleware(AgentMiddleware[SuperAssistState]):
         thread_dir = self._settings.data_dir / "threads" / thread_id
         thread_dir.mkdir(parents=True, exist_ok=True)
         path = thread_dir / "messages.jsonl"
+        assistant_created_at = str(state.get("assistant_message_created_at") or "") or datetime.now(UTC).isoformat()
         append_jsonl(
             path,
             turn_records(
@@ -57,6 +60,8 @@ class ShortMemoryMiddleware(AgentMiddleware[SuperAssistState]):
                 assistant_answer=assistant_answer,
                 tool_events=[],
                 include_tool_events=False,
+                user_created_at=str(state.get("message_created_at") or "") or None,
+                assistant_created_at=assistant_created_at,
             ),
         )
 
@@ -102,7 +107,7 @@ class ShortMemoryMiddleware(AgentMiddleware[SuperAssistState]):
         meta_update.setdefault(
             "short_memory_active_tokens",
             estimate_tokens(str(meta_update.get("summary", existing_metadata.get("summary", "")) or ""))
-            + sum(estimate_tokens(f"{record.get('role')}: {record.get('content') or ''}") for record in active_records),
+            + sum(estimate_tokens(record_text(record)) for record in active_records),
         )
         self._save_thread_metadata(thread_dir, meta_update)
 
@@ -114,6 +119,7 @@ class ShortMemoryMiddleware(AgentMiddleware[SuperAssistState]):
         )
         return {
             "metadata": metadata,
+            "assistant_message_created_at": assistant_created_at,
             "loaded_skills": loaded_skills,
             "skill_activations": skill_activations,
         }
