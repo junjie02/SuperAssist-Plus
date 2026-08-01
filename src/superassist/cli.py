@@ -75,7 +75,7 @@ def _print_tool_event(event: dict[str, Any]) -> None:
         return
     if event_type == "tool_result":
         status = str(event.get("status") or "success")
-        error = str(event.get("error") or "").strip()
+        error = str(event.get("error_summary") or event.get("error") or "").strip()
         suffix = f" error={error}" if error else ""
         print(f"[tool:{status}] {tool_name}{suffix}")
 

@@ -24,6 +24,9 @@ def test_default_tools_include_file_and_web_tools() -> None:
         "delete_path",
         "web_search",
         "web_fetch",
+        "image_search",
+        "inspect_image",
+        "present_images",
         "shell",
         "task",
     }.issubset(names)
@@ -116,6 +119,12 @@ def test_tool_lookup_by_name() -> None:
 
 def test_default_tools_can_exclude_task_for_subagents() -> None:
     assert "task" not in {tool.name for tool in default_tools(include_task=False)}
+
+
+def test_subagent_tools_can_exclude_lead_only_image_delivery_tools() -> None:
+    names = {tool.name for tool in default_tools(include_task=False, include_images=False)}
+
+    assert {"image_search", "inspect_image", "present_images"}.isdisjoint(names)
 
 
 def test_shell_tool_is_disabled_by_default(tmp_path: Path, monkeypatch) -> None:

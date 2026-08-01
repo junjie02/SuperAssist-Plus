@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     temperature: float | None = Field(default=None, alias="SUPERASSIST_TEMPERATURE")
     max_tokens: int | None = Field(default=None, alias="SUPERASSIST_MAX_TOKENS")
     reasoning_effort: ReasoningEffort = Field(default="medium", alias="SUPERASSIST_REASONING_EFFORT")
+    prompt_cache_explicit_enabled: bool = Field(
+        default=True,
+        alias="SUPERASSIST_PROMPT_CACHE_EXPLICIT_ENABLED",
+    )
     model_input_log_enabled: bool = Field(default=False, alias="SUPERASSIST_MODEL_INPUT_LOG_ENABLED")
     model_input_log_max_bytes: int = Field(
         default=50 * 1024 * 1024,

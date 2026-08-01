@@ -17,6 +17,7 @@ from typing import Any, Callable
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
+from langgraph.types import Command
 
 from superassist.agent.state import SuperAssistState
 from superassist.skills import skill_name_from_virtual_path
@@ -70,15 +71,17 @@ class ToolEventMiddleware(AgentMiddleware[SuperAssistState]):
                     loaded_skills.append(skill_name)
                 state["loaded_skills"] = loaded_skills
 
+        status, error_summary, output_summary = _summarize_tool_result(result)
         result_event: dict[str, Any] = {
             "type": "tool_result",
             "tool": tool_name,
             "args": args,
-            "content": str(getattr(result, "content", "")),
-            "status": getattr(result, "status", "success"),
+            "status": status,
         }
+        if output_summary:
+            result_event["output_summary"] = output_summary
         if result_event["status"] == "error":
-            result_event["error"] = result_event["content"]
+            result_event["error_summary"] = error_summary
         if loaded_skills:
             result_event["loaded_skills"] = loaded_skills
         events.append(result_event)
@@ -111,6 +114,27 @@ def _message_text(content: Any) -> str:
                 parts.append(str(item.get("text") or ""))
         return "\n".join(part.strip() for part in parts if part.strip())
     return str(content).strip() if content else ""
+
+
+def _summarize_tool_result(result: Any) -> tuple[str, str, str]:
+    messages: list[ToolMessage] = []
+    if isinstance(result, ToolMessage):
+        messages = [result]
+    elif isinstance(result, Command) and isinstance(result.update, dict):
+        messages = [item for item in (result.update.get("messages") or []) if isinstance(item, ToolMessage)]
+    status = "error" if any(getattr(message, "status", "success") == "error" for message in messages) else "success"
+    text = "\n".join(_message_text(message.content) for message in messages).strip()
+    if status == "error":
+        return status, text[:500], ""
+    image_count = sum(
+        1
+        for message in messages
+        for item in (message.content if isinstance(message.content, list) else [])
+        if isinstance(item, dict) and item.get("type") in {"input_image", "image_url"}
+    )
+    if image_count:
+        return status, "", f"multimodal result with {image_count} image(s)"
+    return status, "", "text result" if text else "empty result"
 
 
 __all__ = ["ToolEventMiddleware"]

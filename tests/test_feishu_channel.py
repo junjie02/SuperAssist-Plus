@@ -11,6 +11,7 @@ import pytest
 from PIL import Image
 
 from superassist.channels.feishu import (
+    FeishuCardImage,
     FeishuCardView,
     FeishuChannel,
     FeishuInboundMessage,
@@ -353,6 +354,84 @@ def test_build_reasoning_card_expands_then_collapses() -> None:
     assert thinking["body"]["elements"][0]["expanded"] is True
     assert answered["body"]["elements"][0]["expanded"] is False
     assert answered["body"]["elements"][1]["content"] == "最终答案"
+
+
+def test_build_card_content_renders_selected_images_and_sources() -> None:
+    card = json.loads(
+        build_card_content(
+            FeishuCardView(
+                answer="这是千叶豆腐。",
+                images=(
+                    FeishuCardImage(
+                        title="千叶豆腐成品",
+                        source_url="https://example.com/recipe",
+                        image_key="img_feishu_1",
+                    ),
+                ),
+            )
+        )
+    )
+
+    elements = card["body"]["elements"]
+    assert elements[1] == {
+        "tag": "img",
+        "img_key": "img_feishu_1",
+        "alt": {"tag": "plain_text", "content": "千叶豆腐成品"},
+        "preview": True,
+    }
+    assert "https://example.com/recipe" in elements[2]["content"]
+
+
+def test_prepare_outbound_images_uploads_selection(monkeypatch, tmp_path) -> None:
+    async def go():
+        channel = FeishuChannel(_settings(tmp_path))
+        monkeypatch.setattr(
+            "superassist.channels.feishu._download_outbound_candidate",
+            lambda _candidate: (b"image", "image/jpeg"),
+        )
+
+        async def upload(data):
+            assert data == b"image"
+            return "img_uploaded"
+
+        channel._upload_image = upload
+        result = await channel._prepare_outbound_images(
+            [
+                {
+                    "candidate_id": "img_1",
+                    "title": "千叶豆腐",
+                    "image_url": "https://cdn.example.com/image.jpg",
+                    "source_url": "https://example.com/source",
+                }
+            ]
+        )
+
+        assert result == [
+            FeishuCardImage(
+                title="千叶豆腐",
+                source_url="https://example.com/source",
+                image_key="img_uploaded",
+            )
+        ]
+
+    _run(go())
+
+
+def test_prepare_outbound_images_degrades_to_source_link(monkeypatch, tmp_path) -> None:
+    async def go():
+        channel = FeishuChannel(_settings(tmp_path))
+
+        def fail(_candidate):
+            raise RuntimeError("download failed")
+
+        monkeypatch.setattr("superassist.channels.feishu._download_outbound_candidate", fail)
+        result = await channel._prepare_outbound_images(
+            [{"candidate_id": "img_1", "title": "Source", "source_url": "https://example.com/source"}]
+        )
+
+        assert result == [FeishuCardImage(title="Source", source_url="https://example.com/source")]
+
+    _run(go())
 
 
 def test_format_subagent_card_text_uses_description() -> None:

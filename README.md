@@ -39,7 +39,7 @@ Go 是面向浏览器的产品入口：负责认证、WebSocket 生命周期、�
 - **长期记忆**：`event/concept/intent/time` 四类节点、九类边，结合向量入口、BFS、Personalized PageRank、时间和访问频次召回。
 - **LightRAG 知识库**：批量上传 PDF、DOCX、PPTX、XLSX、TXT、Markdown、JSON、CSV 和 HTML，异步完成切片、实体关系抽取和建图。
 - **Agentic RAG**：首轮默认 `mix` 检索；证据不足时允许模型改写查询，并由中间件保证最多完成三轮检索。失败后可按工具配置联网，最终回答明确标注上传资料、网页或模型知识来源。
-- **工具与 Subagent**：支持文件、网页和可选 Shell 工具，通过 `task` 把复杂任务交给 general-purpose 或 research 子 Agent。
+- **工具与 Subagent**：支持文件、网页、主 Agent 图片搜索和可选 Shell 工具，通过 `task` 把复杂任务交给 general-purpose 或 research 子 Agent。图片候选只作为本轮临时视觉上下文，主 Agent 明确选择后才会发送到飞书。
 - **ACP Agent Teams**：通过 `agent_team.toml` 接入 Claude Code 等外部 Agent，使用带文件锁、hash chain 和 HMAC 的 JSONL ledger 记录协作过程。
 - **可视化与管理**：导航栏提供 Chat、Memory Graph、Knowledge、Settings；管理员额外拥有 Users 页面，可查看各 Web/飞书/企业微信身份的会话、消息记录与长期记忆图，并可删除选中的未压缩短记忆记录。
 - **飞书 Bot**：支持可配置的群聊触发、合并且保序的流式卡片更新及会话映射；图片与用户问题在同一次主 Agent 多模态请求中处理，可选本地 OCR 仅作校对辅助，主模型会在回答中附加可复用的针对性图片描述；后续历史只保留文本而不重复发送 Base64 图片。私聊按用户隔离，群聊按 `chat_id` 共享短记忆、长期 Memory 图和 RAG。

@@ -24,6 +24,10 @@ SYSTEM_PROMPT = """
   assistant message content explaining what you are about to do.
 - After tools or subagents return, summarize what you learned and your next
   step in assistant message content before deciding whether to call more tools.
+- `image_search` results are private, temporary visual context for this turn. Visually inspect candidates and search
+  again when needed. Never imply that a candidate was shown to the user merely because it appeared in a tool result.
+- To include searched images in the final Feishu response, you MUST explicitly call `present_images` with candidate
+  IDs you have judged relevant. Without that call, no searched image is delivered. Do not fabricate candidate IDs.
 </tool_use>
 
 <memory_use>

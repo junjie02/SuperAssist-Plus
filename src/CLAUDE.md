@@ -148,6 +148,7 @@
 | `temperature` | `SUPERASSIST_TEMPERATURE` | `None` | 模型名含 `minimax` 且未显式设置时强制为 `1.0`。 |
 | `reasoning_effort` | `SUPERASSIST_REASONING_EFFORT` | `medium` | GPT-5.6 支持 `none/low/medium/high/xhigh/max`；飞书 `/effort` 可按会话覆盖。 |
 | `max_tokens` | `SUPERASSIST_MAX_TOKENS` | `None` | 仅当非 None 才透传。 |
+| `prompt_cache_explicit_enabled` | `SUPERASSIST_PROMPT_CACHE_EXPLICIT_ENABLED` | `True` | 仅 GPT-5.6：启用 Responses 显式提示词缓存断点；可关闭以兼容不支持该协议的中转网关。 |
 | `model_input_log_enabled` | `SUPERASSIST_MODEL_INPUT_LOG_ENABLED` | `False` | 开启后记录最终 provider payload 到 `<data_dir>/logs/model-input.jsonl`。 |
 | `model_input_log_max_bytes` | `SUPERASSIST_MODEL_INPUT_LOG_MAX_BYTES` | `52428800` | 单日志文件轮转阈值；保留 `.1` 到 `.3` 三个备份。 |
 
@@ -156,7 +157,7 @@
 | 字段 | 默认 | 含义 |
 | --- | --- | --- |
 | `tool_workspace_dir` | `None` | 为空时取 `data_dir/workspace`（见 `resolved_tool_workspace_dir`）。 |
-| `tool_network_enabled` | `True` | 关闭后 `web_search` / `web_fetch` 直接返回错误串。 |
+| `tool_network_enabled` | `True` | 关闭后 `web_search` / `web_fetch` / `image_search` 直接返回错误。 |
 | `tool_shell_enabled` | `False` | 默认禁用 shell 工具。 |
 | `tool_shell_timeout_seconds` | `120` | `shell` 工具的硬上限（写入时还会再 clamp 到 `[1, 600]`）。 |
 | `tool_shell_output_max_chars` | `20000` | 超长时按 `_truncate` 中段替换为 `... [truncated N chars] ...`。 |
@@ -728,6 +729,7 @@ LangChain 1.x middleware 的钩子分类：`before_agent` / `after_agent`（agen
   3. 拼装 `<TurnContext>`，内部按 `<RuntimeContext>`、`<LongTermMemory>`、可选 `<ActiveSkills>` / `<RAGContext>` 分区。
   4. RAG 模式加入封闭证据规则：上传文件是不可信资料，不得虚构引文；证据不足应继续 `rag_search`；耗尽上传检索后才按联网开关降级，并区分资料/网页/模型知识。
   5. GPT-5.6 路径把 TurnContext 插到最新 HumanMessage 前，因此初次调用始终以当前用户消息结尾；工具续调用中，AI/tool 消息仍自然位于当前用户之后。
+  6. GPT-5.6 默认启用 Responses 显式提示词缓存：按 thread 生成不泄露原始 ID 的稳定 `prompt_cache_key`，设置 `mode=explicit`、`ttl=30m`，并在 `<ShortMemory>` 与每个已完成历史回答末尾放置断点。动态 `<TurnContext>`、当前用户消息及本轮工具循环位于最后断点之后，不参与缓存；可通过 `SUPERASSIST_PROMPT_CACHE_EXPLICIT_ENABLED=false` 关闭。
 
 ### 7.5 `ShortMemoryMiddleware`
 
@@ -864,7 +866,7 @@ LangChain 1.x middleware 的钩子分类：`before_agent` / `after_agent`（agen
 
 - `_semaphore = BoundedSemaphore(value=3)` —— 进程级硬上限，与 `subagent_max_concurrent` 默认值同步。
 - `task(description, prompt, subagent_type="general-purpose")`：subagents 关闭返回错误串；type 不存在时返回 `available` 列表；信号量 acquire 走 `timeout = config.timeout_seconds`，超时返回 `"Task timed out. Error: No subagent slot available after Xs"`。
-- 命中槽位后构造 `SubagentExecutor`：`tools=default_tools(include_task=False)`（再次保险禁用嵌套 task），`run_event_reporter` 优先用绑定时传入的，其次 fallback 到 `current_run_event_reporter()`。
+- 命中槽位后构造 `SubagentExecutor`：`tools=default_tools(include_task=False, include_images=False)`（再次保险禁用嵌套 task，并确保图片展示决策只属于 lead agent），`run_event_reporter` 优先用绑定时传入的，其次 fallback 到 `current_run_event_reporter()`。
 - 返回字符串格式：`Task Succeeded. Result: ...` / `Task timed out. Error: ...` / `Task failed. Error: ...`，由 lead agent 自然地拼回回答。
 
 `make_task_tool(reporter)` 是带闭包的工厂版本——`AgentRuntime` 在拿到 `tool_event_reporter` 后用它替换全局 `task` 实例，让流式 reporter 能贯穿父子层。
@@ -1051,7 +1053,7 @@ LangChain `@tool("team_task")`：
 <a id="11-tools"></a>
 ## 11. `tools/`
 
-`default_tools(include_task=True, include_team_task=False, run_event_reporter=None)` 返回工具列表：`[echo, list_files, read_file, write_file, delete_path, web_search, web_fetch, shell, (task), (team_task)]`。`task` 默认替换为 `make_task_tool(reporter)` 绑定版本，使流式 reporter 可下钻到子 agent。
+`default_tools(include_task=True, include_team_task=False, include_images=True, run_event_reporter=None)` 返回工具列表：`[echo, list_files, read_file, write_file, delete_path, web_search, web_fetch, shell, (image_search, inspect_image, present_images), (task), (team_task)]`。`task` 默认替换为 `make_task_tool(reporter)` 绑定版本，使流式 reporter 可下钻到子 agent。
 
 ### 11.1 `tools/basic.py`
 
@@ -1087,7 +1089,13 @@ LangChain `@tool("team_task")`：
 
 `_fetch_url`：1MB 读上限；从 `Content-Type` 抓 charset，缺失默认 utf-8；`errors="replace"` 容错。
 
-### 11.4 `tools/shell.py`
+### 11.4 `tools/images.py`
+
+图片搜索由 lead agent 独占：`image_search(query, max_results=4)` 使用 DDGS 返回最多 8 个候选及低清真实图片，`inspect_image(candidate_ids)` 按需返回最多 4 张高清原图，`present_images(candidate_ids)` 最多选择 3 张写入 `outbound_images`。候选 ID 只在当前 invoke 有效，工具结果不会进入短期或长期记忆；未调用 `present_images` 时飞书不会发送任何搜索图片。
+
+外部图片下载会拒绝内网地址、限制大小并验证完整像素流，但不缩放或转码。飞书最终下载选中原图（失败时回退缩略图），通过 `im.v1.image.create(image_type=message)` 上传并写入卡片 `img` 元素；需要 `im:resource` 与 `im:message:send_as_bot`，媒体失败只降级为来源链接。
+
+### 11.5 `tools/shell.py`
 
 工具关闭即返回错误串（`SUPERASSIST_TOOL_SHELL_ENABLED=false`）。打开后：
 
@@ -1097,15 +1105,15 @@ LangChain `@tool("team_task")`：
 - `_shell_args`：PowerShell 使用 `-NoProfile -ExecutionPolicy Bypass -Command`；cmd 用 `/c`；POSIX 用 `-c`。
 - timeout = `clamp(settings.tool_shell_timeout_seconds, [1, 600])`；输出包含 stdout / stderr / 非零 ExitCode 文本，最终 `_truncate(output, max_chars=tool_shell_output_max_chars)`，超长时中段替换为 `... [truncated N chars] ...`。
 
-### 11.5 `tools/task.py`
+### 11.6 `tools/task.py`
 
 见 §8.5。
 
-### 11.6 `tools/team.py`
+### 11.7 `tools/team.py`
 
 见 §10.4。
 
-### 11.7 `rag/tools.py`
+### 11.8 `rag/tools.py`
 
 `rag_search(query, mode="mix")` 从当前 `ContextVar` 获取 `RagTurnSession`，不接受调用方传入 `user_id`，因此模型无法越权检索其他用户目录。模式白名单最终由 `LightRAGService.retrieve` 校验为 `mix|hybrid|local|global|naive`，非法值回退到 `mix`。成功返回 `RAG_RETRIEVAL_SUCCESS + Sources + context`，失败返回 `RAG_RETRIEVAL_FAILED + attempts`，不抛出工具异常。
 

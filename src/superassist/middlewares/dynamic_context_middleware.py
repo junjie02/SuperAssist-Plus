@@ -8,13 +8,14 @@ That placement lets provider prompt caching reuse the static prompt and history.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from collections.abc import Callable
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langgraph.runtime import Runtime
 
 from superassist.agent.state import SuperAssistState
@@ -32,11 +33,13 @@ class DynamicContextMiddleware(AgentMiddleware[SuperAssistState]):
         *,
         clock: Callable[[], float] = time.time,
         preserve_static_prefix: bool = True,
+        explicit_prompt_cache: bool = False,
     ) -> None:
         super().__init__()
         self._skill_active_ttl_seconds = skill_active_ttl_seconds
         self._clock = clock
         self._preserve_static_prefix = preserve_static_prefix
+        self._explicit_prompt_cache = explicit_prompt_cache
 
     def before_model(self, state: SuperAssistState, runtime: Runtime) -> dict[str, Any] | None:
         metadata = dict(state.get("metadata") or {})
@@ -99,7 +102,19 @@ class DynamicContextMiddleware(AgentMiddleware[SuperAssistState]):
         reminder = "\n".join(reminder_lines)
 
         inject = _insert_before_latest_human if self._preserve_static_prefix else _merge_into_first_system_message
-        return handler(request.override(messages=inject(request.messages, reminder)))
+        messages = inject(request.messages, reminder)
+        if not self._explicit_prompt_cache:
+            return handler(request.override(messages=messages))
+
+        messages = _mark_explicit_cache_boundaries(messages)
+        model_settings = dict(getattr(request, "model_settings", None) or {})
+        model_settings.update(
+            {
+                "prompt_cache_key": _prompt_cache_key(thread_id),
+                "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
+            }
+        )
+        return handler(request.override(messages=messages, model_settings=model_settings))
 
 
 def _insert_before_latest_human(messages: list[BaseMessage], reminder: str) -> list[BaseMessage]:
@@ -114,6 +129,67 @@ def _merge_into_first_system_message(messages: list[BaseMessage], reminder: str)
         merged = SystemMessage(content=f"{messages[0].content}\n\n{reminder}")
         return [merged, *messages[1:]]
     return [SystemMessage(content=reminder), *messages]
+
+
+def _mark_explicit_cache_boundaries(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Mark stable history prefixes while leaving dynamic turn context uncached."""
+
+    latest_human_index = max(
+        (index for index, message in enumerate(messages) if isinstance(message, HumanMessage)),
+        default=len(messages),
+    )
+    marked: list[BaseMessage] = []
+    for index, message in enumerate(messages):
+        if (
+            index < latest_human_index
+            and isinstance(message, SystemMessage)
+            and str(message.content).lstrip().startswith("<ShortMemory>")
+        ):
+            message = _message_with_cache_breakpoint(message)
+        marked.append(message)
+        if index < latest_human_index and isinstance(message, AIMessage):
+            marked.append(_cache_boundary_message())
+    return marked
+
+
+def _message_with_cache_breakpoint(message: SystemMessage) -> SystemMessage:
+    content = message.content
+    if isinstance(content, str):
+        blocks: list[Any] = [{"type": "text", "text": content}]
+    elif isinstance(content, list):
+        blocks = [dict(item) if isinstance(item, dict) else item for item in content]
+    else:
+        blocks = [{"type": "text", "text": str(content or "")}]
+    for index in range(len(blocks) - 1, -1, -1):
+        block = blocks[index]
+        if isinstance(block, dict) and str(block.get("type") or "").lower() in {"text", "input_text"}:
+            block["prompt_cache_breakpoint"] = {"mode": "explicit"}
+            return message.model_copy(update={"content": blocks})
+    blocks.append(
+        {
+            "type": "text",
+            "text": "<PromptCacheBoundary />",
+            "prompt_cache_breakpoint": {"mode": "explicit"},
+        }
+    )
+    return message.model_copy(update={"content": blocks})
+
+
+def _cache_boundary_message() -> SystemMessage:
+    return SystemMessage(
+        content=[
+            {
+                "type": "text",
+                "text": "<PromptCacheBoundary />",
+                "prompt_cache_breakpoint": {"mode": "explicit"},
+            }
+        ]
+    )
+
+
+def _prompt_cache_key(thread_id: str) -> str:
+    digest = hashlib.sha256(str(thread_id or "local-thread").encode("utf-8")).hexdigest()[:24]
+    return f"superassist-thread-{digest}"
 
 
 __all__ = ["DynamicContextMiddleware"]

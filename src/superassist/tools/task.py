@@ -101,7 +101,7 @@ def _run_task_traced(
 
         executor = SubagentExecutor(
             config=config,
-            tools=default_tools(include_task=False),
+            tools=default_tools(include_task=False, include_images=False),
             settings=settings,
             run_event_reporter=run_event_reporter or current_run_event_reporter(),
         )

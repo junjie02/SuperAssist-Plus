@@ -186,6 +186,10 @@ def _build_middleware_chain(
             DynamicContextMiddleware(
                 settings.skill_active_ttl_seconds,
                 preserve_static_prefix=is_gpt_5_6_model(settings.model),
+                explicit_prompt_cache=(
+                    settings.prompt_cache_explicit_enabled
+                    and is_gpt_5_6_model(settings.model)
+                ),
             ),
             ShortMemoryMiddleware(settings, short_memory_model),
             ToolEventMiddleware(tool_event_reporter),

@@ -431,14 +431,14 @@ def _build_input_manifest(payload: dict[str, Any]) -> dict[str, Any]:
         )
         for index, (role, item_type, text) in enumerate(message_rows):
             tokens = _estimate_payload_tokens(text)
-            if "<ShortMemory>" in text:
+            if index == 0 and role == "system":
+                name = "static_system"
+            elif "<ShortMemory>" in text:
                 name = "short_memory"
             elif "<TurnContext>" in text:
                 name = "turn_context"
             elif "<MemoryWriteInput" in text:
                 name = "memory_write_input"
-            elif index == 0 and role == "system":
-                name = "static_system"
             elif index == current_user_index and role == "user":
                 name = "current_user"
             elif item_type != "message":
@@ -459,7 +459,22 @@ def _build_input_manifest(payload: dict[str, Any]) -> dict[str, Any]:
         "tool_count": len(tools) if isinstance(tools, list) else 0,
         "sections": sections,
         "component_tokens": component_tokens,
+        "prompt_cache": {
+            "key": str(payload.get("prompt_cache_key") or ""),
+            "mode": str((payload.get("prompt_cache_options") or {}).get("mode") or ""),
+            "ttl": str((payload.get("prompt_cache_options") or {}).get("ttl") or ""),
+            "breakpoints": _count_prompt_cache_breakpoints(items),
+        },
     }
+
+
+def _count_prompt_cache_breakpoints(value: Any) -> int:
+    if isinstance(value, dict):
+        own = 1 if "prompt_cache_breakpoint" in value else 0
+        return own + sum(_count_prompt_cache_breakpoints(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_count_prompt_cache_breakpoints(item) for item in value)
+    return 0
 
 
 def _tagged_section_tokens(text: str, tag: str) -> int:

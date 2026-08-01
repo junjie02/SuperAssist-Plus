@@ -1,8 +1,10 @@
 import json
 from datetime import UTC, datetime
 
+from langchain.agents.middleware import ModelRequest
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
+from langgraph.types import Command
 
 from superassist.agent import AgentRuntime
 from superassist.agent.runtime import SYSTEM_PROMPT
@@ -15,7 +17,7 @@ from superassist.agent.short_memory import (
     write_jsonl,
 )
 from superassist.config import PROJECT_ROOT, Settings
-from superassist.llm import FallbackChatModel, MiniMaxCompatibleChatModel
+from superassist.llm import FallbackChatModel, MiniMaxCompatibleChatModel, create_chat_model
 from superassist.memory.service import project_memory_recall, project_memory_write_context
 from superassist.middlewares import (
     DynamicContextMiddleware,
@@ -47,6 +49,7 @@ def test_short_memory_defaults_are_configured() -> None:
 
     assert settings.short_memory_keep_recent_turns == 30
     assert settings.short_memory_token_limit == 80000
+    assert settings.prompt_cache_explicit_enabled is True
     assert settings.memory_llm_writer_enabled is True
     assert settings.memory_model == "deepseek-v4-flash"
     assert settings.feishu_domain == "https://open.feishu.cn"
@@ -54,7 +57,7 @@ def test_short_memory_defaults_are_configured() -> None:
 
 
 def test_dynamic_context_injects_runtime_section() -> None:
-    middleware = DynamicContextMiddleware()
+    middleware = DynamicContextMiddleware(explicit_prompt_cache=True)
     base_messages = [SystemMessage(content="Base system"), HumanMessage(content="Hi")]
     state = {"user_id": "u", "thread_id": "t", "memory_recall": {}, "loaded_skills": []}
 
@@ -67,6 +70,7 @@ def test_dynamic_context_injects_runtime_section() -> None:
 
         def override(self, **kwargs):
             captured["messages"] = kwargs["messages"]
+            captured["model_settings"] = kwargs.get("model_settings")
             return kwargs["messages"]
 
     middleware.wrap_model_call(Request(), lambda value: value)
@@ -81,10 +85,12 @@ def test_dynamic_context_injects_runtime_section() -> None:
     assert "<TurnContext>" in str(merged[-2].content)
     assert "<RuntimeContext>" in str(merged[-2].content)
     assert '<LongTermMemory format="json">' in str(merged[-2].content)
+    assert captured["model_settings"]["prompt_cache_options"] == {"mode": "explicit", "ttl": "30m"}
+    assert captured["model_settings"]["prompt_cache_key"].startswith("superassist-thread-")
 
 
 def test_dynamic_context_preserves_legacy_system_order_when_cache_mode_is_disabled() -> None:
-    middleware = DynamicContextMiddleware(preserve_static_prefix=False)
+    middleware = DynamicContextMiddleware(preserve_static_prefix=False, explicit_prompt_cache=False)
     base_messages = [SystemMessage(content="Base system"), HumanMessage(content="Hi")]
 
     class Request:
@@ -171,7 +177,7 @@ def test_dynamic_context_keeps_multimodal_image_during_skill_tool_continuation()
 
 
 def test_initial_prompt_order_ends_with_current_user() -> None:
-    middleware = DynamicContextMiddleware(clock=lambda: 0.0)
+    middleware = DynamicContextMiddleware(clock=lambda: 0.0, explicit_prompt_cache=True)
     messages = [
         SystemMessage(content="stable system"),
         SystemMessage(content="<ShortMemory>summary</ShortMemory>"),
@@ -197,10 +203,73 @@ def test_initial_prompt_order_ends_with_current_user() -> None:
         HumanMessage,
         AIMessage,
         SystemMessage,
+        SystemMessage,
         HumanMessage,
     ]
+    assert merged[-3].content[0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
     assert "<TurnContext>" in str(merged[-2].content)
     assert merged[-1].content == "current question"
+
+
+def test_gpt_5_6_explicit_cache_breakpoints_exclude_dynamic_turn_context() -> None:
+    settings = Settings(
+        _env_file=None,
+        SUPERASSIST_MODEL="gpt-5.6-sol",
+        SUPERASSIST_API_KEY="secret",
+    )
+    model = create_chat_model(settings)
+    middleware = DynamicContextMiddleware(explicit_prompt_cache=True)
+    messages = [
+        SystemMessage(content="stable system"),
+        SystemMessage(content="<ShortMemory>stable summary</ShortMemory>"),
+        HumanMessage(content="older question"),
+        AIMessage(content="older answer"),
+        HumanMessage(content="current question"),
+    ]
+
+    def build_payload(thread_id: str, request_messages=messages):
+        request = ModelRequest(
+            model=model,
+            messages=request_messages,
+            state={"user_id": "u", "thread_id": thread_id, "memory_recall": {}},
+        )
+        return middleware.wrap_model_call(
+            request,
+            lambda value: value.model._get_request_payload(value.messages, **value.model_settings),
+        )
+
+    first = build_payload("thread-a")
+    repeated = build_payload("thread-a")
+    other_thread = build_payload("thread-b")
+    next_turn = build_payload(
+        "thread-a",
+        [
+            *messages,
+            AIMessage(content="current answer"),
+            HumanMessage(content="next question"),
+        ],
+    )
+
+    assert first["prompt_cache_options"] == {"mode": "explicit", "ttl": "30m"}
+    assert first["prompt_cache_key"] == repeated["prompt_cache_key"]
+    assert first["prompt_cache_key"] != other_thread["prompt_cache_key"]
+    assert "thread-a" not in first["prompt_cache_key"]
+    breakpoint_indexes = [
+        index
+        for index, item in enumerate(first["input"])
+        if any(
+            isinstance(block, dict) and "prompt_cache_breakpoint" in block
+            for block in (item.get("content") if isinstance(item.get("content"), list) else [])
+        )
+    ]
+    turn_context_index = next(
+        index
+        for index, item in enumerate(first["input"])
+        if "<TurnContext>" in str(item.get("content") or "")
+    )
+    assert breakpoint_indexes == [1, 4]
+    assert max(breakpoint_indexes) < turn_context_index
+    assert first["input"][:5] == next_turn["input"][:5]
 
 
 def test_tool_event_middleware_reports_start_and_result() -> None:
@@ -226,6 +295,41 @@ def test_tool_event_middleware_reports_start_and_result() -> None:
     assert [event["type"] for event in reported] == ["tool_start", "tool_result"]
     assert reported[0]["args"] == {"text": "hi"}
     assert reported[1]["args"] == {"text": "hi"}
+
+
+def test_tool_event_middleware_does_not_copy_multimodal_payloads() -> None:
+    reported = []
+    middleware = ToolEventMiddleware(reported.append)
+
+    class DummyTool:
+        name = "image_search"
+
+    request = ToolCallRequest(
+        tool_call={"name": "image_search", "id": "call_1", "args": {"query": "food"}},
+        tool=DummyTool(),
+        state={"tool_events": []},
+        runtime=None,
+    )
+    command = Command(
+        update={
+            "messages": [
+                ToolMessage(
+                    content=[
+                        {"type": "input_text", "text": "candidate_id=img_1"},
+                        {"type": "input_image", "image_url": "data:image/png;base64," + ("x" * 1000)},
+                    ],
+                    tool_call_id="call_1",
+                )
+            ]
+        }
+    )
+
+    result = middleware.wrap_tool_call(request, lambda _request: command)
+
+    assert result is command
+    assert reported[-1]["output_summary"] == "multimodal result with 1 image(s)"
+    assert "content" not in reported[-1]
+    assert "data:image" not in str(request.state["tool_events"])
 
 
 def test_tool_event_middleware_reports_agent_tool_call_content() -> None:

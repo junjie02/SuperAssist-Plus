@@ -14,6 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import numpy as np
 from dotenv import load_dotenv
@@ -24,6 +25,7 @@ from superassist.config import PROJECT_ROOT, REASONING_EFFORTS, Settings, get_se
 from superassist.llm import is_gpt_5_6_model
 from superassist.memory.embedding import get_embedder
 from superassist.models import AgentRunEvent
+from superassist.tools.images import MAX_ORIGINAL_BYTES, download_image_url
 
 from .store import FeishuThreadStore
 
@@ -74,6 +76,14 @@ class FeishuCardView:
     answer: str = ""
     reasoning: str = ""
     reasoning_expanded: bool = True
+    images: tuple["FeishuCardImage", ...] = ()
+
+
+@dataclass(frozen=True)
+class FeishuCardImage:
+    title: str
+    source_url: str
+    image_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -123,6 +133,8 @@ class FeishuChannel:
         self._PatchMessageRequest = None
         self._PatchMessageRequestBody = None
         self._GetMessageResourceRequest = None
+        self._CreateImageRequest = None
+        self._CreateImageRequestBody = None
         self._ocr_engine: Any | None = None
         self._ocr_initialization_attempted = False
         self._ocr_lock = threading.Lock()
@@ -144,6 +156,8 @@ class FeishuChannel:
             from lark_oapi.api.im.v1 import (
                 CreateMessageRequest,
                 CreateMessageRequestBody,
+                CreateImageRequest,
+                CreateImageRequestBody,
                 GetMessageResourceRequest,
                 PatchMessageRequest,
                 PatchMessageRequestBody,
@@ -161,6 +175,8 @@ class FeishuChannel:
         self._PatchMessageRequest = PatchMessageRequest
         self._PatchMessageRequestBody = PatchMessageRequestBody
         self._GetMessageResourceRequest = GetMessageResourceRequest
+        self._CreateImageRequest = CreateImageRequest
+        self._CreateImageRequestBody = CreateImageRequestBody
         self._api_client = (
             lark.Client.builder()
             .app_id(self.settings.feishu_app_id)
@@ -424,12 +440,14 @@ class FeishuChannel:
             if result.metadata.get("model_error"):
                 final_text = format_model_error(result.metadata, has_images=bool(image_payloads))
             previous = self._card_views.get(inbound.message_id)
+            outbound_images = await self._prepare_outbound_images(result.metadata.get("outbound_images"))
             final_view: str | FeishuCardView = final_text
-            if previous and previous.reasoning:
+            if (previous and previous.reasoning) or outbound_images:
                 final_view = FeishuCardView(
                     answer=final_text,
-                    reasoning=previous.reasoning,
+                    reasoning=previous.reasoning if previous else "",
                     reasoning_expanded=False,
+                    images=tuple(outbound_images),
                 )
             await self._send_or_patch(inbound, final_view, final=True)
         except Exception:
@@ -497,6 +515,46 @@ class FeishuChannel:
 
         self._ocr_engine = RapidOCR()
         return self._ocr_engine
+
+    async def _prepare_outbound_images(self, raw_images: Any) -> list[FeishuCardImage]:
+        if not isinstance(raw_images, list):
+            return []
+        prepared: list[FeishuCardImage] = []
+        for raw in raw_images[:3]:
+            if not isinstance(raw, dict):
+                continue
+            title = str(raw.get("title") or "Image").strip()[:200]
+            source_url = _public_link(str(raw.get("source_url") or ""))
+            image_key = ""
+            try:
+                data, _mime_type = await asyncio.to_thread(_download_outbound_candidate, raw)
+                image_key = await self._upload_image(data)
+            except Exception as exc:  # noqa: BLE001 - media failure must not fail the text response
+                logger.warning(
+                    "Failed to prepare selected outbound image candidate_id=%s error_type=%s",
+                    raw.get("candidate_id"),
+                    type(exc).__name__,
+                )
+            if image_key or source_url:
+                prepared.append(FeishuCardImage(title=title, source_url=source_url, image_key=image_key))
+        return prepared
+
+    async def _upload_image(self, data: bytes) -> str:
+        if not self._api_client or not self._CreateImageRequest or not self._CreateImageRequestBody:
+            raise RuntimeError("Feishu image upload client is not initialized")
+        request = self._CreateImageRequest.builder().request_body(
+            self._CreateImageRequestBody.builder()
+            .image_type("message")
+            .image(io.BytesIO(data))
+            .build()
+        ).build()
+        response = await asyncio.to_thread(self._api_client.im.v1.image.create, request)
+        if not response.success():
+            raise RuntimeError(f"Feishu image upload failed with code={getattr(response, 'code', None)}")
+        image_key = str(getattr(getattr(response, "data", None), "image_key", "") or "")
+        if not image_key:
+            raise RuntimeError("Feishu image upload returned no image_key")
+        return image_key
 
     def _get_image_context(self, scope_key: str) -> FeishuImageContext | None:
         context = self._image_contexts.get(scope_key)
@@ -639,7 +697,7 @@ class FeishuChannel:
         if isinstance(text, str):
             text = text.strip()
         if (isinstance(text, str) and not text) or (
-            isinstance(text, FeishuCardView) and not text.reasoning and not text.answer
+            isinstance(text, FeishuCardView) and not text.reasoning and not text.answer and not text.images
         ):
             return
         visible_text = text.answer if isinstance(text, FeishuCardView) else text
@@ -898,6 +956,26 @@ def original_image_payload(data: bytes) -> tuple[bytes, str]:
     return data, mime_type
 
 
+def _download_outbound_candidate(candidate: dict[str, Any]) -> tuple[bytes, str]:
+    errors: list[Exception] = []
+    for key in ("image_url", "thumbnail_url"):
+        url = str(candidate.get(key) or "").strip()
+        if not url:
+            continue
+        try:
+            return download_image_url(url, max_bytes=MAX_ORIGINAL_BYTES, timeout=15)
+        except Exception as exc:  # noqa: BLE001 - original-to-thumbnail fallback
+            errors.append(exc)
+    raise errors[-1] if errors else ImageDownloadError("Selected image has no downloadable URL")
+
+
+def _public_link(url: str) -> str:
+    parsed = urlparse(url.strip())
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return url.strip()
+
+
 def format_model_error(metadata: dict[str, Any], *, has_images: bool) -> str:
     error_type = str(metadata.get("model_error") or "ModelError").strip()
     detail = re.sub(r"\s+", " ", str(metadata.get("model_error_message") or "")).strip()
@@ -916,20 +994,35 @@ class ImageDownloadError(RuntimeError):
 
 
 def build_card_content(text: str | FeishuCardView) -> str:
-    if isinstance(text, FeishuCardView) and text.reasoning:
-        elements: list[dict[str, Any]] = [
-            {
-                "tag": "collapsible_panel",
-                "expanded": text.reasoning_expanded,
-                "header": {
-                    "title": {"tag": "plain_text", "content": "思考过程"},
-                    "vertical_align": "center",
-                },
-                "elements": [{"tag": "markdown", "content": text.reasoning}],
-            }
-        ]
+    if isinstance(text, FeishuCardView):
+        elements: list[dict[str, Any]] = []
+        if text.reasoning:
+            elements.append(
+                {
+                    "tag": "collapsible_panel",
+                    "expanded": text.reasoning_expanded,
+                    "header": {
+                        "title": {"tag": "plain_text", "content": "思考过程"},
+                        "vertical_align": "center",
+                    },
+                    "elements": [{"tag": "markdown", "content": text.reasoning}],
+                }
+            )
         if text.answer:
             elements.append({"tag": "markdown", "content": text.answer})
+        for item in text.images:
+            if item.image_key:
+                elements.append(
+                    {
+                        "tag": "img",
+                        "img_key": item.image_key,
+                        "alt": {"tag": "plain_text", "content": item.title or "Image"},
+                        "preview": True,
+                    }
+                )
+            if item.source_url:
+                label = (item.title or "Image source").replace("[", "\\[").replace("]", "\\]")
+                elements.append({"tag": "markdown", "content": f"[图片来源：{label}]({item.source_url})"})
         return json.dumps(
             {
                 "schema": "2.0",

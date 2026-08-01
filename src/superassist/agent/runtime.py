@@ -288,6 +288,8 @@ class AgentRuntime:
             "loaded_skills": loaded_skills,
             "skill_activations": skill_activations,
             "tool_events": [],
+            "image_search_results": {},
+            "outbound_images": [],
             "rag_mode": self.rag_mode,
             "rag_context": "",
             "rag_sources": [],
@@ -320,6 +322,9 @@ class AgentRuntime:
         if not metadata.get("final_assistant_text") and answer:
             metadata["final_assistant_text"] = answer
         metadata["loaded_skills"] = sorted(set(final_state.get("loaded_skills") or metadata.get("loaded_skills") or []))
+        outbound_images = list(final_state.get("outbound_images") or [])
+        if outbound_images:
+            metadata["outbound_images"] = outbound_images
         return AgentRunResult(thread_id=thread_id, answer=answer, metadata=metadata)
 
     @staticmethod

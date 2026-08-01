@@ -194,6 +194,12 @@ def test_model_input_payload_is_written_to_jsonl_log(tmp_path) -> None:
     sections = records[0]["input_manifest"]["sections"]
     assert sections["long_term_memory"] > 0
     assert sections["long_term_memory"] < sections["turn_context"]
+    assert records[0]["input_manifest"]["prompt_cache"] == {
+        "key": "",
+        "mode": "",
+        "ttl": "",
+        "breakpoints": 0,
+    }
     assert "secret" not in log_path.read_text(encoding="utf-8")
 
 
