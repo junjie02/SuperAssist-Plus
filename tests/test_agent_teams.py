@@ -279,6 +279,22 @@ def test_runtime_skips_team_supervisor_when_config_disabled(tmp_path: Path, monk
         runtime.close()
 
 
+def test_runtime_skips_team_supervisor_when_settings_disable_teams(tmp_path: Path, monkeypatch) -> None:
+    config = _team_config()
+    monkeypatch.setattr("superassist.agent.factory.AgentTeamConfig.from_file", lambda: config)
+    runtime = AgentRuntime(
+        Settings(
+            SUPERASSIST_DATA_DIR=tmp_path,
+            SUPERASSIST_EMBEDDING_PROVIDER="hash",
+            SUPERASSIST_AGENT_TEAMS_ENABLED=False,
+        )
+    )
+    try:
+        assert runtime.team_supervisor is None
+    finally:
+        runtime.close()
+
+
 def test_team_prompt_section_lists_agents() -> None:
     section = team_prompt_section("- codex: Codex fake")
 

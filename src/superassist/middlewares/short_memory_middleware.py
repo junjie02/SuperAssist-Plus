@@ -41,6 +41,8 @@ class ShortMemoryMiddleware(AgentMiddleware[SuperAssistState]):
         self._model = _legacy_model
 
     def after_agent(self, state: SuperAssistState, runtime: Runtime) -> dict[str, Any] | None:
+        if state.get("suppress_short_memory_write"):
+            return None
         thread_id = state.get("thread_id") or ""
         if not thread_id:
             return None

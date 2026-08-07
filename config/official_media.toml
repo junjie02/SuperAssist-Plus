@@ -1,0 +1,288 @@
+version = 1
+
+[[sources]]
+id = "gov"
+name = "中国政府网"
+enabled = true
+domains = ["gov.cn"]
+latest_pages = [
+  "https://www.gov.cn/",
+  "https://www.gov.cn/yaowen/",
+  "https://www.gov.cn/zhengce/",
+]
+
+[[sources]]
+id = "qstheory"
+name = "求是网"
+enabled = true
+domains = ["qstheory.cn"]
+latest_pages = ["http://www.qstheory.cn/"]
+
+[[sources]]
+id = "people"
+name = "人民日报/人民网"
+enabled = true
+domains = ["people.com.cn"]
+latest_pages = [
+  "http://www.people.com.cn/",
+  "http://opinion.people.com.cn/",
+  "http://opinion.people.com.cn/GB/8213/49160/index.html",
+  "http://opinion.people.com.cn/GB/8213/353915/353916/index.html",
+  "http://theory.people.com.cn/",
+  "http://hb.people.com.cn/",
+]
+
+[[sources]]
+id = "xinhuanet"
+name = "新华社/新华网"
+enabled = true
+domains = ["xinhuanet.com", "news.cn"]
+latest_pages = [
+  "https://www.news.cn/politics/",
+  "https://www.news.cn/comments/",
+  "https://lw.news.cn/",
+  "http://hb.news.cn/",
+]
+
+[[sources]]
+id = "cctv"
+name = "央视新闻/央视网"
+enabled = true
+domains = ["cctv.com"]
+latest_pages = [
+  "https://news.cctv.com/",
+  "https://news.cctv.com/china/",
+]
+
+[[sources]]
+id = "gmw"
+name = "光明日报/光明网"
+enabled = true
+domains = ["gmw.cn"]
+latest_pages = [
+  "https://politics.gmw.cn/",
+  "https://guancha.gmw.cn/",
+  "https://theory.gmw.cn/",
+]
+
+[[sources]]
+id = "ce"
+name = "经济日报/中国经济网"
+enabled = true
+domains = ["ce.cn"]
+latest_pages = [
+  "http://www.ce.cn/xwzx/gnsz/gdxw/",
+  "http://views.ce.cn/",
+]
+
+[[sources]]
+id = "banyuetan"
+name = "半月谈"
+enabled = true
+domains = ["banyuetan.org"]
+latest_pages = [
+  "http://www.banyuetan.org/",
+  "http://www.banyuetan.org/byt/jicengzhili/index.html",
+]
+
+[[sources]]
+id = "studytimes"
+name = "学习时报"
+enabled = true
+domains = ["studytimes.cn"]
+latest_pages = ["https://www.studytimes.cn/"]
+
+[[sources]]
+id = "cyol"
+name = "中国青年报/中青在线"
+enabled = true
+domains = ["cyol.com"]
+latest_pages = [
+  "https://wap.cyol.com/",
+  "https://zqb.cyol.com/pc/layout/index.html",
+]
+
+[[sources]]
+id = "youth"
+name = "中国青年网"
+enabled = true
+domains = ["youth.cn"]
+latest_pages = [
+  "https://www.youth.cn/",
+  "https://pinglun.youth.cn/",
+]
+
+[[sources]]
+id = "legal_daily"
+name = "法治日报/法治网"
+enabled = true
+domains = ["legaldaily.com.cn"]
+latest_pages = [
+  "http://www.legaldaily.com.cn/",
+  "http://www.legaldaily.com.cn/node_107525.html",
+]
+
+[[sources]]
+id = "farmers_daily"
+name = "农民日报/中国农网"
+enabled = true
+domains = ["farmer.com.cn"]
+latest_pages = [
+  "https://www.farmer.com.cn/",
+  "https://szb.farmer.com.cn/",
+]
+
+[[sources]]
+id = "workers_daily"
+name = "工人日报/中工网"
+enabled = true
+domains = ["workercn.cn"]
+latest_pages = ["https://www.workercn.cn/"]
+
+[[sources]]
+id = "stdaily"
+name = "科技日报/中国科技网"
+enabled = true
+domains = ["stdaily.com"]
+latest_pages = [
+  "https://www.stdaily.com/",
+  "https://www.stdaily.com/kjrb/index.html",
+]
+
+[[sources]]
+id = "education_daily"
+name = "中国教育报/中国教育新闻网"
+enabled = true
+domains = ["jyb.cn"]
+latest_pages = ["http://www.jyb.cn/"]
+
+[[sources]]
+id = "cssn"
+name = "中国社会科学网"
+enabled = true
+domains = ["cssn.cn"]
+latest_pages = ["https://www.cssn.cn/"]
+
+[[sources]]
+id = "people_forum"
+name = "人民论坛网"
+enabled = true
+domains = ["rmlt.com.cn"]
+latest_pages = ["https://www.rmlt.com.cn/"]
+
+[[sources]]
+id = "women_daily"
+name = "中国妇女报/中国妇女网"
+enabled = true
+domains = ["cnwomen.com.cn"]
+latest_pages = ["https://www.cnwomen.com.cn/"]
+
+[[sources]]
+id = "cnr"
+name = "中央广播电视总台央广网"
+enabled = true
+domains = ["cnr.cn"]
+latest_pages = [
+  "https://www.cnr.cn/",
+  "https://www.cnr.cn/hubei/",
+]
+
+[[sources]]
+id = "china_org"
+name = "中国网"
+enabled = true
+domains = ["china.com.cn"]
+latest_pages = ["http://www.china.com.cn/"]
+
+[[sources]]
+id = "chinanews"
+name = "中国新闻网"
+enabled = true
+domains = ["chinanews.com.cn"]
+latest_pages = [
+  "https://www.chinanews.com.cn/",
+  "https://www.hb.chinanews.com.cn/",
+]
+
+[[sources]]
+id = "dangjian"
+name = "党建网"
+enabled = true
+domains = ["dangjian.cn"]
+latest_pages = ["http://www.dangjian.cn/"]
+
+[[sources]]
+id = "12371"
+name = "共产党员网"
+enabled = true
+domains = ["12371.cn"]
+latest_pages = ["https://www.12371.cn/"]
+
+[[sources]]
+id = "cppcc_daily"
+name = "人民政协报/人民政协网"
+enabled = true
+domains = ["rmzxw.com.cn"]
+latest_pages = ["http://www.rmzxw.com.cn/"]
+
+[[sources]]
+id = "environment_daily"
+name = "中国环境报/中国环境网"
+enabled = true
+domains = ["cenews.com.cn"]
+latest_pages = ["http://www.cenews.com.cn/"]
+
+[[sources]]
+id = "ccdi"
+name = "中央纪委国家监委网站"
+enabled = true
+domains = ["ccdi.gov.cn"]
+latest_pages = [
+  "https://www.ccdi.gov.cn/",
+  "https://www.ccdi.gov.cn/pln/",
+]
+
+[[sources]]
+id = "hubei_gov"
+name = "湖北省人力资源和社会保障厅"
+enabled = true
+domains = ["hubei.gov.cn"]
+latest_pages = ["https://rst.hubei.gov.cn/"]
+
+[[sources]]
+id = "hubei_daily"
+name = "湖北日报/荆楚网"
+enabled = true
+domains = ["cnhubei.com", "hubeidaily.net"]
+latest_pages = [
+  "http://www.cnhubei.com/",
+  "https://www.hubeidaily.net/",
+]
+
+[[sources]]
+id = "hubei_tv"
+name = "湖北广播电视台/长江云新闻"
+enabled = true
+domains = ["hbtv.com.cn", "hbgbdst.com"]
+latest_pages = ["https://news.hbtv.com.cn/"]
+
+[[sources]]
+id = "wuhan_gov"
+name = "武汉市人民政府"
+enabled = true
+domains = ["wuhan.gov.cn"]
+latest_pages = ["https://www.wuhan.gov.cn/"]
+
+[[sources]]
+id = "changjiang_daily"
+name = "长江日报/长江网"
+enabled = true
+domains = ["cjn.cn"]
+latest_pages = ["http://www.cjn.cn/"]
+
+[[sources]]
+id = "hubei_ccdi"
+name = "湖北省纪委监委"
+enabled = true
+domains = ["hbjwjc.gov.cn"]
+latest_pages = ["https://www.hbjwjc.gov.cn/"]

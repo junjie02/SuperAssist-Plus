@@ -6,7 +6,7 @@ from superassist.config import Settings
 from superassist.tools import default_tools
 from superassist.tools.files import delete_path, list_files, read_file, write_file
 from superassist.tools.shell import shell
-from superassist.tools.web import web_fetch, web_search
+from superassist.tools.web import official_media_web_scope, web_fetch, web_search
 from superassist.tools import web as web_module
 
 
@@ -111,6 +111,31 @@ def test_web_search_falls_back_to_html_results(monkeypatch) -> None:
 
     assert "HTML Result" in result
     assert "https://example.org" in result
+
+
+def test_official_media_scope_filters_search_and_blocks_fetch(monkeypatch) -> None:
+    body = """
+    <a rel="nofollow" href="https://www.gov.cn/policy" class='result-link'>Official Result</a>
+    <td class='result-snippet'>Official.</td>
+    <a rel="nofollow" href="https://example.com/repost" class='result-link'>Repost</a>
+    <td class='result-snippet'>Unofficial.</td>
+    """
+    requested: list[str] = []
+
+    def fetch(url):
+        requested.append(url)
+        return body, "text/html"
+
+    monkeypatch.setattr(web_module, "_fetch_url", fetch)
+
+    with official_media_web_scope(["gov.cn"]):
+        result = web_search.invoke({"query": "2026-08-01", "max_results": 5})
+        blocked = web_fetch.invoke({"url": "https://example.com/repost"})
+
+    assert "Official Result" in result
+    assert "example.com" not in result
+    assert "site%3Agov.cn" in requested[0]
+    assert "outside the configured official-media" in blocked
 
 
 def test_tool_lookup_by_name() -> None:

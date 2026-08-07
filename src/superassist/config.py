@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     max_tool_calls: int = Field(default=8, alias="SUPERASSIST_MAX_TOOL_CALLS")
     enable_tools: bool = Field(default=False, alias="SUPERASSIST_ENABLE_TOOLS")
     subagents_enabled: bool = Field(default=True, alias="SUPERASSIST_SUBAGENTS_ENABLED")
+    agent_teams_enabled: bool = Field(default=True, alias="SUPERASSIST_AGENT_TEAMS_ENABLED")
     subagent_max_concurrent: int = Field(default=3, alias="SUPERASSIST_SUBAGENT_MAX_CONCURRENT")
     subagent_timeout_seconds: int = Field(default=900, alias="SUPERASSIST_SUBAGENT_TIMEOUT_SECONDS")
     subagent_max_turns: int = Field(default=20, alias="SUPERASSIST_SUBAGENT_MAX_TURNS")
@@ -123,6 +124,65 @@ class Settings(BaseSettings):
         ge=1,
         alias="SUPERASSIST_FEISHU_IMAGE_CONTEXT_TTL_SECONDS",
     )
+    daily_brief_enabled: bool = Field(default=False, alias="SUPERASSIST_DAILY_BRIEF_ENABLED")
+    daily_brief_times: str = Field(default="07:45,19:45", alias="SUPERASSIST_DAILY_BRIEF_TIMES")
+    daily_brief_timezone: str = Field(default="Asia/Shanghai", alias="SUPERASSIST_DAILY_BRIEF_TIMEZONE")
+    daily_brief_feishu_chat_ids: str = Field(
+        default="",
+        alias="SUPERASSIST_DAILY_BRIEF_FEISHU_CHAT_IDS",
+    )
+    daily_brief_source_file: Path = Field(
+        default=Path("config/official_media.toml"),
+        alias="SUPERASSIST_DAILY_BRIEF_SOURCE_FILE",
+    )
+    daily_brief_prompt_file: Path = Field(
+        default=Path("prompts/shenlun_daily_brief.md"),
+        alias="SUPERASSIST_DAILY_BRIEF_PROMPT_FILE",
+    )
+    daily_brief_lookback_hours: int = Field(
+        default=24,
+        ge=1,
+        le=168,
+        alias="SUPERASSIST_DAILY_BRIEF_LOOKBACK_HOURS",
+    )
+    daily_brief_catch_up_minutes: int = Field(
+        default=10,
+        ge=0,
+        le=180,
+        alias="SUPERASSIST_DAILY_BRIEF_CATCH_UP_MINUTES",
+    )
+    daily_brief_max_candidates: int = Field(
+        default=80,
+        ge=10,
+        le=300,
+        alias="SUPERASSIST_DAILY_BRIEF_MAX_CANDIDATES",
+    )
+    daily_brief_min_sources: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        alias="SUPERASSIST_DAILY_BRIEF_MIN_SOURCES",
+    )
+    daily_brief_model: str = Field(
+        default="deepseek-v4-flash",
+        alias="SUPERASSIST_DAILY_BRIEF_MODEL",
+    )
+    daily_brief_api_key: str = Field(default="", alias="SUPERASSIST_DAILY_BRIEF_API_KEY")
+    daily_brief_base_url: str = Field(default="", alias="SUPERASSIST_DAILY_BRIEF_BASE_URL")
+    daily_quiz_enabled: bool = Field(default=True, alias="SUPERASSIST_DAILY_QUIZ_ENABLED")
+    daily_quiz_time: str = Field(default="17:00", alias="SUPERASSIST_DAILY_QUIZ_TIME")
+    daily_quiz_question_count: int = Field(
+        default=10,
+        ge=1,
+        le=30,
+        alias="SUPERASSIST_DAILY_QUIZ_QUESTION_COUNT",
+    )
+    daily_quiz_notebook_days: int = Field(
+        default=3,
+        ge=1,
+        le=14,
+        alias="SUPERASSIST_DAILY_QUIZ_NOTEBOOK_DAYS",
+    )
     wecom_bot_id: str = Field(default="", alias="SUPERASSIST_WECOM_BOT_ID")
     wecom_bot_secret: str = Field(default="", alias="SUPERASSIST_WECOM_BOT_SECRET")
     wecom_allowed_user_ids: str = Field(default="", alias="SUPERASSIST_WECOM_ALLOWED_USER_IDS")
@@ -180,6 +240,40 @@ class Settings(BaseSettings):
     @property
     def feishu_thread_store_path(self) -> Path:
         return self.data_dir / "channels" / "feishu_threads.json"
+
+    @property
+    def daily_brief_feishu_chat_id_list(self) -> list[str]:
+        return [item.strip() for item in self.daily_brief_feishu_chat_ids.split(",") if item.strip()]
+
+    @property
+    def resolved_daily_brief_source_file(self) -> Path:
+        path = self.daily_brief_source_file
+        return path if path.is_absolute() else PROJECT_ROOT / path
+
+    @property
+    def resolved_daily_brief_prompt_file(self) -> Path:
+        path = self.daily_brief_prompt_file
+        return path if path.is_absolute() else PROJECT_ROOT / path
+
+    @property
+    def daily_brief_state_path(self) -> Path:
+        return self.data_dir / "channels" / "daily_brief_state.json"
+
+    @property
+    def daily_quiz_data_dir(self) -> Path:
+        return self.data_dir / "study" / "shenlun"
+
+    @property
+    def daily_quiz_scheduler_state_path(self) -> Path:
+        return self.daily_quiz_data_dir / "scheduler_state.json"
+
+    @property
+    def resolved_daily_brief_api_key(self) -> str:
+        return self.daily_brief_api_key or self.memory_api_key or self.api_key
+
+    @property
+    def resolved_daily_brief_base_url(self) -> str:
+        return self.daily_brief_base_url or self.memory_base_url or self.base_url
 
     @property
     def wecom_allowed_user_id_set(self) -> set[str]:

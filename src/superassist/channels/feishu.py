@@ -10,8 +10,9 @@ import re
 import signal
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -21,12 +22,24 @@ from dotenv import load_dotenv
 from PIL import Image
 
 from superassist.agent import AgentRuntime
+from superassist.agent.short_memory import append_jsonl
 from superassist.config import PROJECT_ROOT, REASONING_EFFORTS, Settings, get_settings
 from superassist.llm import is_gpt_5_6_model
 from superassist.memory.embedding import get_embedder
 from superassist.models import AgentRunEvent
 from superassist.tools.images import MAX_ORIGINAL_BYTES, download_image_url
 
+from .daily_brief import (
+    DailyBriefProgress,
+    DailyBriefProgressReporter,
+    DailyBriefRunResult,
+    DailyBriefScheduler,
+)
+from .daily_quiz import (
+    DailyQuizScheduler,
+    DailyQuizStore,
+    get_daily_quiz_store,
+)
 from .store import FeishuThreadStore
 
 logger = logging.getLogger(__name__)
@@ -102,6 +115,11 @@ class FeishuChannel:
         runtime_factory: Callable[..., AgentRuntime] | None = None,
         store: FeishuThreadStore | None = None,
         monotonic_clock: Callable[[], float] = time.monotonic,
+        daily_brief_trigger: (
+            Callable[[str, DailyBriefProgressReporter | None], Awaitable[DailyBriefRunResult]] | None
+        ) = None,
+        daily_quiz_trigger: Callable[[str], Awaitable[str]] | None = None,
+        daily_quiz_store: DailyQuizStore | None = None,
     ) -> None:
         self.settings = settings
         self.store = store or FeishuThreadStore(settings.feishu_thread_store_path)
@@ -110,6 +128,9 @@ class FeishuChannel:
         self.mention_only = settings.feishu_mention_only
         self.active_session_seconds = settings.feishu_active_session_seconds
         self._monotonic_clock = monotonic_clock
+        self.daily_brief_trigger = daily_brief_trigger
+        self.daily_quiz_trigger = daily_quiz_trigger
+        self.daily_quiz_store = daily_quiz_store or get_daily_quiz_store(settings)
         self._active_group_until: dict[str, float] = {}
         self._main_loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -216,6 +237,49 @@ class FeishuChannel:
         )
         if not accepted:
             return
+        if re.fullmatch(r"/brief(?:\s+now)?", clean_text, flags=re.IGNORECASE):
+            if self.daily_brief_trigger is None:
+                await self._send_or_patch(inbound, "申论官媒简报功能尚未启用。", final=True)
+                return
+            await self._send_or_patch(inbound, "正在扫描官媒最新内容并生成申论简报，请稍候。", final=False)
+            user_id, conversation_scope = feishu_memory_scope(inbound)
+            self.store.get_or_create_thread_id(
+                chat_id=inbound.chat_id,
+                topic_id=conversation_scope,
+                user_id=user_id,
+            )
+            loop = asyncio.get_running_loop()
+
+            def report_progress(progress: DailyBriefProgress) -> None:
+                loop.call_soon_threadsafe(
+                    self._queue_card_update,
+                    inbound,
+                    format_daily_brief_progress(progress),
+                )
+
+            result = await self.daily_brief_trigger(inbound.chat_id, report_progress)
+            await self._flush_card_updates(inbound.message_id)
+            status_text = {
+                "sent": "申论官媒简报已生成并发送。",
+                "skipped": f"本次简报未执行：{result.message}",
+                "failed": f"本次简报生成失败：{result.message}",
+            }.get(result.status, result.message)
+            await self._send_or_patch(inbound, status_text, final=True)
+            return
+        if clean_text.lower() == "/quiz":
+            if self.daily_quiz_trigger is None or not self.settings.daily_quiz_enabled:
+                await self._send_or_patch(inbound, "政治理论练习功能尚未启用。", final=True)
+                return
+            user_id, conversation_scope = feishu_memory_scope(inbound)
+            self.store.get_or_create_thread_id(
+                chat_id=inbound.chat_id,
+                topic_id=conversation_scope,
+                user_id=user_id,
+            )
+            await self._send_or_patch(inbound, "正在让主 Agent 生成今天的政治理论练习。", final=False)
+            result = await self.daily_quiz_trigger(inbound.chat_id)
+            await self._send_or_patch(inbound, result, final=True)
+            return
         if not clean_text and not inbound.files:
             return
 
@@ -268,6 +332,9 @@ class FeishuChannel:
 
     def _should_accept_message(self, inbound: FeishuInboundMessage) -> bool:
         if inbound.is_private or not self.mention_only:
+            return True
+
+        if self.daily_quiz_store.is_active_reply(inbound.chat_id, inbound.root_id):
             return True
 
         now = self._monotonic_clock()
@@ -419,7 +486,10 @@ class FeishuChannel:
 
         runtime: AgentRuntime | None = None
         try:
-            runtime = self._create_runtime(report, reasoning_effort=reasoning_effort)
+            runtime = self._create_runtime(
+                report,
+                reasoning_effort=reasoning_effort,
+            )
             runtime_kwargs: dict[str, Any] = {"user_id": user_id, "thread_id": thread_id}
             if image_payloads:
                 runtime_kwargs["message_content"] = message_content
@@ -693,13 +763,13 @@ class FeishuChannel:
 
     async def _send_or_patch(
         self, inbound: FeishuInboundMessage, text: str | FeishuCardView, *, final: bool
-    ) -> None:
+    ) -> str | None:
         if isinstance(text, str):
             text = text.strip()
         if (isinstance(text, str) and not text) or (
             isinstance(text, FeishuCardView) and not text.reasoning and not text.answer and not text.images
         ):
-            return
+            return None
         visible_text = text.answer if isinstance(text, FeishuCardView) else text
         if visible_text:
             self._last_card_text[inbound.message_id] = visible_text
@@ -719,6 +789,7 @@ class FeishuChannel:
             self._running_cards.pop(inbound.message_id, None)
             self._last_card_text.pop(inbound.message_id, None)
             self._card_views.pop(inbound.message_id, None)
+        return card_id
 
     async def _reply_card(self, message_id: str, text: str | FeishuCardView) -> str | None:
         if not self._api_client:
@@ -748,6 +819,109 @@ class FeishuChannel:
         response_data = getattr(response, "data", None)
         return getattr(response_data, "message_id", None)
 
+    async def send_proactive_card(self, chat_id: str, text: str) -> str | None:
+        """Send a standalone card for a scheduled or manually triggered task."""
+
+        message_id = await self._create_card(chat_id, text)
+        if message_id:
+            self._remember_proactive_assistant_message(chat_id, text)
+        return message_id
+
+    async def start_daily_quiz(self, chat_id: str, scheduled_for: datetime) -> str:
+        """Ask the main Agent to create the scheduled political-theory question set."""
+
+        entry = self.store.get_latest_chat_entry(chat_id)
+        if entry is None:
+            text = "政治理论练习尚未生成：请先在当前会话与主 Agent 对话一次，以建立会话。"
+            await self._create_card(chat_id, text)
+            return text
+        if not self.daily_quiz_store.has_notebook(chat_id):
+            text = "近三日日报笔记本目前还是空的；至少完成一次定时日报推送后再开始测验。"
+            await self._create_card(chat_id, text)
+            return text
+
+        thread_id = str(entry["thread_id"])
+        prompt = self.daily_quiz_store.build_start_prompt(chat_id, thread_id, scheduled_for)
+        runtime: AgentRuntime | None = None
+        try:
+            effort = self.store.get_reasoning_effort(
+                chat_id=chat_id,
+                topic_id=str(entry.get("topic_id") or "__group__"),
+                default=self.settings.reasoning_effort,
+            )
+            runtime = self._create_runtime(
+                lambda _event: None,
+                reasoning_effort=effort,
+            )
+            result = await asyncio.to_thread(
+                runtime.run,
+                prompt,
+                user_id=str(entry["user_id"]),
+                thread_id=thread_id,
+                memory_query="开始近三日日报政治理论选择题测验",
+                suppress_memory_write=True,
+                suppress_short_memory_write=True,
+            )
+            runtime.memory_queue.flush()
+            if result.metadata.get("model_error"):
+                raise RuntimeError(result.metadata.get("model_error_message") or result.metadata["model_error"])
+            current = self.daily_quiz_store.current_quiz_text(thread_id)
+            if not current:
+                raise RuntimeError("main Agent did not finalize a complete quiz set")
+            message_id = await self._create_card(chat_id, current)
+            self.daily_quiz_store.set_question_message_id(thread_id, message_id)
+            if message_id:
+                self._remember_quiz_visible_question(thread_id, current)
+            return "政治理论测验已生成并完成检查，请在新卡片中一次提交全部答案。"
+        except Exception as exc:
+            logger.exception("Main Agent failed to start daily quiz chat_suffix=%s", chat_id[-8:])
+            text = f"政治理论测验启动失败：{type(exc).__name__}: {exc}"
+            await self._create_card(chat_id, text)
+            return text
+        finally:
+            close = getattr(runtime, "close", None)
+            if callable(close):
+                close()
+
+    def _remember_proactive_assistant_message(self, chat_id: str, text: str) -> None:
+        entry = self.store.get_latest_chat_entry(chat_id)
+        if entry is None:
+            logger.warning(
+                "Cannot add proactive Feishu message to main-agent history: no thread mapping chat_suffix=%s",
+                chat_id[-8:] if chat_id else "unknown",
+            )
+            return
+        thread_id = str(entry["thread_id"])
+        append_jsonl(
+            self.settings.data_dir / "threads" / thread_id / "messages.jsonl",
+            [
+                {
+                    "role": "assistant",
+                    "content": text,
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "source": "daily_brief",
+                }
+            ],
+        )
+        logger.info(
+            "Added proactive Feishu message to main-agent short memory thread_id=%s chars=%d",
+            thread_id,
+            len(text),
+        )
+
+    def _remember_quiz_visible_question(self, thread_id: str, question: str) -> None:
+        append_jsonl(
+            self.settings.data_dir / "threads" / thread_id / "messages.jsonl",
+            [
+                {
+                    "role": "assistant",
+                    "content": question,
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "source": "daily_quiz",
+                }
+            ],
+        )
+
     async def _update_card(self, message_id: str, text: str | FeishuCardView) -> None:
         if not self._api_client:
             return
@@ -760,7 +934,16 @@ class FeishuChannel:
 class FeishuChannelService:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
-        self.channel = FeishuChannel(self.settings)
+        self.daily_quiz_store = get_daily_quiz_store(self.settings)
+        self.channel = FeishuChannel(self.settings, daily_quiz_store=self.daily_quiz_store)
+        self.daily_brief = DailyBriefScheduler(
+            self.settings,
+            self.channel.send_proactive_card,
+            brief_recorder=self.daily_quiz_store.archive_brief,
+        )
+        self.daily_quiz = DailyQuizScheduler(self.settings, self.channel.start_daily_quiz)
+        self.channel.daily_brief_trigger = self.daily_brief.run_now
+        self.channel.daily_quiz_trigger = self.daily_quiz.run_now
 
     async def run_forever(self) -> None:
         stop_event = asyncio.Event()
@@ -771,9 +954,13 @@ class FeishuChannelService:
             except (NotImplementedError, RuntimeError):
                 pass
         await self.channel.start()
+        await self.daily_brief.start()
+        await self.daily_quiz.start()
         try:
             await stop_event.wait()
         finally:
+            await self.daily_quiz.stop()
+            await self.daily_brief.stop()
             await self.channel.stop()
 
 
@@ -810,6 +997,15 @@ def parse_effort_command(text: str) -> tuple[bool, str | None]:
         return False, None
     value = match.group(1).strip().lower()
     return True, value or None
+
+
+def format_daily_brief_progress(progress: DailyBriefProgress) -> str:
+    percent = max(0, min(100, int(progress.percent)))
+    filled = round(percent / 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    detail = re.sub(r"\s+", " ", progress.detail).strip()[:260]
+    rendered = f"**申论官媒简报**\n\n`{bar}` **{percent}%**\n\n{progress.stage}"
+    return f"{rendered}\n\n{detail}" if detail else rendered
 
 
 def attributed_feishu_text(inbound: FeishuInboundMessage, clean_text: str) -> str:

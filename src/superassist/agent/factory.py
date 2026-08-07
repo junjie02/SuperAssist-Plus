@@ -117,6 +117,10 @@ def build_agent(
         if settings.enable_tools
         else []
     )
+    if settings.enable_tools and settings.daily_quiz_enabled:
+        from superassist.channels.daily_quiz import make_daily_quiz_tool
+
+        tools.append(make_daily_quiz_tool(settings))
     if rag_mode:
         from superassist.tools.web import web_fetch, web_search
 
@@ -209,6 +213,8 @@ def _build_middleware_chain(
 
 
 def _build_team_supervisor(settings: Settings) -> tuple[TeamSupervisor | None, str | None]:
+    if not settings.agent_teams_enabled:
+        return None, None
     try:
         config = AgentTeamConfig.from_file()
     except AgentTeamConfigError as exc:

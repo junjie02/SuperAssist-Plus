@@ -3,6 +3,9 @@ from __future__ import annotations
 import html
 import json
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from urllib.error import URLError
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 from urllib.request import Request, urlopen
@@ -23,6 +26,34 @@ _LITE_RESULT_RE = re.compile(
     r"<td\s+class=[\"']result-snippet[\"'][^>]*>(?P<snippet>.*?)</td>",
     re.DOTALL,
 )
+_OFFICIAL_MEDIA_DOMAINS: ContextVar[tuple[str, ...]] = ContextVar(
+    "superassist_official_media_domains",
+    default=(),
+)
+
+
+@contextmanager
+def official_media_web_scope(domains: list[str] | tuple[str, ...] | set[str]) -> Iterator[None]:
+    """Restrict web tools to official-media domains for the current agent run."""
+
+    normalized = tuple(sorted({_normalize_domain(item) for item in domains if _normalize_domain(item)}))
+    token = _OFFICIAL_MEDIA_DOMAINS.set(normalized)
+    try:
+        yield
+    finally:
+        _OFFICIAL_MEDIA_DOMAINS.reset(token)
+
+
+def is_allowed_official_url(url: str, domains: tuple[str, ...] | list[str] | set[str]) -> bool:
+    host = (urlparse(str(url)).hostname or "").lower().rstrip(".")
+    return any(host == domain or host.endswith(f".{domain}") for domain in domains)
+
+
+def _normalize_domain(value: str) -> str:
+    value = str(value or "").strip().lower().rstrip(".")
+    if "://" in value:
+        value = (urlparse(value).hostname or "").lower().rstrip(".")
+    return value.removeprefix("www.")
 
 
 def _ensure_network_enabled() -> str | None:
@@ -44,7 +75,13 @@ def _fetch_url(url: str, timeout: int = 15) -> tuple[str, str]:
         content_type = response.headers.get("content-type", "")
         raw = response.read(1_000_000)
     charset_match = re.search(r"charset=([\w.-]+)", content_type, re.IGNORECASE)
-    charset = charset_match.group(1) if charset_match else "utf-8"
+    charset = charset_match.group(1) if charset_match else ""
+    if "html" in content_type.lower() or not charset:
+        head = raw[:8192].decode("ascii", errors="ignore")
+        meta_match = re.search(r"charset\s*=\s*[\"']?([\w.-]+)", head, re.IGNORECASE)
+        if meta_match:
+            charset = meta_match.group(1)
+    charset = "gb18030" if charset.lower() in {"gbk", "gb2312", "gb_2312"} else (charset or "utf-8")
     return raw.decode(charset, errors="replace"), content_type
 
 
@@ -98,9 +135,14 @@ def web_search(query: str, max_results: int = 5) -> str:
     if disabled:
         return disabled
     max_results = max(1, min(max_results, 10))
+    official_domains = _OFFICIAL_MEDIA_DOMAINS.get()
+    scoped_query = query
+    if official_domains:
+        site_filter = " OR ".join(f"site:{domain}" for domain in official_domains)
+        scoped_query = f"({query}) ({site_filter})"
     urls = [
-        f"https://lite.duckduckgo.com/lite/?q={quote_plus(query)}",
-        f"https://duckduckgo.com/html/?q={quote_plus(query)}",
+        f"https://lite.duckduckgo.com/lite/?q={quote_plus(scoped_query)}",
+        f"https://duckduckgo.com/html/?q={quote_plus(scoped_query)}",
     ]
     errors: list[str] = []
     for url in urls:
@@ -114,6 +156,8 @@ def web_search(query: str, max_results: int = 5) -> str:
             continue
 
         results = _parse_search_results(body, max_results)
+        if official_domains:
+            results = [item for item in results if is_allowed_official_url(item.get("url", ""), official_domains)]
         if results:
             return json.dumps(results, ensure_ascii=False, indent=2)
     if errors:
@@ -136,6 +180,9 @@ def web_fetch(url: str, max_chars: int = 12000) -> str:
         return disabled
     if not url.lower().startswith(("http://", "https://")):
         return "Error: URL must start with http:// or https://"
+    official_domains = _OFFICIAL_MEDIA_DOMAINS.get()
+    if official_domains and not is_allowed_official_url(url, official_domains):
+        return "Error: URL is outside the configured official-media source list"
     max_chars = max(1000, min(max_chars, 50000))
     try:
         body, content_type = _fetch_url(url)

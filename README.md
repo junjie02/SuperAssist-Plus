@@ -114,6 +114,22 @@ superassist-wecom
 superassist-wecom-rpa
 ```
 
+飞书进程可同时运行申论官媒晨晚报。它先从 `config/official_media.toml` 配置的官媒最新栏目发现当天内容，
+再由独立的日报研究 Agent 使用 deep-research 流程核验和整理；定时与目标群通过 `SUPERASSIST_DAILY_BRIEF_*`
+环境变量配置。默认时间为 `07:45,19:45`、时区为 `Asia/Shanghai`。在飞书当前会话输入
+`/brief` 可立即生成一次预览，预览不会占用正式定时时段或更新增量窗口。
+
+正式推送的日报会写入 `.superassist/study/shenlun/chats/<会话哈希>/日报笔记本.md`，按自然日保留最近
+3 天。主 Agent 默认在每天 `17:00` 基于近几日日报和未掌握错题一次生成 10 道行测政治理论四选一题，
+先把整套草稿交给工具做结构校验，再逐题检查材料依据、唯一答案、干扰项和重复度后确认保存。题目、答案、
+解析和复核记录同时归档到同目录的 `quizzes/`；飞书只发送不含答案的整套题面。用户一次回复完整答案表，
+例如 `1A 2B ... 10D`；主 Agent一次读取整套题、标准答案、材料依据和用户答案，逐题判分并输出全部解析，
+评分工具只保存主 Agent 的判断并据此更新 `错题本.md`，不再由程序比较选项，也不再逐题重复调用主 Agent。
+`/quiz` 仅作为立即出题的测试入口，不再提供 `/quiz status`、`/quiz stop`，也没有独立答题模式。每天定时
+出题后，用户像普通对话一样直接回复整套答案，主 Agent 主动读取已保存的答案和材料并完成批改。测验时间、题数和窗口天数通过
+`SUPERASSIST_DAILY_QUIZ_*` 配置。日报全文、错题状态、标准答案和内部复核提示不写入主线程短期历史；
+短期历史只保留用户看到的整套题面、完整答案表和判分解析。
+
 `superassist-memory-ui` 是仍保留的旧调试入口，不属于当前 React 产品的验证路径；完整界面应通过 Go 的 `http://localhost:8080` 使用。
 
 ## 知识库使用
@@ -141,6 +157,10 @@ Python 配置集中在 `src/superassist/config.py`，示例见 [.env.example](.e
 | `SUPERASSIST_FEISHU_IMAGE_OCR_ENABLED` | `true` | 飞书图片启用本地 RapidOCR 辅助；原图无论 OCR 是否成功都会直接交给主模型 |
 | `SUPERASSIST_FEISHU_IMAGE_OCR_MAX_CHARS` | `12000` | 单条飞书多图 OCR 写入当前轮文本历史的字符上限 |
 | `SUPERASSIST_FEISHU_IMAGE_CONTEXT_TTL_SECONDS` | `180` | 飞书会话原图上下文的滑动 TTL；有效消息会刷新，过期后只复用文本描述 |
+| `SUPERASSIST_DAILY_QUIZ_ENABLED` | `true` | 启用近三日日报政治理论选择题测验 |
+| `SUPERASSIST_DAILY_QUIZ_TIME` | `17:00` | 每天自动生成整套测验的本地时间 |
+| `SUPERASSIST_DAILY_QUIZ_QUESTION_COUNT` | `10` | 每组测验题数 |
+| `SUPERASSIST_DAILY_QUIZ_NOTEBOOK_DAYS` | `3` | 日报笔记本滑动窗口的自然日数 |
 | `SUPERASSIST_API_KEY` | 空 | 为空时使用测试用 fallback 模型 |
 | `SUPERASSIST_BASE_URL` | OpenAI API | OpenAI 兼容接口地址 |
 | `SUPERASSIST_DATA_DIR` | `.superassist` | SQLite、FAISS、RAG、线程等数据根目录 |

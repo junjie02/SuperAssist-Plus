@@ -5,11 +5,16 @@ import io
 import json
 import threading
 import time
+from datetime import datetime
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 from PIL import Image
 
+from superassist.agent.short_memory import read_jsonl
+from superassist.channels.daily_brief import DailyBriefProgress, DailyBriefRunResult
+from superassist.channels.daily_quiz import DailyQuizStore
 from superassist.channels.feishu import (
     FeishuCardImage,
     FeishuCardView,
@@ -24,6 +29,7 @@ from superassist.channels.feishu import (
     clean_mention_text,
     default_image_only_request,
     feishu_memory_scope,
+    format_daily_brief_progress,
     format_model_error,
     format_subagent_card_text,
     image_mime_type,
@@ -325,6 +331,19 @@ def test_thread_store_persists_reasoning_effort(tmp_path) -> None:
     assert reloaded.get_reasoning_effort(chat_id="chat", topic_id="scope", default="medium") == "high"
 
 
+def test_thread_store_returns_latest_entry_for_chat(tmp_path) -> None:
+    store = FeishuThreadStore(tmp_path / "feishu_threads.json")
+    first = store.get_or_create_thread_id(chat_id="chat", topic_id="first", user_id="feishu-group:chat")
+    second = store.get_or_create_thread_id(chat_id="chat", topic_id="second", user_id="feishu-group:chat")
+
+    entry = store.get_latest_chat_entry("chat")
+
+    assert entry is not None
+    assert entry["thread_id"] in {first, second}
+    assert entry["user_id"] == "feishu-group:chat"
+    assert store.get_latest_chat_entry("missing") is None
+
+
 def test_parse_effort_command() -> None:
     assert parse_effort_command("/effort") == (True, None)
     assert parse_effort_command("/EFFORT high") == (True, "high")
@@ -449,6 +468,331 @@ def test_feishu_channel_requires_credentials(tmp_path) -> None:
 
     with pytest.raises(RuntimeError, match="SUPERASSIST_FEISHU_APP_ID"):
         _run(channel.start())
+
+
+def test_feishu_daily_brief_command_runs_preview_for_current_chat(tmp_path) -> None:
+    triggered: list[str] = []
+
+    async def trigger(chat_id, progress_reporter):
+        triggered.append(chat_id)
+        progress_reporter(DailyBriefProgress(55, "正在打开官媒原文核验", "已完成 2/5 次"))
+        return DailyBriefRunResult(status="sent", message="delivered")
+
+    async def go():
+        channel = FeishuChannel(_settings(tmp_path), daily_brief_trigger=trigger)
+        sent: list[str] = []
+
+        async def reply(_message_id, text):
+            sent.append(text)
+            return "card_1"
+
+        async def update(_message_id, text):
+            sent.append(text)
+
+        channel._reply_card = reply
+        channel._update_card = update
+        await channel.handle_inbound(FeishuInboundMessage("chat_1", "msg_1", "ou_1", "/brief", chat_type="p2p"))
+
+        assert triggered == ["chat_1"]
+        assert any("55%" in text and "正在打开官媒原文核验" in text for text in sent)
+        assert sent[-1] == "申论官媒简报已生成并发送。"
+
+    _run(go())
+
+
+def test_feishu_daily_quiz_command_starts_for_current_chat(tmp_path) -> None:
+    triggered: list[str] = []
+
+    async def trigger(chat_id: str) -> str:
+        triggered.append(chat_id)
+        return "政治理论测验已生成并完成检查，请在新卡片中一次提交全部答案。"
+
+    async def go():
+        channel = FeishuChannel(_settings(tmp_path), daily_quiz_trigger=trigger)
+        sent: list[str] = []
+
+        async def reply(_message_id, text):
+            sent.append(text)
+            return "card_1"
+
+        async def update(_message_id, text):
+            sent.append(text)
+
+        channel._reply_card = reply
+        channel._update_card = update
+        await channel.handle_inbound(FeishuInboundMessage("chat_1", "msg_1", "ou_1", "/quiz", chat_type="p2p"))
+
+        assert triggered == ["chat_1"]
+        assert sent[-1] == "政治理论测验已生成并完成检查，请在新卡片中一次提交全部答案。"
+
+    _run(go())
+
+
+def test_feishu_quiz_answer_reaches_main_agent_as_an_ordinary_turn(tmp_path) -> None:
+    settings = _settings(tmp_path, SUPERASSIST_DAILY_QUIZ_QUESTION_COUNT=2)
+    thread_store = FeishuThreadStore(settings.feishu_thread_store_path)
+    thread_id = thread_store.get_or_create_thread_id(
+        chat_id="chat_1",
+        topic_id="__private__",
+        user_id="feishu:ou_1",
+    )
+    quiz_store = DailyQuizStore(settings)
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    quiz_store.archive_brief("chat_1", now, "今日强调提升基层治理效能。")
+    quiz_store.start_session("chat_1", thread_id, now)
+    questions = [
+        {
+            "question": "材料体现的治理要求是？",
+            "option_a": "单一治理",
+            "option_b": "系统治理",
+            "option_c": "被动治理",
+            "option_d": "封闭治理",
+            "correct_option": "B",
+            "explanation": "材料强调系统治理，其他选项均割裂了治理要素。",
+            "source_date": now.date().isoformat(),
+            "source_title": "今日简报",
+            "evidence": "提升基层治理效能",
+        },
+        {
+            "question": "下列对系统治理理解最准确的是？",
+            "option_a": "只处理单一环节",
+            "option_b": "完全依赖临时措施",
+            "option_c": "统筹主体、资源和过程",
+            "option_d": "排除公众参与",
+            "correct_option": "C",
+            "explanation": "系统治理强调多主体和全过程统筹。",
+            "source_date": now.date().isoformat(),
+            "source_title": "今日简报",
+            "evidence": "提升基层治理效能",
+        },
+    ]
+    quiz_store.save_draft(thread_id, questions)
+    quiz_store.finalize(thread_id, "已逐题检查材料依据、唯一答案和干扰项质量。")
+    runtime_controls: list[dict[str, object]] = []
+
+    class Runtime:
+        def __init__(self, _reporter):
+            self.memory_queue = SimpleNamespace(flush=lambda: None)
+
+        def run_streaming(
+            self,
+            message,
+            *,
+            user_id,
+            thread_id,
+            memory_query=None,
+            suppress_memory_write=False,
+            suppress_short_memory_write=False,
+        ):
+            runtime_controls.append(
+                {
+                    "message": message,
+                    "user_id": user_id,
+                    "thread_id": thread_id,
+                    "memory_query": memory_query,
+                    "suppress_memory_write": suppress_memory_write,
+                    "suppress_short_memory_write": suppress_short_memory_write,
+                }
+            )
+            assert message == "1B 2C"
+            assert "DailyPoliticalQuizGrading" not in message
+            grading_context = quiz_store.build_grading_prompt(thread_id, ["B", "C"])
+            assert "<DailyPoliticalQuizGrading>" in grading_context
+            saved = quiz_store.save_grading(
+                thread_id,
+                [
+                    {
+                        "number": 1,
+                        "is_correct": True,
+                        "feedback": "材料强调系统治理，B 项符合题意。",
+                        "weakness": "",
+                    },
+                    {
+                        "number": 2,
+                        "is_correct": True,
+                        "feedback": "系统治理要求统筹主体、资源和过程，C 项正确。",
+                        "weakness": "",
+                    },
+                ],
+                "两题均由主 Agent 判定正确，系统治理知识掌握较好。",
+            )
+            assert "Agent grading saved. Score: 2/2" in saved
+            return AgentRunResult(
+                thread_id=thread_id,
+                answer="主 Agent 批改报告：2/2。第 1 题正确；第 2 题正确。",
+                metadata={},
+            )
+
+    async def go():
+        channel = FeishuChannel(
+            settings,
+            store=thread_store,
+            daily_quiz_store=quiz_store,
+            runtime_factory=lambda reporter: Runtime(reporter),
+        )
+        visible: list[str] = []
+
+        async def reply(_message_id, text):
+            visible.append(text)
+            return "card_2"
+
+        async def update(_message_id, text):
+            visible.append(text)
+
+        channel._reply_card = reply
+        channel._update_card = update
+        await channel.handle_inbound(FeishuInboundMessage("chat_1", "msg_2", "ou_1", "1B 2C", chat_type="p2p"))
+
+        assert visible[-1] == "主 Agent 批改报告：2/2。第 1 题正确；第 2 题正确。"
+        assert quiz_store.active_session(thread_id) is None
+        assert runtime_controls[0]["user_id"] == "feishu:ou_1"
+        assert runtime_controls[0]["thread_id"] == thread_id
+        assert runtime_controls[0]["memory_query"] is None
+        assert runtime_controls[0]["suppress_memory_write"] is False
+        assert runtime_controls[0]["suppress_short_memory_write"] is False
+
+    _run(go())
+
+
+def test_scheduled_quiz_reuses_main_thread_but_persists_only_visible_question(tmp_path) -> None:
+    settings = _settings(tmp_path, SUPERASSIST_DAILY_QUIZ_QUESTION_COUNT=2)
+    thread_store = FeishuThreadStore(settings.feishu_thread_store_path)
+    thread_id = thread_store.get_or_create_thread_id(
+        chat_id="chat_1",
+        topic_id="__group__",
+        user_id="feishu-group:chat_1",
+    )
+    quiz_store = DailyQuizStore(settings)
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    quiz_store.archive_brief("chat_1", now, "日报内部全文：湖北推进基层治理创新。")
+    runtime_controls: list[dict[str, object]] = []
+
+    class Runtime:
+        def __init__(self, _reporter):
+            self.memory_queue = SimpleNamespace(flush=lambda: None)
+
+        def run(
+            self,
+            message,
+            *,
+            user_id,
+            thread_id,
+            memory_query=None,
+            suppress_memory_write=False,
+            suppress_short_memory_write=False,
+        ):
+            runtime_controls.append(
+                {
+                    "message": message,
+                    "user_id": user_id,
+                    "thread_id": thread_id,
+                    "memory_query": memory_query,
+                    "suppress_memory_write": suppress_memory_write,
+                    "suppress_short_memory_write": suppress_short_memory_write,
+                }
+            )
+            quiz_store.save_draft(
+                thread_id,
+                [
+                    {
+                        "question": "材料体现了哪一种治理理念？",
+                        "option_a": "系统治理",
+                        "option_b": "封闭治理",
+                        "option_c": "单一治理",
+                        "option_d": "被动治理",
+                        "correct_option": "A",
+                        "explanation": "材料体现系统治理，其他选项均与协同要求相悖。",
+                        "source_date": now.date().isoformat(),
+                        "source_title": "今日简报",
+                        "evidence": "推进基层治理创新",
+                    },
+                    {
+                        "question": "基层治理创新应坚持什么方法？",
+                        "option_a": "单一主体包办",
+                        "option_b": "多元协同参与",
+                        "option_c": "只看短期指标",
+                        "option_d": "排除群众参与",
+                        "correct_option": "B",
+                        "explanation": "基层治理创新需要多元协同，其他选项都削弱治理合力。",
+                        "source_date": now.date().isoformat(),
+                        "source_title": "今日简报",
+                        "evidence": "推进基层治理创新",
+                    },
+                ],
+            )
+            quiz_store.finalize(thread_id, "已检查两题的材料依据、唯一答案、差异性和选项质量。")
+            return AgentRunResult(thread_id=thread_id, answer="内部状态已保存。", metadata={})
+
+    async def go():
+        channel = FeishuChannel(
+            settings,
+            store=thread_store,
+            daily_quiz_store=quiz_store,
+            runtime_factory=lambda reporter: Runtime(reporter),
+        )
+        cards: list[str] = []
+
+        async def create(_chat_id, text):
+            cards.append(text)
+            return "quiz_card_1"
+
+        channel._create_card = create
+        result = await channel.start_daily_quiz("chat_1", now)
+
+        assert result == "政治理论测验已生成并完成检查，请在新卡片中一次提交全部答案。"
+        assert "材料体现了哪一种治理理念" in cards[-1]
+        assert "基层治理创新应坚持什么方法" in cards[-1]
+        assert runtime_controls[0]["thread_id"] == thread_id
+        assert runtime_controls[0]["user_id"] == "feishu-group:chat_1"
+        assert runtime_controls[0]["memory_query"] == "开始近三日日报政治理论选择题测验"
+        assert runtime_controls[0]["suppress_memory_write"] is True
+        assert runtime_controls[0]["suppress_short_memory_write"] is True
+        assert "日报内部全文" in str(runtime_controls[0]["message"])
+
+        records = read_jsonl(settings.data_dir / "threads" / thread_id / "messages.jsonl")
+        assert [record["role"] for record in records] == ["assistant"]
+        assert "材料体现了哪一种治理理念" in records[0]["content"]
+        assert records[0]["source"] == "daily_quiz"
+        assert "日报内部全文" not in str(records)
+        assert "correct_option" not in str(records)
+        assert "内部状态已保存" not in str(records)
+
+    _run(go())
+
+
+def test_format_daily_brief_progress_replaces_bar_and_bounds_detail() -> None:
+    rendered = format_daily_brief_progress(DailyBriefProgress(68, "正在核验", "原文  读取中"))
+
+    assert "70%" not in rendered
+    assert "68%" in rendered
+    assert "███████░░░" in rendered
+    assert "原文 读取中" in rendered
+
+
+def test_feishu_proactive_brief_is_added_to_main_short_memory_without_user_turn(tmp_path) -> None:
+    async def go():
+        settings = _settings(tmp_path)
+        store = FeishuThreadStore(settings.feishu_thread_store_path)
+        thread_id = store.get_or_create_thread_id(
+            chat_id="chat_1",
+            topic_id="__group__",
+            user_id="feishu-group:chat_1",
+        )
+        channel = FeishuChannel(settings, store=store)
+
+        async def create(_chat_id, _text):
+            return "message_1"
+
+        channel._create_card = create
+
+        assert await channel.send_proactive_card("chat_1", "申论官媒晚报") == "message_1"
+        records = read_jsonl(settings.data_dir / "threads" / thread_id / "messages.jsonl")
+        assert len(records) == 1
+        assert records[0]["role"] == "assistant"
+        assert records[0]["content"] == "申论官媒晚报"
+        assert records[0]["source"] == "daily_brief"
+
+    _run(go())
 
 
 def test_feishu_channel_uses_one_runtime_per_message(tmp_path) -> None:

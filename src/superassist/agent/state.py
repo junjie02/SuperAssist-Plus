@@ -19,6 +19,9 @@ class SuperAssistState(AgentState):
     user_id: str
     thread_id: str
     input: str
+    memory_query: NotRequired[str]
+    suppress_memory_write: NotRequired[bool]
+    suppress_short_memory_write: NotRequired[bool]
     message_created_at: NotRequired[str]
     assistant_message_created_at: NotRequired[str]
     memory_event_id: NotRequired[str]

@@ -21,6 +21,7 @@ from superassist.llm import FallbackChatModel, MiniMaxCompatibleChatModel, creat
 from superassist.memory.service import project_memory_recall, project_memory_write_context
 from superassist.middlewares import (
     DynamicContextMiddleware,
+    MemoryRecallMiddleware,
     MemoryWriterMiddleware,
     ToolEventMiddleware,
 )
@@ -418,6 +419,30 @@ def test_runtime_runs_in_fallback_mode(tmp_path) -> None:
     assert (tmp_path / "threads" / "t" / "messages.jsonl").exists()
 
 
+def test_runtime_quiz_turn_recalls_context_without_short_or_long_memory_writes(tmp_path) -> None:
+    settings = Settings(
+        SUPERASSIST_DATA_DIR=tmp_path,
+        SUPERASSIST_API_KEY="",
+        SUPERASSIST_MEMORY_DEBOUNCE_SECONDS=0.01,
+        SUPERASSIST_EMBEDDING_PROVIDER="hash",
+    )
+    runtime = AgentRuntime(settings)
+
+    result = runtime.run(
+        "<DailyPoliticalQuiz>private notebook and answer</DailyPoliticalQuiz>",
+        user_id="u",
+        thread_id="quiz-thread",
+        memory_query="政治理论测验作答 B",
+        suppress_memory_write=True,
+        suppress_short_memory_write=True,
+    )
+    runtime.memory_queue.flush()
+
+    assert result.thread_id == "quiz-thread"
+    assert not (tmp_path / "threads" / "quiz-thread" / "messages.jsonl").exists()
+    assert runtime.memory.store.list_nodes("u") == []
+
+
 def test_runtime_loads_thread_history_on_followup(tmp_path) -> None:
     settings = Settings(
         SUPERASSIST_DATA_DIR=tmp_path,
@@ -528,9 +553,19 @@ def test_runtime_current_user_message_has_stable_timestamp_and_raw_input(tmp_pat
     )
     runtime = AgentRuntime(settings)
 
-    state = runtime._initial_state("raw question", user_id="u", thread_id="t")
+    state = runtime._initial_state(
+        "raw question",
+        user_id="u",
+        thread_id="t",
+        memory_query="safe recall query",
+        suppress_memory_write=True,
+        suppress_short_memory_write=True,
+    )
 
     assert state["input"] == "raw question"
+    assert state["memory_query"] == "safe recall query"
+    assert state["suppress_memory_write"] is True
+    assert state["suppress_short_memory_write"] is True
     assert state["messages"][-1].content == (
         f"raw question\n\n[系统时间: {state['message_created_at']}]"
     )
@@ -817,6 +852,86 @@ def test_memory_writer_queue_receives_only_compact_tool_completion_fields() -> N
     assert queue.payload.tool_events == [
         {"name": "web_fetch", "status": "error", "error_summary": "provider failed"}
     ]
+
+
+def test_memory_recall_can_read_without_reserving_a_writer_event() -> None:
+    calls: list[tuple[str, str, str]] = []
+
+    class Memory:
+        def prepare_turn_contexts(self, user_id, thread_id, message):
+            calls.append((user_id, thread_id, message))
+            return type(
+                "Contexts",
+                (),
+                {
+                    "event_id": "event_should_not_be_used",
+                    "read_recall": MemoryRecall(),
+                    "write_recall": MemoryRecall(),
+                },
+            )()
+
+    result = MemoryRecallMiddleware(Memory()).before_agent(
+        {
+            "user_id": "u",
+            "thread_id": "t",
+            "input": "large private quiz context",
+            "memory_query": "visible quiz question and choice B",
+            "suppress_memory_write": True,
+            "messages": [],
+        },
+        runtime=None,
+    )
+
+    assert calls == [("u", "t", "visible quiz question and choice B")]
+    assert result["memory_event_id"] == ""
+    assert result["memory_recall"] == {"immediate": [], "working": [], "background": [], "buffer": []}
+
+
+def test_memory_writer_hard_suppression_skips_fallback_writer() -> None:
+    class Queue:
+        def __init__(self) -> None:
+            self.payload = None
+
+        def add(self, payload) -> None:
+            self.payload = payload
+
+    queue = Queue()
+    result = MemoryWriterMiddleware(queue).after_agent(
+        {
+            "user_id": "u",
+            "thread_id": "t",
+            "memory_event_id": "event_1",
+            "suppress_memory_write": True,
+            "input": "private quiz prompt",
+            "messages": [AIMessage(content="finished")],
+        },
+        runtime=None,
+    )
+
+    assert result is None
+    assert queue.payload is None
+
+
+def test_short_memory_hard_suppression_does_not_write_internal_prompt(tmp_path) -> None:
+    from superassist.middlewares.short_memory_middleware import ShortMemoryMiddleware
+
+    settings = Settings(
+        SUPERASSIST_DATA_DIR=tmp_path,
+        SUPERASSIST_API_KEY="",
+        SUPERASSIST_EMBEDDING_PROVIDER="hash",
+    )
+    state = {
+        "user_id": "u",
+        "thread_id": "t",
+        "input": "<DailyPoliticalQuiz>private answer</DailyPoliticalQuiz>",
+        "suppress_short_memory_write": True,
+        "messages": [AIMessage(content="visible")],
+    }
+
+    result = ShortMemoryMiddleware(settings).after_agent(state, runtime=None)
+
+    assert result is None
+    assert not (tmp_path / "threads" / "t" / "messages.jsonl").exists()
 
 
 def test_runtime_persists_only_unexpired_skill_activations(tmp_path) -> None:

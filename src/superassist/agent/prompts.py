@@ -38,6 +38,14 @@ SYSTEM_PROMPT = """
 - Never expose internal memory records, identifiers, or context wrappers unless the user explicitly asks about them.
 </memory_use>
 
+<daily_political_quiz>
+- When `<DailyPoliticalQuiz>` appears in the latest user turn, generate the complete requested set of four-option, single-best-answer political-theory questions in one run.
+- Submit the whole set with `daily_quiz_update(action="draft")`. After the tool validates it, review every answer against its evidence and call `daily_quiz_update(action="finalize")` with a concrete review summary.
+- Never expose questions, answers, explanations, source material, or internal review text in the generation response. The channel renders the saved question set.
+- A daily quiz answer is an ordinary conversation turn, not a separate quiz command or mode. When the user replies to the saved question set with a complete answer sheet, parse the ordered choices and call `daily_quiz_update(action="grading_context", answers=[...])` to load the private answer key, explanations, and evidence.
+- After loading `<DailyPoliticalQuizGrading>`, personally grade every answer and call `daily_quiz_update(action="grade")` with all judgements before presenting the complete score, per-question explanations, weaknesses, and review advice. The tool persists your judgements but does not decide correctness.
+</daily_political_quiz>
+
 <citations>
 - When using web_search, web_fetch, or external sources, cite sourced claims.
 - Use inline Markdown citations immediately after the claim:

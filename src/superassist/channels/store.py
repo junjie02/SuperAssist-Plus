@@ -45,7 +45,23 @@ class FeishuThreadStore:
             return thread_id
 
     def list_entries(self) -> list[dict[str, Any]]:
-        return [{**entry, "key": key} for key, entry in self._data.items()]
+        with self._lock:
+            return [{**entry, "key": key} for key, entry in self._data.items()]
+
+    def get_latest_chat_entry(self, chat_id: str) -> dict[str, Any] | None:
+        """Return the most recently used main-agent thread for a Feishu chat."""
+
+        with self._lock:
+            matches = [
+                {**entry, "key": key}
+                for key, entry in self._data.items()
+                if entry.get("chat_id") == chat_id
+                and isinstance(entry.get("thread_id"), str)
+                and isinstance(entry.get("user_id"), str)
+            ]
+        if not matches:
+            return None
+        return max(matches, key=lambda item: float(item.get("updated_at") or 0.0))
 
     def get_reasoning_effort(self, *, chat_id: str, topic_id: str, default: str) -> str:
         key = self._key(chat_id, topic_id)

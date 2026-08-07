@@ -30,6 +30,8 @@ class MemoryWriterMiddleware(AgentMiddleware[SuperAssistState]):
         self._queue = queue
 
     def after_agent(self, state: SuperAssistState, runtime: Runtime) -> dict[str, Any] | None:
+        if state.get("suppress_memory_write"):
+            return None
         event_id = str(state.get("memory_event_id") or "")
         if not event_id:
             return None

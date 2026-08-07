@@ -108,12 +108,44 @@ class AgentRuntime:
 
     # -- Sync turn ---------------------------------------------------------
 
-    def run(self, message: str, *, user_id: str = "local-user", thread_id: str | None = None) -> AgentRunResult:
-        return self._run_traced(message, user_id=user_id, thread_id=thread_id)
+    def run(
+        self,
+        message: str,
+        *,
+        user_id: str = "local-user",
+        thread_id: str | None = None,
+        memory_query: str | None = None,
+        suppress_memory_write: bool = False,
+        suppress_short_memory_write: bool = False,
+    ) -> AgentRunResult:
+        return self._run_traced(
+            message,
+            user_id=user_id,
+            thread_id=thread_id,
+            memory_query=memory_query,
+            suppress_memory_write=suppress_memory_write,
+            suppress_short_memory_write=suppress_short_memory_write,
+        )
 
     @traceable(name="superassist.turn", run_type="chain", process_inputs=without_self)
-    def _run_traced(self, message: str, *, user_id: str, thread_id: str | None) -> AgentRunResult:
-        state = self._initial_state(message, user_id=user_id, thread_id=thread_id)
+    def _run_traced(
+        self,
+        message: str,
+        *,
+        user_id: str,
+        thread_id: str | None,
+        memory_query: str | None,
+        suppress_memory_write: bool,
+        suppress_short_memory_write: bool,
+    ) -> AgentRunResult:
+        state = self._initial_state(
+            message,
+            user_id=user_id,
+            thread_id=thread_id,
+            memory_query=memory_query,
+            suppress_memory_write=suppress_memory_write,
+            suppress_short_memory_write=suppress_short_memory_write,
+        )
         with run_event_reporter_context(self._run_event_reporter):
             self._report_run_event("preparing_context", "Preparing context...", thread_id=state["thread_id"])
             try:
@@ -147,12 +179,18 @@ class AgentRuntime:
         user_id: str = "local-user",
         thread_id: str | None = None,
         message_content: str | list[dict[str, Any]] | None = None,
+        memory_query: str | None = None,
+        suppress_memory_write: bool = False,
+        suppress_short_memory_write: bool = False,
     ) -> AgentRunResult:
         return self._run_streaming_traced(
             message,
             user_id=user_id,
             thread_id=thread_id,
             message_content=message_content,
+            memory_query=memory_query,
+            suppress_memory_write=suppress_memory_write,
+            suppress_short_memory_write=suppress_short_memory_write,
         )
 
     @traceable(name="superassist.turn.streaming", run_type="chain", process_inputs=without_self)
@@ -163,12 +201,18 @@ class AgentRuntime:
         user_id: str,
         thread_id: str | None,
         message_content: str | list[dict[str, Any]] | None = None,
+        memory_query: str | None = None,
+        suppress_memory_write: bool = False,
+        suppress_short_memory_write: bool = False,
     ) -> AgentRunResult:
         state = self._initial_state(
             message,
             user_id=user_id,
             thread_id=thread_id,
             message_content=message_content,
+            memory_query=memory_query,
+            suppress_memory_write=suppress_memory_write,
+            suppress_short_memory_write=suppress_short_memory_write,
         )
         with run_event_reporter_context(self._run_event_reporter):
             self._report_run_event("preparing_context", "Preparing context...", thread_id=state["thread_id"])
@@ -252,6 +296,9 @@ class AgentRuntime:
         user_id: str,
         thread_id: str | None,
         message_content: str | list[dict[str, Any]] | None = None,
+        memory_query: str | None = None,
+        suppress_memory_write: bool = False,
+        suppress_short_memory_write: bool = False,
     ) -> SuperAssistState:
         resolved_thread_id = thread_id or f"thread_{uuid4().hex[:12]}"
         message_created_at = datetime.now(UTC).isoformat()
@@ -282,6 +329,9 @@ class AgentRuntime:
                 HumanMessage(content=timestamp_user_content(current_content, message_created_at)),
             ],
             "input": message,
+            "memory_query": memory_query or message,
+            "suppress_memory_write": suppress_memory_write,
+            "suppress_short_memory_write": suppress_short_memory_write,
             "message_created_at": message_created_at,
             "user_id": user_id,
             "thread_id": resolved_thread_id,
