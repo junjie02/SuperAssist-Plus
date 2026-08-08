@@ -22,6 +22,9 @@ def _update_payload(data: dict) -> dict:
             "allowed_open_ids": data["feishu"]["allowed_open_ids"],
             "mention_only": data["feishu"]["mention_only"],
             "active_session_seconds": data["feishu"]["active_session_seconds"],
+            "activation_debounce_seconds": data["feishu"]["activation_debounce_seconds"],
+            "activation_max_wait_seconds": data["feishu"]["activation_max_wait_seconds"],
+            "max_images_per_activation": data["feishu"]["max_images_per_activation"],
         },
         "wecom": {
             "bot_id": data["wecom"]["bot_id"],

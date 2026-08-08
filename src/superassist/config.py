@@ -30,6 +30,22 @@ class Settings(BaseSettings):
     temperature: float | None = Field(default=None, alias="SUPERASSIST_TEMPERATURE")
     max_tokens: int | None = Field(default=None, alias="SUPERASSIST_MAX_TOKENS")
     reasoning_effort: ReasoningEffort = Field(default="medium", alias="SUPERASSIST_REASONING_EFFORT")
+    use_responses_api: bool = Field(default=True, alias="SUPERASSIST_USE_RESPONSES_API")
+    claude_fallback_model: str = Field(
+        default="claude-opus-5",
+        alias="SUPERASSIST_CLAUDE_FALLBACK_MODEL",
+    )
+    claude_fallback_api_key: str = Field(default="", alias="SUPERASSIST_CLAUDE_FALLBACK_API_KEY")
+    claude_fallback_base_url: str = Field(
+        default="https://code.mmkg.cloud/v1",
+        alias="SUPERASSIST_CLAUDE_FALLBACK_BASE_URL",
+    )
+    deepseek_fallback_model: str = Field(
+        default="deepseek-v4-flash",
+        alias="SUPERASSIST_DEEPSEEK_FALLBACK_MODEL",
+    )
+    deepseek_fallback_api_key: str = Field(default="", alias="SUPERASSIST_DEEPSEEK_FALLBACK_API_KEY")
+    deepseek_fallback_base_url: str = Field(default="", alias="SUPERASSIST_DEEPSEEK_FALLBACK_BASE_URL")
     prompt_cache_explicit_enabled: bool = Field(
         default=True,
         alias="SUPERASSIST_PROMPT_CACHE_EXPLICIT_ENABLED",
@@ -54,6 +70,7 @@ class Settings(BaseSettings):
     subagent_max_concurrent: int = Field(default=3, alias="SUPERASSIST_SUBAGENT_MAX_CONCURRENT")
     subagent_timeout_seconds: int = Field(default=900, alias="SUPERASSIST_SUBAGENT_TIMEOUT_SECONDS")
     subagent_max_turns: int = Field(default=20, alias="SUPERASSIST_SUBAGENT_MAX_TURNS")
+    agents_dir: Path = Field(default=Path("config/agents"), alias="SUPERASSIST_AGENTS_DIR")
     memory_llm_writer_enabled: bool = Field(default=True, alias="SUPERASSIST_MEMORY_LLM_WRITER_ENABLED")
     memory_model: str = Field(default="deepseek-v4-flash", alias="SUPERASSIST_MEMORY_MODEL")
     memory_api_key: str = Field(default="", alias="SUPERASSIST_MEMORY_API_KEY")
@@ -64,10 +81,6 @@ class Settings(BaseSettings):
     short_memory_summary_target_tokens: int = Field(
         default=6000,
         alias="SUPERASSIST_SHORT_MEMORY_SUMMARY_TARGET_TOKENS",
-    )
-    short_memory_enable_tool_events: bool = Field(
-        default=False,
-        alias="SUPERASSIST_SHORT_MEMORY_ENABLE_TOOL_EVENTS",
     )
     skill_active_ttl_seconds: int = Field(
         default=300,
@@ -108,6 +121,24 @@ class Settings(BaseSettings):
     feishu_active_session_seconds: int = Field(
         default=180,
         alias="SUPERASSIST_FEISHU_ACTIVE_SESSION_SECONDS",
+    )
+    feishu_activation_debounce_seconds: float = Field(
+        default=1.5,
+        ge=0,
+        le=30,
+        alias="SUPERASSIST_FEISHU_ACTIVATION_DEBOUNCE_SECONDS",
+    )
+    feishu_activation_max_wait_seconds: float = Field(
+        default=6.0,
+        ge=0.1,
+        le=60,
+        alias="SUPERASSIST_FEISHU_ACTIVATION_MAX_WAIT_SECONDS",
+    )
+    feishu_max_images_per_activation: int = Field(
+        default=12,
+        ge=1,
+        le=100,
+        alias="SUPERASSIST_FEISHU_MAX_IMAGES_PER_ACTIVATION",
     )
     feishu_image_ocr_enabled: bool = Field(
         default=True,
@@ -234,12 +265,21 @@ class Settings(BaseSettings):
         return self.data_dir / "logs" / "model-input.jsonl"
 
     @property
+    def resolved_agents_dir(self) -> Path:
+        path = self.agents_dir
+        return path if path.is_absolute() else PROJECT_ROOT / path
+
+    @property
     def feishu_allowed_open_id_set(self) -> set[str]:
         return {item.strip() for item in self.feishu_allowed_open_ids.split(",") if item.strip()}
 
     @property
     def feishu_thread_store_path(self) -> Path:
         return self.data_dir / "channels" / "feishu_threads.json"
+
+    @property
+    def feishu_message_store_path(self) -> Path:
+        return self.data_dir / "channels" / "feishu_messages.sqlite3"
 
     @property
     def daily_brief_feishu_chat_id_list(self) -> list[str]:

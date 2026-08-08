@@ -146,7 +146,7 @@ The authenticated shell keeps Chat mounted while switching pages so WebSocket an
 
 ### Feishu
 
-[src/superassist/channels/feishu.py](src/superassist/channels/feishu.py) receives Feishu events over WebSocket and sends incremental interactive-card updates. Private chats use `feishu:<open_id>` identities; every member of a group shares `feishu-group:<chat_id>`, a stable group thread, Memory graph, and RAG scope. Messages arriving while the same scope is busy are ignored. Image messages send the original downloaded PNG/JPEG/GIF/WebP bytes without orientation correction, resizing, background flattening, or transcoding; optional untrusted local OCR and the current user request accompany them in one multimodal `HumanMessage`. The latest image set is retained in memory across accepted Feishu messages with a configurable sliding 180-second TTL; follow-ups refresh the TTL and resend full image bytes without rerunning OCR. After expiry, only persisted OCR/text, answers, and `<ImageDescription>` remain. The original multimodal message also remains in every model request during a single Skill/tool loop; GPT-5.6 explicitly disables `use_previous_response_id` so the client cannot omit the earlier image input. Streaming card updates use one coalescing worker per message and must drain before the final patch. Non-image files remain unsupported.
+[src/superassist/channels/feishu.py](src/superassist/channels/feishu.py) receives Feishu events over WebSocket and sends incremental interactive-card updates. Private chats use `feishu:<open_id>` identities; every member of a group shares `feishu-group:<chat_id>`, a stable group thread, Memory graph, and RAG scope. Every visible group message is first inserted idempotently into `channels/feishu_messages.sqlite3`; only an explicit mention activates the Agent. Activation waits for a configurable 1.5-second quiet window (6-second hard limit), then projects every unconsumed message through the high-water mark into one speaker-attributed `FeishuConversationBatch`. Per-scope locks queue concurrent work instead of dropping it. Image bytes are cached in the inbox at ingress, sent in chronological speaker order with optional untrusted OCR, and retained in the existing sliding in-memory context for private follow-ups. GPT-5.6 uses Responses with `use_previous_response_id=False`; configured OpenAI-compatible Claude and DeepSeek routes provide ordered failover. Streaming card updates use one coalescing worker per message and must drain before the final patch. Non-image files remain unsupported.
 
 ### WeCom
 
@@ -169,6 +169,7 @@ rag/<user-hash>/index/default/  LightRAG KV/vector/GraphML stores
 threads/<thread-id>/             messages.jsonl + thread_meta.json
 teams/<thread-id>/ledger.jsonl  audited ACP team communication
 channels/feishu_threads.json    Feishu-to-thread mapping
+channels/feishu_messages.sqlite3 durable Feishu inbox, image payloads, and consumption cursors
 channels/wecom_threads.json     WeCom chat/sender-to-thread and RAG mapping
 channels/wecom_rpa_state.json   desktop RPA visible-message replay guard
 huggingface/                    embedding model cache

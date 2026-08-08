@@ -48,6 +48,7 @@ class MemoryWriterMiddleware(AgentMiddleware[SuperAssistState]):
                 assistant_message_created_at=assistant_created_at,
                 tool_events=compact_tool_events(list(state.get("tool_events") or [])),
                 memory_context=dict(state.get("memory_write_context") or {}),
+                source_context=dict(state.get("memory_source_context") or {}),
             )
         )
         return {"assistant_message_created_at": assistant_created_at}

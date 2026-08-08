@@ -36,7 +36,6 @@ class MemorySettingsPayload(BaseModel):
     short_token_limit: int = Field(ge=100, le=10_000_000)
     short_keep_recent_turns: int = Field(ge=0, le=10000)
     short_summary_target_tokens: int = Field(ge=1, le=1_000_000)
-    short_enable_tool_events: bool
 
     @model_validator(mode="after")
     def validate_related_values(self) -> "MemorySettingsPayload":
@@ -58,6 +57,9 @@ class FeishuSettingsPayload(BaseModel):
     allowed_open_ids: str = Field(max_length=10000)
     mention_only: bool
     active_session_seconds: int = Field(ge=10, le=86400)
+    activation_debounce_seconds: float = Field(ge=0, le=30)
+    activation_max_wait_seconds: float = Field(ge=0.1, le=60)
+    max_images_per_activation: int = Field(ge=1, le=100)
 
     @field_validator("domain")
     @classmethod
@@ -156,10 +158,6 @@ _MEMORY_FIELDS = {
         "short_memory_summary_target_tokens",
         "SUPERASSIST_SHORT_MEMORY_SUMMARY_TARGET_TOKENS",
     ),
-    "short_enable_tool_events": (
-        "short_memory_enable_tool_events",
-        "SUPERASSIST_SHORT_MEMORY_ENABLE_TOOL_EVENTS",
-    ),
 }
 
 _FEISHU_FIELDS = {
@@ -170,6 +168,18 @@ _FEISHU_FIELDS = {
     "active_session_seconds": (
         "feishu_active_session_seconds",
         "SUPERASSIST_FEISHU_ACTIVE_SESSION_SECONDS",
+    ),
+    "activation_debounce_seconds": (
+        "feishu_activation_debounce_seconds",
+        "SUPERASSIST_FEISHU_ACTIVATION_DEBOUNCE_SECONDS",
+    ),
+    "activation_max_wait_seconds": (
+        "feishu_activation_max_wait_seconds",
+        "SUPERASSIST_FEISHU_ACTIVATION_MAX_WAIT_SECONDS",
+    ),
+    "max_images_per_activation": (
+        "feishu_max_images_per_activation",
+        "SUPERASSIST_FEISHU_MAX_IMAGES_PER_ACTIVATION",
     ),
 }
 

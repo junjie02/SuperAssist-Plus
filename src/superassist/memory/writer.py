@@ -1,21 +1,24 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import re
 import threading
 from collections import deque
+from dataclasses import asdict
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
 
-from superassist.memory.plans import UpdatePlan
+from superassist.memory.plans import AddNodeOp, UpdatePlan
 from superassist.memory.prompts import format_memory_writer_prompt
 from superassist.memory.service import MemoryService, MemoryWritePayload
 
 logger = logging.getLogger(__name__)
 
-MEMORY_WRITER_PROMPT = format_memory_writer_prompt(mode="quick")
+MEMORY_WRITER_PROMPT = format_memory_writer_prompt()
 
 
 class MemoryWriter:
@@ -34,6 +37,7 @@ class MemoryWriter:
 
     def write(self, payload: MemoryWritePayload) -> dict[str, int]:
         plan = self._build_plan(payload)
+        _attach_source_context(plan, payload.source_context or {})
         result = self.service.apply_structured_memory(payload, plan)
         result.update(self.service.consolidate(payload.user_id))
         return result
@@ -55,6 +59,7 @@ class MemoryWriter:
                                     "assistant_message_created_at": payload.assistant_message_created_at,
                                     "tool_events": compact_tool_events(payload.tool_events),
                                     "memory_context": _compact_memory_context(payload.memory_context or {}),
+                                    "source_context": payload.source_context or {},
                                 },
                                 ensure_ascii=False,
                                 separators=(",", ":"),
@@ -227,19 +232,46 @@ def _preview(text: str, limit: int) -> str:
     return f"{value[:limit]}..."
 
 
+def _attach_source_context(plan: UpdatePlan, source_context: dict[str, Any]) -> None:
+    if not source_context:
+        return
+    allowed = {
+        "source_batch_id": str(source_context.get("batch_id") or ""),
+        "source_message_ids": [str(item) for item in source_context.get("message_ids") or []][:100],
+        "asserted_by": [str(item) for item in source_context.get("sender_ids") or []][:50],
+        "source_channel": str(source_context.get("channel") or ""),
+    }
+    metadata = {key: value for key, value in allowed.items() if value}
+    for operation in plan.operations:
+        if isinstance(operation, AddNodeOp):
+            operation.data.metadata = {**operation.data.metadata, **metadata}
+
+
 class MemoryWriteQueue:
     """Debounced in-process queue for background memory writes."""
 
     def __init__(self, writer: MemoryWriter, debounce_seconds: float = 30.0) -> None:
         self.writer = writer
         self.debounce_seconds = debounce_seconds
-        self._queue: deque[MemoryWritePayload] = deque()
+        self._queue: deque[tuple[str, MemoryWritePayload]] = deque()
+        self._queued_job_ids: set[str] = set()
         self._lock = threading.Lock()
         self._timer: threading.Timer | None = None
+        self._recover_jobs()
 
     def add(self, payload: MemoryWritePayload) -> None:
+        job_id = _memory_job_id(payload)
+        should_run = self.writer.service.store.enqueue_memory_job(
+            job_id,
+            payload.user_id,
+            asdict(payload),
+        )
+        if not should_run:
+            return
         with self._lock:
-            self._queue.append(payload)
+            if job_id not in self._queued_job_ids:
+                self._queue.append((job_id, payload))
+                self._queued_job_ids.add(job_id)
             if self._timer is not None:
                 self._timer.cancel()
             self._timer = threading.Timer(self.debounce_seconds, self.flush)
@@ -248,11 +280,65 @@ class MemoryWriteQueue:
 
     def flush(self) -> None:
         with self._lock:
-            payloads = list(self._queue)
+            timer = self._timer
+            if timer is not None and timer is not threading.current_thread():
+                timer.cancel()
+            jobs = list(self._queue)
             self._queue.clear()
+            self._queued_job_ids.clear()
             self._timer = None
-        for payload in payloads:
+        retry_jobs: list[tuple[str, MemoryWritePayload]] = []
+        for job_id, payload in jobs:
+            attempts = self.writer.service.store.mark_memory_job_running(job_id)
+            if attempts == 0:
+                continue
             try:
                 self.writer.write(payload)
-            except Exception:
+            except Exception as exc:
+                self.writer.service.store.finish_memory_job(
+                    job_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
                 logger.exception("Memory write failed for thread %s", payload.thread_id)
+                if attempts < 3:
+                    retry_jobs.append((job_id, payload))
+            else:
+                self.writer.service.store.finish_memory_job(job_id)
+        if retry_jobs:
+            with self._lock:
+                for job in retry_jobs:
+                    if job[0] not in self._queued_job_ids:
+                        self._queue.append(job)
+                        self._queued_job_ids.add(job[0])
+                if self._timer is None:
+                    self._timer = threading.Timer(max(1.0, self.debounce_seconds), self.flush)
+                    self._timer.daemon = True
+                    self._timer.start()
+
+    def _recover_jobs(self) -> None:
+        self.writer.service.store.requeue_stale_memory_jobs(
+            (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+        )
+        for row in self.writer.service.store.list_memory_jobs():
+            if int(row.get("attempts") or 0) >= 3:
+                continue
+            try:
+                raw = json.loads(str(row.get("payload_json") or "{}"))
+                payload = MemoryWritePayload(**raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                logger.warning("Skipping invalid persisted memory job id=%s", row.get("id"))
+                continue
+            job_id = str(row["id"])
+            self._queue.append((job_id, payload))
+            self._queued_job_ids.add(job_id)
+        if self._queue:
+            self._timer = threading.Timer(max(1.0, self.debounce_seconds), self.flush)
+            self._timer.daemon = True
+            self._timer.start()
+
+
+def _memory_job_id(payload: MemoryWritePayload) -> str:
+    source_context = payload.source_context or {}
+    source_id = str(source_context.get("batch_id") or payload.event_id)
+    digest = hashlib.sha256(f"{payload.user_id}\0{source_id}".encode("utf-8")).hexdigest()
+    return f"memory_job_{digest[:32]}"

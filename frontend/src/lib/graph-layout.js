@@ -1,4 +1,4 @@
-// Force-directed graph layout - pure functions ported from app.js
+// Force-directed graph layout shared by memory and knowledge graphs.
 
 const LAYOUT_MARGIN = 96
 const TYPE_ORDER = ['event', 'concept', 'intent', 'time', 'entity']

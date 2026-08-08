@@ -4,7 +4,6 @@ import json
 import uuid
 from collections.abc import Iterable
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 from sqlalchemy import Engine, Connection, create_engine, event, text
@@ -551,6 +550,105 @@ class MemoryGraphStore:
                     ),
                     rows,
                 )
+
+    def enqueue_memory_job(self, job_id: str, user_id: str, payload: dict[str, Any]) -> bool:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            existing = conn.execute(
+                text("SELECT status FROM memory_jobs WHERE id = :id"),
+                {"id": job_id},
+            ).mappings().fetchone()
+            if existing is not None:
+                return str(existing["status"]) != "completed"
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO memory_jobs (
+                        id, user_id, status, payload_json, attempts, error, created_at, updated_at
+                    ) VALUES (
+                        :id, :user_id, 'pending', :payload_json, 0, '', :created_at, :updated_at
+                    )
+                    """
+                ),
+                {
+                    "id": job_id,
+                    "user_id": user_id,
+                    "payload_json": json.dumps(payload, ensure_ascii=False),
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
+        return True
+
+    def list_memory_jobs(self, *, statuses: tuple[str, ...] = ("pending", "failed")) -> list[dict[str, Any]]:
+        if not statuses:
+            return []
+        placeholders = ",".join(f":status_{index}" for index in range(len(statuses)))
+        parameters = {f"status_{index}": status for index, status in enumerate(statuses)}
+        with self.connect() as conn:
+            rows = conn.execute(
+                text(
+                    f"""
+                    SELECT id, user_id, status, payload_json, attempts, error, created_at, updated_at
+                    FROM memory_jobs
+                    WHERE status IN ({placeholders})
+                    ORDER BY created_at
+                    """
+                ),
+                parameters,
+            ).mappings().fetchall()
+        return [dict(row) for row in rows]
+
+    def requeue_stale_memory_jobs(self, stale_before: str) -> int:
+        with self.connect() as conn:
+            result = conn.execute(
+                text(
+                    """
+                    UPDATE memory_jobs
+                    SET status = 'failed', error = 'Recovered stale running job', updated_at = :updated_at
+                    WHERE status = 'running' AND updated_at < :stale_before
+                    """
+                ),
+                {"stale_before": stale_before, "updated_at": utc_now_iso()},
+            )
+        return int(result.rowcount or 0)
+
+    def mark_memory_job_running(self, job_id: str) -> int:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                text(
+                    """
+                    UPDATE memory_jobs
+                    SET status = 'running', attempts = attempts + 1, error = '', updated_at = :updated_at
+                    WHERE id = :id AND status IN ('pending', 'failed')
+                    """
+                ),
+                {"id": job_id, "updated_at": now},
+            )
+            row = conn.execute(
+                text("SELECT attempts FROM memory_jobs WHERE id = :id AND status = 'running' AND updated_at = :updated_at"),
+                {"id": job_id, "updated_at": now},
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def finish_memory_job(self, job_id: str, *, error: str = "") -> None:
+        with self.connect() as conn:
+            conn.execute(
+                text(
+                    """
+                    UPDATE memory_jobs
+                    SET status = :status, error = :error, updated_at = :updated_at
+                    WHERE id = :id
+                    """
+                ),
+                {
+                    "id": job_id,
+                    "status": "failed" if error else "completed",
+                    "error": error[:2000],
+                    "updated_at": utc_now_iso(),
+                },
+            )
 
     def list_recall_snapshot(self, user_id: str) -> dict[str, dict[str, Any]]:
         with self.connect() as conn:

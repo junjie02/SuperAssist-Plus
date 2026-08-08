@@ -4,7 +4,7 @@ from langchain_core.messages import AIMessage
 
 from superassist.config import Settings
 from superassist.memory.service import MemoryService, MemoryWritePayload
-from superassist.memory.writer import MEMORY_WRITER_PROMPT, MemoryWriter
+from superassist.memory.writer import MEMORY_WRITER_PROMPT, MemoryWriteQueue, MemoryWriter
 from superassist.models import EdgeType, NodeType
 
 
@@ -108,6 +108,53 @@ def test_memory_writer_is_deterministic_by_default(tmp_path) -> None:
 
     # Fallback writer now creates 2 nodes: 1 event + 1 concept
     assert result["nodes"] == 2
+
+
+def test_memory_writer_attaches_feishu_batch_provenance(tmp_path) -> None:
+    service = make_service(tmp_path)
+    base = make_payload(service)
+    payload = MemoryWritePayload(
+        **{
+            **base.__dict__,
+            "source_context": {
+                "batch_id": "feishu:chat:1:3",
+                "message_ids": ["msg_1", "msg_2", "msg_3"],
+                "sender_ids": ["ou_a", "ou_b"],
+                "channel": "feishu",
+            },
+        }
+    )
+
+    MemoryWriter(service).write(payload)
+
+    nodes = service.store.list_nodes("u")
+    assert nodes
+    assert all(node.metadata["source_batch_id"] == "feishu:chat:1:3" for node in nodes)
+    assert all(node.metadata["source_message_ids"] == ["msg_1", "msg_2", "msg_3"] for node in nodes)
+    assert all(node.metadata["asserted_by"] == ["ou_a", "ou_b"] for node in nodes)
+
+
+def test_memory_write_queue_deduplicates_completed_source_batch(tmp_path) -> None:
+    service = make_service(tmp_path)
+    base = make_payload(service)
+    payload = MemoryWritePayload(
+        **{
+            **base.__dict__,
+            "source_context": {"batch_id": "feishu:chat:1:3", "channel": "feishu"},
+        }
+    )
+    first = MemoryWriteQueue(MemoryWriter(service), debounce_seconds=3600)
+    first.add(payload)
+    first.flush()
+    initial_ids = {node.id for node in service.store.list_nodes("u")}
+
+    second = MemoryWriteQueue(MemoryWriter(service), debounce_seconds=3600)
+    second.add(payload)
+    second.flush()
+
+    assert {node.id for node in service.store.list_nodes("u")} == initial_ids
+    jobs = service.store.list_memory_jobs(statuses=("completed",))
+    assert len(jobs) == 1
 
 
 def test_memory_writer_can_opt_into_llm_plan(tmp_path) -> None:

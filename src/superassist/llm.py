@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import threading
@@ -14,8 +15,8 @@ from uuid import uuid4
 
 import tiktoken
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, AIMessageChunk
-from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.runnables import Runnable
 from langchain_openai import ChatOpenAI
 from pydantic import PrivateAttr
@@ -25,6 +26,12 @@ from superassist.config import Settings, get_settings
 _THINK_TAG_RE = re.compile(r"<think>\s*(.*?)\s*</think>", re.DOTALL)
 _MODEL_INPUT_LOG_LOCK = threading.Lock()
 _MODEL_INPUT_LOG_BACKUPS = 3
+logger = logging.getLogger(__name__)
+
+
+class _FailoverRouteState:
+    def __init__(self, selected_index: int = 0) -> None:
+        self.selected_index = selected_index
 
 
 class OneSecondRetryChatModel(ChatOpenAI):
@@ -64,7 +71,9 @@ class OneSecondRetryChatModel(ChatOpenAI):
     def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:  # type: ignore[no-untyped-def]
         try:
             return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
-        except Exception:
+        except Exception as exc:
+            if not _should_retry_same_route(exc):
+                raise
             time.sleep(1)
             return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
 
@@ -91,6 +100,115 @@ class OneSecondRetryChatModel(ChatOpenAI):
         additional_kwargs["reasoning_content"] = reasoning
         message = generation.message.model_copy(update={"additional_kwargs": additional_kwargs})
         return generation.model_copy(update={"message": message})
+
+
+class FailoverChatModel(BaseChatModel):
+    """Sticky ordered failover across OpenAI-compatible chat routes."""
+
+    _routes: list[Runnable] = PrivateAttr(default_factory=list)
+    _route_names: list[str] = PrivateAttr(default_factory=list)
+    _route_state: _FailoverRouteState = PrivateAttr(default_factory=_FailoverRouteState)
+
+    def __init__(self, routes: list[Runnable], route_names: list[str]) -> None:
+        if not routes or len(routes) != len(route_names):
+            raise ValueError("FailoverChatModel requires equally sized non-empty routes and names")
+        super().__init__()
+        self._routes = routes
+        self._route_names = route_names
+
+    @property
+    def _llm_type(self) -> str:
+        return "superassist-failover"
+
+    @property
+    def _identifying_params(self) -> dict[str, Any]:
+        return {"routes": list(self._route_names)}
+
+    @property
+    def active_route(self) -> str:
+        return self._route_names[self._route_state.selected_index]
+
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs) -> Runnable:  # type: ignore[no-untyped-def]
+        bound_routes = [
+            route.bind_tools(tools, tool_choice=tool_choice, **kwargs)
+            for route in self._routes
+        ]
+        bound = FailoverChatModel(bound_routes, list(self._route_names))
+        # create_agent may bind tools again for each model node. Sharing this
+        # tiny state keeps a selected fallback sticky through the tool loop.
+        bound._route_state = self._route_state
+        return bound
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager=None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        last_error: Exception | None = None
+        for index in range(self._route_state.selected_index, len(self._routes)):
+            route = self._routes[index]
+            route_messages = _route_messages(messages, self._route_names[index])
+            try:
+                message = route.invoke(route_messages, stop=stop, **_route_kwargs(kwargs, fallback=index > 0))
+            except Exception as exc:  # noqa: BLE001 - route boundary classifies and records provider failures
+                last_error = exc
+                if not _should_failover(exc) or index == len(self._routes) - 1:
+                    raise
+                logger.warning(
+                    "Model route failed; switching from %s to %s error_type=%s",
+                    self._route_names[index],
+                    self._route_names[index + 1],
+                    type(exc).__name__,
+                )
+                self._route_state.selected_index = index + 1
+                continue
+            self._route_state.selected_index = index
+            if not isinstance(message, AIMessage):
+                raise TypeError(f"Model route {self._route_names[index]} returned {type(message).__name__}")
+            return ChatResult(
+                generations=[ChatGeneration(message=_with_model_route(message, self._route_names[index]))]
+            )
+        assert last_error is not None
+        raise last_error
+
+    def _stream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager=None,
+        **kwargs: Any,
+    ):
+        last_error: Exception | None = None
+        for index in range(self._route_state.selected_index, len(self._routes)):
+            emitted = False
+            route_messages = _route_messages(messages, self._route_names[index])
+            try:
+                for chunk in self._routes[index].stream(
+                    route_messages,
+                    stop=stop,
+                    **_route_kwargs(kwargs, fallback=index > 0),
+                ):
+                    emitted = True
+                    if isinstance(chunk, AIMessageChunk):
+                        chunk = _with_model_route(chunk, self._route_names[index])
+                    yield ChatGenerationChunk(message=chunk)
+                self._route_state.selected_index = index
+                return
+            except Exception as exc:  # noqa: BLE001 - see synchronous route boundary above
+                last_error = exc
+                if emitted or not _should_failover(exc) or index == len(self._routes) - 1:
+                    raise
+                logger.warning(
+                    "Streaming model route failed before first chunk; switching from %s to %s error_type=%s",
+                    self._route_names[index],
+                    self._route_names[index + 1],
+                    type(exc).__name__,
+                )
+                self._route_state.selected_index = index + 1
+        assert last_error is not None
+        raise last_error
 
 
 class FallbackChatModel(BaseChatModel):
@@ -180,7 +298,33 @@ class MiniMaxCompatibleChatModel(OneSecondRetryChatModel):
 def create_chat_model(settings: Settings | None = None) -> BaseChatModel:
     settings = settings or get_settings()
     if not settings.api_key:
-        return FallbackChatModel()
+        routes: list[Runnable] = []
+        route_names: list[str] = []
+        if settings.claude_fallback_api_key and settings.claude_fallback_base_url:
+            routes.append(
+                _create_compatible_fallback_model(
+                    model=settings.claude_fallback_model,
+                    api_key=settings.claude_fallback_api_key,
+                    base_url=settings.claude_fallback_base_url,
+                    settings=settings,
+                    call_kind="lead_agent_claude_fallback",
+                )
+            )
+            route_names.append(f"claude:{settings.claude_fallback_model}")
+        if settings.deepseek_fallback_api_key and settings.deepseek_fallback_base_url:
+            routes.append(
+                _create_compatible_fallback_model(
+                    model=settings.deepseek_fallback_model,
+                    api_key=settings.deepseek_fallback_api_key,
+                    base_url=settings.deepseek_fallback_base_url,
+                    settings=settings,
+                    call_kind="lead_agent_deepseek_fallback",
+                )
+            )
+            route_names.append(f"deepseek:{settings.deepseek_fallback_model}")
+        if not routes:
+            return FallbackChatModel()
+        return routes[0] if len(routes) == 1 else FailoverChatModel(routes, route_names)
     if settings.model_provider.lower() != "openai":
         raise ValueError(f"Unsupported model provider: {settings.model_provider}")
     kwargs = {
@@ -191,7 +335,7 @@ def create_chat_model(settings: Settings | None = None) -> BaseChatModel:
         "max_retries": 2,
         "stream_usage": True,
     }
-    if is_gpt_5_6_model(settings.model):
+    if is_gpt_5_6_model(settings.model) and settings.use_responses_api:
         reasoning: dict[str, str] = {"effort": settings.reasoning_effort}
         if settings.reasoning_effort != "none":
             reasoning["summary"] = "detailed"
@@ -201,6 +345,13 @@ def create_chat_model(settings: Settings | None = None) -> BaseChatModel:
                 # Keep the original multimodal HumanMessage in every tool-loop request.
                 "use_previous_response_id": False,
                 "reasoning": reasoning,
+            }
+        )
+    elif is_gpt_5_6_model(settings.model):
+        kwargs.update(
+            {
+                "use_responses_api": False,
+                "reasoning_effort": settings.reasoning_effort,
             }
         )
     temperature = settings.temperature
@@ -217,7 +368,58 @@ def create_chat_model(settings: Settings | None = None) -> BaseChatModel:
         max_bytes=settings.model_input_log_max_bytes,
         call_kind="lead_agent",
     )
-    return model
+    routes: list[Runnable] = [model]
+    route_names = [f"primary:{settings.model}"]
+    if settings.claude_fallback_api_key and settings.claude_fallback_base_url:
+        routes.append(
+            _create_compatible_fallback_model(
+                model=settings.claude_fallback_model,
+                api_key=settings.claude_fallback_api_key,
+                base_url=settings.claude_fallback_base_url,
+                settings=settings,
+                call_kind="lead_agent_claude_fallback",
+            )
+        )
+        route_names.append(f"claude:{settings.claude_fallback_model}")
+    deepseek_api_key = settings.deepseek_fallback_api_key
+    deepseek_base_url = settings.deepseek_fallback_base_url
+    if deepseek_api_key and deepseek_base_url:
+        routes.append(
+            _create_compatible_fallback_model(
+                model=settings.deepseek_fallback_model,
+                api_key=deepseek_api_key,
+                base_url=deepseek_base_url,
+                settings=settings,
+                call_kind="lead_agent_deepseek_fallback",
+            )
+        )
+        route_names.append(f"deepseek:{settings.deepseek_fallback_model}")
+    return model if len(routes) == 1 else FailoverChatModel(routes, route_names)
+
+
+def _create_compatible_fallback_model(
+    *,
+    model: str,
+    api_key: str,
+    base_url: str,
+    settings: Settings,
+    call_kind: str,
+) -> OneSecondRetryChatModel:
+    fallback = OneSecondRetryChatModel(
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        timeout=60,
+        max_retries=1,
+        stream_usage=True,
+        use_responses_api=False,
+    )
+    fallback.configure_input_logging(
+        path=settings.model_input_log_path if settings.model_input_log_enabled else None,
+        max_bytes=settings.model_input_log_max_bytes,
+        call_kind=call_kind,
+    )
+    return fallback
 
 
 def create_memory_model(
@@ -256,6 +458,88 @@ def is_minimax_model(model: str, base_url: str = "") -> bool:
 
 def is_gpt_5_6_model(model: str) -> bool:
     return model.lower().startswith("gpt-5.6")
+
+
+def _should_failover(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    response = getattr(exc, "response", None)
+    if status_code is None and response is not None:
+        status_code = getattr(response, "status_code", None)
+    if isinstance(status_code, int):
+        if status_code in {400, 413, 422}:
+            return False
+        return status_code in {401, 403, 404, 405, 408, 409, 429} or status_code >= 500
+    name = type(exc).__name__.lower()
+    message = str(exc).lower()
+    non_retryable_markers = (
+        "context length",
+        "maximum context",
+        "content policy",
+        "invalid tool",
+        "invalid_request",
+    )
+    if any(marker in message for marker in non_retryable_markers):
+        return False
+    return any(
+        marker in name or marker in message
+        for marker in ("timeout", "connection", "ratelimit", "temporar", "unavailable", "overload")
+    ) or isinstance(exc, RuntimeError)
+
+
+def _should_retry_same_route(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    response = getattr(exc, "response", None)
+    if status_code is None and response is not None:
+        status_code = getattr(response, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code in {408, 409, 429} or status_code >= 500
+    return _should_failover(exc)
+
+
+def _with_model_route(message: Any, route_name: str) -> Any:
+    metadata = dict(getattr(message, "response_metadata", {}) or {})
+    metadata["superassist_model_route"] = route_name
+    return message.model_copy(update={"response_metadata": metadata})
+
+
+def _route_kwargs(kwargs: dict[str, Any], *, fallback: bool) -> dict[str, Any]:
+    if not fallback:
+        return kwargs
+    unsupported = {"prompt_cache_key", "prompt_cache_options"}
+    return {key: value for key, value in kwargs.items() if key not in unsupported}
+
+
+def _route_messages(messages: list[BaseMessage], route_name: str) -> list[BaseMessage]:
+    if not route_name.startswith("deepseek:"):
+        return messages
+    rendered: list[BaseMessage] = []
+    for message in messages:
+        content = message.content
+        if not isinstance(content, list):
+            rendered.append(message)
+            continue
+        kept: list[Any] = []
+        removed_images = 0
+        for item in content:
+            item_type = str(item.get("type") or "").lower() if isinstance(item, dict) else ""
+            if item_type in {"image", "image_url", "input_image"}:
+                removed_images += 1
+                continue
+            kept.append(item)
+        if removed_images:
+            kept.append(
+                {
+                    "type": "text",
+                    "text": (
+                        f"<VisionDegraded omitted_images=\"{removed_images}\">"
+                        "This fallback model did not receive original image pixels. Use only OCR and existing "
+                        "visual descriptions, and disclose this limitation in the answer."
+                        "</VisionDegraded>"
+                    ),
+                }
+            )
+        rendered.append(message.model_copy(update={"content": kept}))
+    return rendered
 
 
 def _strip_message_names(payload: dict[str, Any]) -> None:

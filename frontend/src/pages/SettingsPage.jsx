@@ -49,7 +49,6 @@ const MEMORY_SECTIONS = [
       { key: 'short_token_limit', label: 'Compression token limit', env: 'SUPERASSIST_SHORT_MEMORY_TOKEN_LIMIT', min: 100, max: 10000000, step: 100 },
       { key: 'short_keep_recent_turns', label: 'Sliding window turns', env: 'SUPERASSIST_SHORT_MEMORY_KEEP_RECENT_TURNS', min: 1, max: 10000, step: 1 },
       { key: 'short_summary_target_tokens', label: 'Summary target tokens', env: 'SUPERASSIST_SHORT_MEMORY_SUMMARY_TARGET_TOKENS', min: 1, max: 1000000, step: 100 },
-      { key: 'short_enable_tool_events', label: 'Record tool events', env: 'SUPERASSIST_SHORT_MEMORY_ENABLE_TOOL_EVENTS', type: 'boolean' },
     ],
   },
 ]
@@ -265,7 +264,9 @@ export default function SettingsPage() {
                 <TextField label="Open API domain" env="SUPERASSIST_FEISHU_DOMAIN" type="url" value={draft.feishu.domain} onChange={value => updateFeishu('domain', value)} required />
                 <TextField label="Allowed Open IDs" env="SUPERASSIST_FEISHU_ALLOWED_OPEN_IDS" value={draft.feishu.allowed_open_ids} onChange={value => updateFeishu('allowed_open_ids', value)} placeholder="ou_xxx,ou_yyy" />
                 <ToggleField label="Mention to start session" env="SUPERASSIST_FEISHU_MENTION_ONLY" checked={Boolean(draft.feishu.mention_only)} onChange={value => updateFeishu('mention_only', value)} />
-                <NumberField label="Active session timeout" env="SUPERASSIST_FEISHU_ACTIVE_SESSION_SECONDS" value={draft.feishu.active_session_seconds} onChange={value => updateFeishu('active_session_seconds', value)} suffix="seconds" min={10} max={86400} step={10} />
+                <NumberField label="Batch quiet window" env="SUPERASSIST_FEISHU_ACTIVATION_DEBOUNCE_SECONDS" value={draft.feishu.activation_debounce_seconds} onChange={value => updateFeishu('activation_debounce_seconds', value)} suffix="seconds" min={0} max={30} step={0.1} />
+                <NumberField label="Batch maximum wait" env="SUPERASSIST_FEISHU_ACTIVATION_MAX_WAIT_SECONDS" value={draft.feishu.activation_max_wait_seconds} onChange={value => updateFeishu('activation_max_wait_seconds', value)} suffix="seconds" min={0.1} max={60} step={0.5} />
+                <NumberField label="Images per activation" env="SUPERASSIST_FEISHU_MAX_IMAGES_PER_ACTIVATION" value={draft.feishu.max_images_per_activation} onChange={value => updateFeishu('max_images_per_activation', value)} min={1} max={100} step={1} />
               </div>
             </section>
           ) : (

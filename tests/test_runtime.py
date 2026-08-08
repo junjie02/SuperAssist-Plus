@@ -7,14 +7,13 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 
 from superassist.agent import AgentRuntime
-from superassist.agent.runtime import SYSTEM_PROMPT
+from superassist.agent.prompts import SYSTEM_PROMPT
 from superassist.agent.short_memory import (
     build_summary_prompt,
     load_short_memory,
     maybe_compress_short_memory,
     read_jsonl,
     turn_records,
-    write_jsonl,
 )
 from superassist.config import PROJECT_ROOT, Settings
 from superassist.llm import FallbackChatModel, MiniMaxCompatibleChatModel, create_chat_model
@@ -26,6 +25,14 @@ from superassist.middlewares import (
     ToolEventMiddleware,
 )
 from superassist.models import MemoryNode, MemoryRecall, NodeType
+
+
+def _write_jsonl(path, records) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
+        encoding="utf-8",
+    )
 
 
 def test_project_root_env_file_is_configured() -> None:
@@ -217,6 +224,7 @@ def test_gpt_5_6_explicit_cache_breakpoints_exclude_dynamic_turn_context() -> No
         _env_file=None,
         SUPERASSIST_MODEL="gpt-5.6-sol",
         SUPERASSIST_API_KEY="secret",
+        SUPERASSIST_USE_RESPONSES_API=True,
     )
     model = create_chat_model(settings)
     middleware = DynamicContextMiddleware(explicit_prompt_cache=True)
@@ -980,11 +988,9 @@ def test_short_memory_compression_waits_until_turn_limit(tmp_path) -> None:
             turn_records(
                 user_message=f"user {index}",
                 assistant_answer=f"assistant {index}",
-                tool_events=[],
-                include_tool_events=True,
             )
         )
-    write_jsonl(path, records)
+    _write_jsonl(path, records)
     before_limit = maybe_compress_short_memory(
         messages_path=path,
         metadata={},
@@ -997,10 +1003,8 @@ def test_short_memory_compression_waits_until_turn_limit(tmp_path) -> None:
     append_records = turn_records(
         user_message="user 29",
         assistant_answer="assistant 29",
-        tool_events=[],
-        include_tool_events=False,
     )
-    write_jsonl(path, [*records, *append_records])
+    _write_jsonl(path, [*records, *append_records])
     at_limit = maybe_compress_short_memory(
         messages_path=path,
         metadata={},
@@ -1022,10 +1026,8 @@ def test_short_memory_compression_triggers_at_token_limit(tmp_path) -> None:
     records = turn_records(
         user_message="large input " + ("x" * 1000),
         assistant_answer="large answer " + ("y" * 1000),
-        tool_events=[],
-        include_tool_events=False,
     )
-    write_jsonl(path, records)
+    _write_jsonl(path, records)
 
     update = maybe_compress_short_memory(
         messages_path=path,
@@ -1051,11 +1053,9 @@ def test_short_memory_loads_complete_active_segment_after_checkpoint(tmp_path) -
             turn_records(
                 user_message=f"user {index}",
                 assistant_answer=f"assistant {index}",
-                tool_events=[],
-                include_tool_events=True,
             )
         )
-    write_jsonl(path, records)
+    _write_jsonl(path, records)
 
     loaded = load_short_memory(path, {}, keep_recent_turns=30)
     checkpointed = load_short_memory(
@@ -1078,12 +1078,10 @@ def test_short_memory_replays_user_timestamp_and_compressor_sees_it(tmp_path) ->
     records = turn_records(
         user_message="time-sensitive question",
         assistant_answer="answer",
-        tool_events=[],
-        include_tool_events=False,
         user_created_at="2026-08-01T08:00:00+00:00",
         assistant_created_at="2026-08-01T08:01:00+00:00",
     )
-    write_jsonl(path, records)
+    _write_jsonl(path, records)
 
     loaded = load_short_memory(path, {}, keep_recent_turns=30)
     summary_prompt = build_summary_prompt(
@@ -1106,11 +1104,9 @@ def test_short_memory_load_does_not_silently_trim_at_token_limit(tmp_path) -> No
             turn_records(
                 user_message=f"user {index}",
                 assistant_answer=f"assistant {index} " + ("x" * 160),
-                tool_events=[],
-                include_tool_events=True,
             )
         )
-    write_jsonl(path, records)
+    _write_jsonl(path, records)
     loaded = load_short_memory(
         path,
         {},
@@ -1192,11 +1188,9 @@ def test_short_memory_compression_writes_checkpoint_without_pruning_jsonl(tmp_pa
             turn_records(
                 user_message=f"old user {index} " + ("x" * 200),
                 assistant_answer=f"old assistant {index} " + ("y" * 200),
-                tool_events=[],
-                include_tool_events=True,
             )
         )
-    write_jsonl(path, records)
+    _write_jsonl(path, records)
 
     update = maybe_compress_short_memory(
         messages_path=path,
@@ -1230,11 +1224,9 @@ def test_short_memory_compression_failure_does_not_prune(tmp_path) -> None:
             turn_records(
                 user_message=f"user {index} " + ("x" * 200),
                 assistant_answer=f"assistant {index} " + ("y" * 200),
-                tool_events=[],
-                include_tool_events=True,
             )
         )
-    write_jsonl(path, records)
+    _write_jsonl(path, records)
 
     update = maybe_compress_short_memory(
         messages_path=path,

@@ -6,12 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from superassist.agent.runtime import AgentRuntime, team_prompt_section
+from superassist.agent.prompts import team_section
+from superassist.agent.runtime import AgentRuntime
 from superassist.teams import AgentTeamConfig, TeamSupervisor, get_team_supervisor, set_team_supervisor
 from superassist.teams.ledger import TeamLedger, LedgerTamperError
 from superassist.teams.config import AgentTeamConfigError, TeamAgentConfig
 from superassist.teams.context import team_thread_context
-from superassist.teams.supervisor import _resolve_command
 from superassist.config import Settings
 from superassist.tools import default_tools
 from superassist.tools.team import team_task
@@ -295,14 +295,8 @@ def test_runtime_skips_team_supervisor_when_settings_disable_teams(tmp_path: Pat
         runtime.close()
 
 
-def test_team_prompt_section_lists_agents() -> None:
-    section = team_prompt_section("- codex: Codex fake")
+def test_team_section_lists_agents() -> None:
+    section = team_section("- codex: Codex fake")
 
     assert "team_task" in section
     assert "codex" in section
-
-
-def test_resolve_command_uses_path_executable(monkeypatch) -> None:
-    monkeypatch.setattr("superassist.teams.supervisor.shutil.which", lambda command: "E:/nodejs/npx.CMD")
-
-    assert _resolve_command("npx") == "E:/nodejs/npx.CMD"

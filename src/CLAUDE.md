@@ -148,6 +148,8 @@
 | `temperature` | `SUPERASSIST_TEMPERATURE` | `None` | 模型名含 `minimax` 且未显式设置时强制为 `1.0`。 |
 | `reasoning_effort` | `SUPERASSIST_REASONING_EFFORT` | `medium` | GPT-5.6 支持 `none/low/medium/high/xhigh/max`；飞书 `/effort` 可按会话覆盖。 |
 | `max_tokens` | `SUPERASSIST_MAX_TOKENS` | `None` | 仅当非 None 才透传。 |
+| `claude_fallback_*` | `SUPERASSIST_CLAUDE_FALLBACK_*` | `claude-opus-5` / 空 key | 配置 key 与 OpenAI-compatible `/v1` 地址后成为第二 lead route，固定走 Chat Completions。 |
+| `deepseek_fallback_*` | `SUPERASSIST_DEEPSEEK_FALLBACK_*` | `deepseek-v4-flash` / 空 key | 配置独立 key/base URL 后成为第三 lead route；不隐式复用 Memory 凭据。 |
 | `prompt_cache_explicit_enabled` | `SUPERASSIST_PROMPT_CACHE_EXPLICIT_ENABLED` | `True` | 仅 GPT-5.6：启用 Responses 显式提示词缓存断点；可关闭以兼容不支持该协议的中转网关。 |
 | `model_input_log_enabled` | `SUPERASSIST_MODEL_INPUT_LOG_ENABLED` | `False` | 开启后记录最终 provider payload 到 `<data_dir>/logs/model-input.jsonl`。 |
 | `model_input_log_max_bytes` | `SUPERASSIST_MODEL_INPUT_LOG_MAX_BYTES` | `52428800` | 单日志文件轮转阈值；保留 `.1` 到 `.3` 三个备份。 |
@@ -172,6 +174,7 @@
 | `subagent_max_concurrent` | `3` | `SubagentLimitMiddleware` 强制 clamp 到 `[1,3]`；`tools/task.py` 的 `BoundedSemaphore` 同样为 3。**两侧必须同步**。 |
 | `subagent_timeout_seconds` | `900` | 单次子任务硬超时；`asyncio.timeout(...)` 触发 `TIMED_OUT`。 |
 | `subagent_max_turns` | `20` | LangGraph `recursion_limit` 上限；超出走 `_summarize_after_recursion_limit`。 |
+| `agents_dir` | `config/agents` | 模块化 Subagent 根目录；相对路径按项目根目录解析。 |
 
 **记忆**
 
@@ -183,7 +186,6 @@
 | `short_memory_token_limit` | `80000` | 活动段达到该 token 阈值后整体压缩为摘要。 |
 | `short_memory_keep_recent_turns` | `30` | 活动段达到该已完成回合数后整体压缩为摘要。 |
 | `short_memory_summary_target_tokens` | `6000` | 压缩 prompt 中告知模型的目标长度。 |
-| `short_memory_enable_tool_events` | `False` | 已废弃的兼容字段；短记忆始终只保存 user 与最终 assistant。 |
 | `memory_reinforce_similarity` | `0.85` | event ↔ 现有 concept 余弦相似度阈值；命中即 `REINFORCES`。 |
 | `memory_concept_merge_similarity` | `0.85` | `merge_similar_concepts` 阈值。 |
 | `memory_completion_similarity` | `0.30` | `complete_orphans` 给孤立 concept 接 GROUNDS 的下限。 |
@@ -226,6 +228,9 @@
 | `feishu_domain` | `https://open.feishu.cn` | Lark Client 的 domain。 |
 | `feishu_allowed_open_ids` | `""` | 逗号分隔；`feishu_allowed_open_id_set` 属性返回去空白后的 set。 |
 | `feishu_mention_only` | `True` | True 且非私聊时只响应被 @ 消息。 |
+| `feishu_activation_debounce_seconds` | `1.5` | 明确激活后的全消息静默收集窗口。 |
+| `feishu_activation_max_wait_seconds` | `6.0` | 群聊持续活跃时的批次硬上限。 |
+| `feishu_max_images_per_activation` | `12` | 一批直接交给主视觉模型的图片数上限。 |
 | `feishu_image_ocr_enabled` | `True` | 是否运行本地 RapidOCR；OCR 失败不阻止原图进入主模型。 |
 | `feishu_image_ocr_max_chars` | `12000` | 多图 OCR 注入当前轮文本历史的总字符上限。 |
 | `feishu_image_context_ttl_seconds` | `180` | 最新一组原图跨消息保留的滑动 TTL；有效后续消息刷新计时。 |
@@ -252,6 +257,7 @@
 | `faiss_dir` | `data_dir / "faiss"` |
 | `rag_dir` | `data_dir / "rag"` |
 | `feishu_thread_store_path` | `data_dir / "channels" / "feishu_threads.json"` |
+| `feishu_message_store_path` | `data_dir / "channels" / "feishu_messages.sqlite3"` |
 | `wecom_thread_store_path` | `data_dir / "channels" / "wecom_threads.json"` |
 
 `PROJECT_ROOT` 同时被 [`teams/config.py`](superassist/teams/config.py) 用来定位 `agent_team.toml`、被 [`skills/registry.py`](superassist/skills/registry.py) 定位 `skills/`、被 [`tools/shell.py`](superassist/tools/shell.py) 限制 `cwd` 不可越界、被 [`ui/server.py`](superassist/ui/server.py) 定位 `frontend/`。
@@ -272,7 +278,8 @@
 3. **GPT-5.6 family** → `OneSecondRetryChatModel` + Responses API：
    - 请求 `reasoning.effort`；非 `none` 时同时请求 `reasoning.summary="detailed"`，供流式飞书卡片展示。
    - 开启 `stream_usage`，`AgentRuntime` 把 `input_tokens/cache_read/cache_hit_rate` 写入结果 metadata 和日志。
-4. **其它 OpenAI 兼容** → `OneSecondRetryChatModel`，每次 `_generate` 失败后 `time.sleep(1)` 重试一次。
+4. **其它 OpenAI 兼容** → `OneSecondRetryChatModel`，仅对连接、超时、429 与 5xx 等可恢复错误在 1 秒后重试一次。
+5. **可选 lead failover** → `FailoverChatModel` 按 GPT → Claude → DeepSeek 顺序包装已配置 route；每轮切换后保持 route，不在工具循环中跳回。Responses 的 prompt-cache kwargs 不会传给 Chat Completions fallback。流式请求只在首 chunk 前失败时透明切换，避免拼接两个模型的半截回答。
 
 `create_memory_model` 默认使用 `deepseek-v4-flash`，从 `memory_api_key/memory_base_url` 取独立配置（空值回退主模型凭据），不附加 GPT-5.6 的 Responses/reasoning 参数。Memory Updater 与短记忆压缩各持有一个该模型客户端。
 
@@ -351,11 +358,11 @@ RunEventReporter = Callable[[AgentRunEvent], None]
 | `created_at` / `updated_at` / `last_activated_at` | TEXT / TEXT / TEXT NULL | |
 | `UNIQUE(user_id, source_id, target_id, edge_type)` | | 确保 `add_or_boost_edge` 走 boost 而非重复 INSERT。 |
 
-#### 5.1.3 `memory_jobs`（保留表，目前未写入）
+#### 5.1.3 `memory_jobs`（持久化 Writer outbox）
 
 | 列 | 类型 | 说明 |
 | --- | --- | --- |
-| `id` / `user_id` / `status` / `payload_json` / `attempts` / `error` / `created_at` / `updated_at` | TEXT/TEXT/TEXT/TEXT/INTEGER/TEXT/TEXT/TEXT | 留给未来替换内存队列 `MemoryWriteQueue` 的持久化方案；当前 `MemoryWriter` 不写这张表，`idx_memory_jobs_status(status, updated_at)` 索引已建好。 |
+| `id` / `user_id` / `status` / `payload_json` / `attempts` / `error` / `created_at` / `updated_at` | TEXT/TEXT/TEXT/TEXT/INTEGER/TEXT/TEXT/TEXT | `MemoryWriteQueue.add` 先持久化；状态为 `pending/running/completed/failed`，最多自动尝试 3 次。Feishu batch 以稳定 batch ID 派生 job ID，已完成批次不会重复写图；运行超过 5 分钟的 job 会在新 queue 启动时回收。 |
 
 #### 5.1.4 `memory_recall_snapshots`
 
@@ -395,7 +402,6 @@ RunEventReporter = Callable[[AgentRunEvent], None]
 
 - `rebuild(nodes)`：过滤掉无 embedding 或维度不匹配的节点；空时调 `_delete_files()` 删除两侧文件；否则用 `IndexIDMap2(IndexFlatIP(dim))`、`add_with_ids(matrix, np.arange(N))`、写盘并把 `dimension` + `ids: list[str]` 落到 mapping。`MemoryService.apply_structured_memory` 在 nodes/updated/merged/removed_nodes 任一非零时触发重建。
 - `search(query, limit)`：mapping 文件不存在或维度不匹配返回 `[]`；否则 normalize 查询向量后 `index.search`，把 FAISS 内部 id 翻译为节点 id，封装为 `VectorMatch(node_id, score)`。
-- `EmptyVectorIndex`：测试 / fallback 兜底，所有方法 no-op。
 
 ### 5.4 `scoring.MemoryContextRanker`
 
@@ -649,7 +655,7 @@ TIME 节点的语义边不自动推断：事件实际发生时间必须显式添
 ### 6.4 `agent/prompts.py`
 
 - `SYSTEM_PROMPT`：`<role>` / `<thinking_style>` / `<tool_use>` / `<citations>` / `<response_style>` 五块固定 XML-ish 段，写明"被调用工具前先在 assistant content 写一句 NL"等行为约束。
-- `subagent_section(max_concurrent)`：限定 `task` 调用并发上限（实际写入文本时 clamp 到 `[1,3]`，与 middleware 一致），列出 `general-purpose` / `research` 两个 subagent 类型。
+- `subagent_section(max_concurrent, agents_text)`：限定 `task` 调用并发上限（实际写入文本时 clamp 到 `[1,3]`，与 middleware 一致），并注入 `SubagentRegistry.available_agents_text()` 动态生成的 Agent 名称和描述；不会注入各 Agent 的完整系统提示。
 - `team_section(agents_text)`：把 `TeamSupervisor.available_agents_text()` 列表填入 `<agent_team_system>`。
 - `compose_system_prompt(settings, *, team_supervisor, team_config_error)`：`SYSTEM_PROMPT` + 可选 `subagent_section` + 可选 `team_section`；当 supervisor 创建失败 (`team_config_error`)，把错误字符串作为 `Agent team config error: ...` 段拼入，以便 LLM 知道 team 不可用的原因。
 
@@ -791,25 +797,37 @@ LangChain 1.x middleware 的钩子分类：`before_agent` / `after_agent`（agen
 
 子智能体是 **进程内** 的一次性 agent，通过 `task` LangChain 工具触发；与 `team_task` 启动外部 ACP 进程是两条完全独立的链路。
 
-### 8.1 `subagents/config.py`
+### 8.1 `config/agents/` 与 `subagents/config.py`
+
+所有进程内 Subagent 都从 `Settings.resolved_agents_dir`（默认 `config/agents`）动态加载。每个一级子目录包含 `agent.toml` 和提示文件（默认 `system.md`）；Python 中不再硬编码 Agent 名称或系统提示。当前目录内置 `general-purpose`、`research`、`shenlun-quiz` 三个模块。
+
+`agent.toml` 支持以下字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `name` / `description` | `task(subagent_type=...)` 使用的名称，以及注入主 Agent 的简短能力描述。 |
+| `prompt_file` | 相对当前 Agent 目录的系统提示文件，默认 `system.md`，禁止越出当前目录。 |
+| `enabled` / `default` | 是否启用，以及是否作为 `subagent_type` 为空时的默认 Agent；所有有效模块必须且只能有一个默认项。 |
+| `model_profile` | `main` 使用主模型配置；`memory` 使用独立 Memory 模型、密钥与地址，并强制关闭 Responses API。 |
+| `allowed_tools` | `"*"` 表示继承除 `task` 外的常规工具，字符串列表表示工具白名单。 |
+| `timeout_seconds` / `max_turns` | 可覆盖全局 Subagent 超时和最大轮数；省略时读取 Settings 默认值。 |
 
 `SubagentConfig`（frozen dataclass）：
 
 | 字段 | 含义 |
 | --- | --- |
-| `name` | `general-purpose` / `research`，作为 `task(subagent_type=...)` 的取值。 |
-| `description` | 文案，用在 `subagent_section` system prompt 中。 |
-| `system_prompt` | 子 agent 的系统提示（见 `GENERAL_PURPOSE_PROMPT` / `RESEARCH_PROMPT`）。 |
-| `allowed_tools` | `None` 表示继承除 `task` 外所有 lead 工具；`research` 限制为 `[web_search, web_fetch, read_file, list_files, write_file]`。 |
-| `timeout_seconds` / `max_turns` | 来自 settings。 |
+| `name` / `description` | 从清单读取；描述用于主 Agent 的动态能力索引。 |
+| `system_prompt` | 从同目录提示文件读取，只在该 Subagent 执行时使用。 |
+| `allowed_tools` | `None` 表示继承除 `task` 外所有常规工具，否则按清单白名单过滤。 |
+| `model_profile` | `main` 或 `memory`。 |
+| `is_default` / `source_dir` | 是否为目录注册表默认项，以及定义来源目录。 |
+| `timeout_seconds` / `max_turns` | 清单覆盖值或 Settings 全局默认值。 |
 
-`build_builtin_subagents(timeout_seconds, max_turns)` 返回 `dict[name → SubagentConfig]`。
-
-`GENERAL_PURPOSE_PROMPT` / `RESEARCH_PROMPT` 都强制不得递归调用 `task` 工具，并要求结构化输出（含 citations）。
+`load_subagent_configs(agents_dir, ...)` 扫描所有一级子目录，跳过禁用或无效清单、拒绝重名，并在没有有效 Agent 或默认项数量不等于 1 时抛出 `SubagentConfigError`。
 
 ### 8.2 `subagents/registry.py`
 
-`SubagentRegistry(settings)`：构造时一次性 build 所有 builtin configs。`get_subagent_config(name, settings)` / `get_available_subagent_names(settings)` 是模块级便利函数，每次都新建 registry —— 因为内部只是 dict 构造，没有副作用。
+`SubagentRegistry(settings)`：构造时扫描 `settings.resolved_agents_dir`，提供 `get/list/names/default/available_agents_text`。每次创建注册表都会重新扫描，因此新增或修改目录定义可在后续主 Agent/任务构建时生效。
 
 ### 8.3 `subagents/store.py`
 
@@ -840,13 +858,13 @@ LangChain 1.x middleware 的钩子分类：`before_agent` / `after_agent`（agen
 
 #### 8.4.1 构造
 
-接收 `SubagentConfig`、`tools`、`settings`、`run_event_reporter`。`tools` 经 `_filter_tools` 处理：永远剥掉 `task`（防递归），再按 `config.allowed_tools` 白名单过滤。`model = create_chat_model(settings)` —— 与 lead agent 共享同一模型工厂。
+接收 `SubagentConfig`、`tools`、`settings`、`run_event_reporter`、`parent_thread_id`、`task_parameters`。`tools` 经 `_filter_tools` 处理：永远剥掉 `task`（防递归），再按 `config.allowed_tools` 白名单过滤。模型仍由 `create_chat_model` 创建；`main` profile 使用主配置，`memory` profile 使用 Memory 模型配置并关闭 Responses API。执行图用 `parent_thread_id` 建立线程上下文，使专用工具能定位所属会话，但子 Agent 的消息不会写入主 Agent 短期历史。
 
 #### 8.4.2 `LangGraph` graph
 
 子 agent **的确**包了一层 LangGraph：`StateGraph(dict)` 三节点 prepare → agent → finalize。
 
-- `_prepare`：把 prompt 和 system prompt 拼成初始 messages。
+- `_prepare`：把 system prompt 与动态委派消息拼成初始 messages；存在 `task_parameters` 时先注入 `<DelegatedTaskParameters format="json">`，再注入 `<TaskInstructions>`。
 - `_agent`：内部 `create_agent(model, tools)`（**没有** middleware 链，纯净的 LangChain agent）；调 `_invoke_agent` 走 stream 或 invoke，捕 `GraphRecursionError` → `_summarize_after_recursion_limit` 强制让模型生成"达到 max_turns"的总结返回，避免子任务静默挂起。
 - `_finalize`：`_last_ai_text` 取尾部 `AIMessage`，写回 `holder.result` / `status=COMPLETED` / `completed_at`。
 
@@ -865,8 +883,9 @@ LangChain 1.x middleware 的钩子分类：`before_agent` / `after_agent`（agen
 ### 8.5 `tools/task.py`（lead 侧入口）
 
 - `_semaphore = BoundedSemaphore(value=3)` —— 进程级硬上限，与 `subagent_max_concurrent` 默认值同步。
-- `task(description, prompt, subagent_type="general-purpose")`：subagents 关闭返回错误串；type 不存在时返回 `available` 列表；信号量 acquire 走 `timeout = config.timeout_seconds`，超时返回 `"Task timed out. Error: No subagent slot available after Xs"`。
+- `task(description, prompt, subagent_type="", parameters=None)`：空类型动态解析为清单中唯一的 `default=true` Agent；`parameters` 是结构化 JSON，会注入子 Agent 首轮上下文。subagents 关闭返回错误串；type 不存在时返回 `available` 列表；信号量 acquire 走 `timeout = config.timeout_seconds`，超时返回 `"Task timed out. Error: No subagent slot available after Xs"`。
 - 命中槽位后构造 `SubagentExecutor`：`tools=default_tools(include_task=False, include_images=False)`（再次保险禁用嵌套 task，并确保图片展示决策只属于 lead agent），`run_event_reporter` 优先用绑定时传入的，其次 fallback 到 `current_run_event_reporter()`。
+- `shenlun-quiz` 的 `parameters.question_count` 还会直接绑定为 `daily_quiz_update` 的委派题量；`prepare_generation` 把 1–30 写入 session，后续 draft/finalize 只认 session 题量。参数缺失时使用 `SUPERASSIST_DAILY_QUIZ_QUESTION_COUNT`。
 - 返回字符串格式：`Task Succeeded. Result: ...` / `Task timed out. Error: ...` / `Task failed. Error: ...`，由 lead agent 自然地拼回回答。
 
 `make_task_tool(reporter)` 是带闭包的工厂版本——`AgentRuntime` 在拿到 `tool_event_reporter` 后用它替换全局 `task` 实例，让流式 reporter 能贯穿父子层。
@@ -1053,16 +1072,9 @@ LangChain `@tool("team_task")`：
 <a id="11-tools"></a>
 ## 11. `tools/`
 
-`default_tools(include_task=True, include_team_task=False, include_images=True, run_event_reporter=None)` 返回工具列表：`[echo, list_files, read_file, write_file, delete_path, web_search, web_fetch, shell, (image_search, inspect_image, present_images), (task), (team_task)]`。`task` 默认替换为 `make_task_tool(reporter)` 绑定版本，使流式 reporter 可下钻到子 agent。
+`default_tools(include_task=True, include_team_task=False, include_images=True, run_event_reporter=None)` 返回工具列表：`[list_files, read_file, write_file, delete_path, web_search, web_fetch, shell, (image_search, inspect_image, present_images), (task), (team_task)]`。`task` 默认替换为 `make_task_tool(reporter)` 绑定版本，使流式 reporter 可下钻到子 agent。
 
-### 11.1 `tools/basic.py`
-
-| 工具 | 行为 |
-| --- | --- |
-| `echo(text) -> str` | 直接返回 `text`，烟测用。 |
-| `current_time() -> str` | 返回 `datetime.now(UTC).isoformat()`，**未挂入 `default_tools`**（运行时由 DynamicContextMiddleware 把 current time 注入 system prompt，不需要工具）。 |
-
-### 11.2 `tools/files.py` —— 工作区沙箱
+### 11.1 `tools/files.py` —— 工作区沙箱
 
 所有路径都被 `_resolve_workspace_path` clamp 到 `Settings.resolved_tool_workspace_dir.resolve()`：
 
@@ -1078,7 +1090,7 @@ LangChain `@tool("team_task")`：
 | `write_file(path, content, append=False)` | mode `"a"` / `"w"` | 自动 mkdir 父目录；返回 `OK`。 |
 | `delete_path(path, recursive=False)` | 只删工作区内的文件或目录 | `recursive=True` 调 `shutil.rmtree`；目录非空且 `recursive=False` 时 `rmdir` 自身抛错由外层 `ToolErrorMiddleware` 包成 ToolMessage。 |
 
-### 11.3 `tools/web.py`
+### 11.2 `tools/web.py`
 
 | 工具 | 行为 |
 | --- | --- |
@@ -1089,13 +1101,13 @@ LangChain `@tool("team_task")`：
 
 `_fetch_url`：1MB 读上限；从 `Content-Type` 抓 charset，缺失默认 utf-8；`errors="replace"` 容错。
 
-### 11.4 `tools/images.py`
+### 11.3 `tools/images.py`
 
 图片搜索由 lead agent 独占：`image_search(query, max_results=4)` 使用 DDGS 返回最多 8 个候选及低清真实图片，`inspect_image(candidate_ids)` 按需返回最多 4 张高清原图，`present_images(candidate_ids)` 最多选择 3 张写入 `outbound_images`。候选 ID 只在当前 invoke 有效，工具结果不会进入短期或长期记忆；未调用 `present_images` 时飞书不会发送任何搜索图片。
 
 外部图片下载会拒绝内网地址、限制大小并验证完整像素流，但不缩放或转码。飞书最终下载选中原图（失败时回退缩略图），通过 `im.v1.image.create(image_type=message)` 上传并写入卡片 `img` 元素；需要 `im:resource` 与 `im:message:send_as_bot`，媒体失败只降级为来源链接。
 
-### 11.5 `tools/shell.py`
+### 11.4 `tools/shell.py`
 
 工具关闭即返回错误串（`SUPERASSIST_TOOL_SHELL_ENABLED=false`）。打开后：
 
@@ -1105,15 +1117,15 @@ LangChain `@tool("team_task")`：
 - `_shell_args`：PowerShell 使用 `-NoProfile -ExecutionPolicy Bypass -Command`；cmd 用 `/c`；POSIX 用 `-c`。
 - timeout = `clamp(settings.tool_shell_timeout_seconds, [1, 600])`；输出包含 stdout / stderr / 非零 ExitCode 文本，最终 `_truncate(output, max_chars=tool_shell_output_max_chars)`，超长时中段替换为 `... [truncated N chars] ...`。
 
-### 11.6 `tools/task.py`
+### 11.5 `tools/task.py`
 
 见 §8.5。
 
-### 11.7 `tools/team.py`
+### 11.6 `tools/team.py`
 
 见 §10.4。
 
-### 11.8 `rag/tools.py`
+### 11.7 `rag/tools.py`
 
 `rag_search(query, mode="mix")` 从当前 `ContextVar` 获取 `RagTurnSession`，不接受调用方传入 `user_id`，因此模型无法越权检索其他用户目录。模式白名单最终由 `LightRAGService.retrieve` 校验为 `mix|hybrid|local|global|naive`，非法值回退到 `mix`。成功返回 `RAG_RETRIEVAL_SUCCESS + Sources + context`，失败返回 `RAG_RETRIEVAL_FAILED + attempts`，不抛出工具异常。
 
@@ -1165,6 +1177,7 @@ LangChain `@tool("team_task")`：
 | `chat_type` | `p2p` / `group` 等。 |
 | `mentions` | dict 列表，至少含 `name` / `open_id`。 |
 | `files` | `[{file_key} 或 {image_key}]`；图片进入多模态主 Agent，其他文件仍返回 unsupported。 |
+| `created_at` | 飞书 `create_time` 规范化后的 UTC ISO 时间；缺失时使用接收时间。 |
 | `topic_id` 属性 | `root_id or message_id`，用作 `FeishuThreadStore` 的 topic 维度。 |
 | `is_private` 属性 | `chat_type in {"p2p","private","single"}`。 |
 
@@ -1183,16 +1196,16 @@ LangChain `@tool("team_task")`：
 #### 13.2.2 处理入站
 
 `handle_inbound(inbound)`：
-1. 白名单：`feishu_allowed_open_id_set` 非空时严格匹配 sender。
-2. `should_trigger_agent`：私聊立即触发；群里需 `mention_only=False` 或确实有 @ 提及。
-3. `clean_mention_text` 去掉 @ 文本。
-4. scope 正忙时直接忽略新消息；图片以外的附件返回 `UNSUPPORTED_FILE_MESSAGE`。
-5. 每张图片按 10 MB 下载上限、每条消息最多 4 张；PNG/JPEG/GIF/WebP 原始字节直接进入模型，不校正方向、不缩放、不铺白、不转码。
-6. 可选 RapidOCR 在本地线程中逐图识别，结果标为不可信辅助文本；OCR 缺包、初始化或识别失败时 fail-open。
-7. 原图 Base64、OCR、当前用户问题组成一个 LangChain 多模态 `HumanMessage`，直接进入主 Agent。最新一组原图按 180 秒滑动 TTL 跨飞书消息保留，每条有效后续消息刷新计时；过期后清除原始字节，只复用历史中的 OCR、回答和 `<ImageDescription>`。同一轮 Skill/工具循环的每次模型调用也完整保留原图；GPT-5.6 显式关闭 `use_previous_response_id`，避免客户端省略旧图片输入。
-8. `runtime.run_streaming(message, message_content=...)` 的 `message` 只含 OCR 与用户问题，且用户问题位于末尾；`message_content` 才含 Base64。因此短期记忆持久化 OCR、问题、最终回答和图片描述，但不持久化图片数据。
-9. 构造 `report` 闭包流式处理 `thinking` / `agent_reasoning` / `agent_text` / `subagent_text`；正文开始后折叠 reasoning 面板。
-10. `runtime.memory_queue.flush()` 后提交最终卡片；任何异常回统一错误提示。
+1. 私聊先执行 sender 白名单；群聊中所有可见成员消息先写 `FeishuMessageStore`，白名单只决定谁能触发 Agent。
+2. `(channel,message_id)` 由 SQLite 唯一约束去重；图片在入口立即缓存原始字节，失败时保留 resource key 并在激活时重试。
+3. 私聊立即进入每 scope 串行锁；群聊需 `mention_only=False`、明确 @ 或测验回复才能触发。
+4. 群聊触发后等待 `activation_debounce_seconds=1.5` 的全消息静默窗口，任何文字或图片都会重置窗口；`activation_max_wait_seconds=6` 是硬上限。
+5. 水位内全部未消费消息按 seq 形成一个 `<FeishuConversationBatch>`，每条保留 message ID、sender open_id/name、时间、reply root 与 trigger 标记；Agent 成功后才推进消费游标。
+6. scope 正忙时新任务等待锁而非丢弃。Agent 运行期间到达但超过水位的消息留给下一次显式激活。
+7. 每张图片按 10 MB 下载上限处理；每批最多 `feishu_max_images_per_activation` 张直接进入模型，超限在批次中显式标记，不做无提示截断。
+8. 可选 RapidOCR 在本地线程中逐图识别，结果标为不可信辅助文本；OCR 缺包、初始化或识别失败时 fail-open。
+9. 当前轮的内容块按“成员文字/成员图片”关联；短期记忆只写 ConversationBatch 文本投影、OCR 和最终回答，不写 Base64。Writer 每批执行一次，并把 batch/message/sender provenance 写入节点 metadata。
+10. 构造 `report` 闭包流式处理 `thinking` / `agent_reasoning` / `agent_text` / `subagent_text`；`runtime.memory_queue.flush()` 后提交最终卡片，模型失败不推进消息游标。
 
 #### 13.2.3 卡片渲染
 
@@ -1221,6 +1234,12 @@ JSON 文件，路径来自 `Settings.feishu_thread_store_path`。
 | `created_at` / `updated_at` | epoch float。 |
 
 写入路径用 `tempfile.NamedTemporaryFile` + `Path.replace` 做原子替换；并发由 `threading.Lock` 保护。
+
+`FeishuMessageStore` 是独立 SQLite inbox，路径为 `channels/feishu_messages.sqlite3`：
+
+- `feishu_messages`：全量逐条群消息与单调 `seq`，`message_id` 唯一。
+- `feishu_image_payloads`：按 `(message_id,image_key)` 保存 MIME、SHA-256 与原始字节；批次成功推进消费游标时删除已消费图片，失败时保留供重试。
+- `feishu_conversation_cursors`：每 chat 已成功投影到短期记忆的最大 seq。
 
 ### 13.4 `FeishuChannelService.run_forever`
 

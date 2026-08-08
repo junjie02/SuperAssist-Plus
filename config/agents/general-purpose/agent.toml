@@ -1,0 +1,9 @@
+name = "general-purpose"
+description = "General autonomous worker for complex multi-step implementation, investigation, and codebase analysis."
+prompt_file = "system.md"
+enabled = true
+default = true
+model_profile = "main"
+allowed_tools = "*"
+timeout_seconds = 900
+max_turns = 20

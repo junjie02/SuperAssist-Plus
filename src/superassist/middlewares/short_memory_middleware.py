@@ -60,8 +60,6 @@ class ShortMemoryMiddleware(AgentMiddleware[SuperAssistState]):
             turn_records(
                 user_message=user_message,
                 assistant_answer=assistant_answer,
-                tool_events=[],
-                include_tool_events=False,
                 user_created_at=str(state.get("message_created_at") or "") or None,
                 assistant_created_at=assistant_created_at,
             ),

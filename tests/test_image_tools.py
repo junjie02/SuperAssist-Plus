@@ -166,10 +166,11 @@ def test_multimodal_tool_result_becomes_responses_function_output() -> None:
     model = create_chat_model(
         Settings(
             SUPERASSIST_MODEL="gpt-5.6-sol",
-            SUPERASSIST_API_KEY="test-key",
-            SUPERASSIST_BASE_URL="https://gateway.example/v1",
-            SUPERASSIST_EMBEDDING_PROVIDER="hash",
-        )
+                SUPERASSIST_API_KEY="test-key",
+                SUPERASSIST_BASE_URL="https://gateway.example/v1",
+                SUPERASSIST_EMBEDDING_PROVIDER="hash",
+                SUPERASSIST_USE_RESPONSES_API=True,
+            )
     )
     payload = model._get_request_payload(
         [

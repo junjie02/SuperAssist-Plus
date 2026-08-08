@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import UTC, datetime
 from collections.abc import Callable
@@ -18,6 +19,7 @@ from superassist.config import Settings, get_settings
 from superassist.llm import create_chat_model
 from superassist.models import AgentRunEvent
 from superassist.observability import runnable_trace_config, trace_extra, traceable, without_self
+from superassist.teams.context import team_thread_context
 
 from .config import SubagentConfig
 from .store import TASK_STORE, SubagentResult, SubagentStatus
@@ -32,13 +34,17 @@ class SubagentExecutor:
         tools: list[BaseTool],
         settings: Settings | None = None,
         run_event_reporter: Callable[[AgentRunEvent], None] | None = None,
+        parent_thread_id: str | None = None,
+        task_parameters: dict[str, Any] | None = None,
     ) -> None:
         self.config = config
         self.settings = settings or get_settings()
         self._run_event_reporter = run_event_reporter
+        self.parent_thread_id = parent_thread_id
+        self.task_parameters = dict(task_parameters or {})
         self._reported_subagent_text_seen: set[str] = set()
         self.tools = _filter_tools(tools, config.allowed_tools)
-        self.model = create_chat_model(self.settings)
+        self.model = create_chat_model(_settings_for_model_profile(self.settings, self.config.model_profile))
         self.graph = self._build_graph()
         logger.info(
             "SubagentExecutor initialized: subagent_type=%s tools=%s max_turns=%s timeout=%ss",
@@ -106,23 +112,7 @@ class SubagentExecutor:
         logger.info("Subagent task running: task_id=%s subagent_type=%s", holder.task_id, self.config.name)
         try:
             async with asyncio.timeout(self.config.timeout_seconds):
-                output = await asyncio.to_thread(
-                    self.graph.invoke,
-                    {
-                        "prompt": prompt,
-                        "messages": [],
-                        "result": holder,
-                    },
-                    runnable_trace_config(
-                        run_name="subagent.graph",
-                        tags=["subagent", self.config.name, "graph"],
-                        metadata={
-                            "task_id": holder.task_id,
-                            "description": holder.description,
-                            "subagent_type": holder.subagent_type,
-                        },
-                    ),
-                )
+                output = await asyncio.to_thread(self._invoke_graph, prompt, holder)
             updated = output.get("result", holder)
             if isinstance(updated, SubagentResult):
                 return updated
@@ -142,6 +132,26 @@ class SubagentExecutor:
             logger.exception("Subagent task failed: task_id=%s", holder.task_id)
             return holder
 
+    def _invoke_graph(self, prompt: str, holder: SubagentResult) -> dict[str, Any]:
+        with team_thread_context(self.parent_thread_id):
+            return self.graph.invoke(
+                {
+                    "prompt": prompt,
+                    "task_parameters": self.task_parameters,
+                    "messages": [],
+                    "result": holder,
+                },
+                runnable_trace_config(
+                    run_name="subagent.graph",
+                    tags=["subagent", self.config.name, "graph"],
+                    metadata={
+                        "task_id": holder.task_id,
+                        "description": holder.description,
+                        "subagent_type": holder.subagent_type,
+                        "parent_thread_id": self.parent_thread_id or "",
+                    },
+                ),
+            )
     def _build_graph(self):
         graph = StateGraph(dict)
         graph.add_node("prepare", self._prepare)
@@ -155,14 +165,24 @@ class SubagentExecutor:
 
     def _prepare(self, state: dict[str, Any]) -> dict[str, Any]:
         prompt = str(state.get("prompt") or "")
+        task_parameters = dict(state.get("task_parameters") or {})
+        delegated_prompt = prompt
+        if task_parameters:
+            delegated_prompt = (
+                '<DelegatedTaskParameters format="json">\n'
+                f"{json.dumps(task_parameters, ensure_ascii=False, separators=(',', ':'))}\n"
+                "</DelegatedTaskParameters>\n\n"
+                f"<TaskInstructions>\n{prompt}\n</TaskInstructions>"
+            )
         logger.info("Subagent prepare: subagent_type=%s prompt_len=%d", self.config.name, len(prompt))
         return {
             "prompt": prompt,
+            "task_parameters": task_parameters,
             "result": state["result"],
             "messages": [
                 SystemMessage(content=self.config.system_prompt),
-                HumanMessage(content=prompt),
-            ]
+                HumanMessage(content=delegated_prompt),
+            ],
         }
 
     def _agent(self, state: dict[str, Any]) -> dict[str, Any]:
@@ -182,6 +202,7 @@ class SubagentExecutor:
             TASK_STORE.put(holder)
             return {
                 "prompt": state.get("prompt", ""),
+                "task_parameters": state.get("task_parameters", {}),
                 "messages": [*messages, AIMessage(content=summary)],
                 "result": holder,
                 "recursion_limited": True,
@@ -195,7 +216,12 @@ class SubagentExecutor:
                     TASK_STORE.put(holder)
                     self._report_subagent_text(text, holder=holder)
                     logger.info("Subagent AI message: task_id=%s chars=%d", holder.task_id, len(text))
-        return {"prompt": state.get("prompt", ""), "messages": messages, "result": holder}
+        return {
+            "prompt": state.get("prompt", ""),
+            "task_parameters": state.get("task_parameters", {}),
+            "messages": messages,
+            "result": holder,
+        }
 
     def _invoke_agent(self, agent: Any, messages: list[BaseMessage], holder: SubagentResult) -> dict[str, Any]:
         if not hasattr(agent, "stream"):
@@ -308,6 +334,20 @@ def _filter_tools(tools: list[BaseTool], allowed: list[str] | None) -> list[Base
         return filtered
     allowed_set = set(allowed)
     return [tool for tool in filtered if tool.name in allowed_set]
+
+
+def _settings_for_model_profile(settings: Settings, profile: str) -> Settings:
+    if profile != "memory":
+        return settings
+    return settings.model_copy(
+        update={
+            "model": settings.memory_model,
+            "api_key": settings.memory_api_key or settings.api_key,
+            "base_url": settings.memory_base_url or settings.base_url,
+            "max_tokens": settings.memory_max_tokens,
+            "use_responses_api": False,
+        }
+    )
 
 
 def _last_ai_text(messages: list[Any]) -> str:

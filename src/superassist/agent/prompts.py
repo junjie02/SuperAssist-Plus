@@ -39,9 +39,6 @@ SYSTEM_PROMPT = """
 </memory_use>
 
 <daily_political_quiz>
-- When `<DailyPoliticalQuiz>` appears in the latest user turn, generate the complete requested set of four-option, single-best-answer political-theory questions in one run.
-- Submit the whole set with `daily_quiz_update(action="draft")`. After the tool validates it, review every answer against its evidence and call `daily_quiz_update(action="finalize")` with a concrete review summary.
-- Never expose questions, answers, explanations, source material, or internal review text in the generation response. The channel renders the saved question set.
 - A daily quiz answer is an ordinary conversation turn, not a separate quiz command or mode. When the user replies to the saved question set with a complete answer sheet, parse the ordered choices and call `daily_quiz_update(action="grading_context", answers=[...])` to load the private answer key, explanations, and evidence.
 - After loading `<DailyPoliticalQuizGrading>`, personally grade every answer and call `daily_quiz_update(action="grade")` with all judgements before presenting the complete score, per-question explanations, weaknesses, and review advice. The tool persists your judgements but does not decide correctness.
 </daily_political_quiz>
@@ -65,18 +62,19 @@ SYSTEM_PROMPT = """
 """.strip()
 
 
-def subagent_section(max_concurrent: int) -> str:
+def subagent_section(max_concurrent: int, agents_text: str) -> str:
     limit = max(1, min(3, max_concurrent))
     return f"""
 <subagent_system>
 You can delegate complex work to subagents using the `task` tool.
 
 Available subagents:
-- general-purpose: Complex multi-step implementation, investigation, and codebase analysis.
-- research: Source-backed research and synthesis using web/search tools.
+{agents_text}
 
 Rules:
-- Use subagents only when the request can be split into 2 or more meaningful parallel subtasks.
+- Use a domain-specific subagent whenever its description directly matches the request, even for one task.
+- When a subagent description documents structured parameters, pass them through the `task.parameters` object instead of relying only on prose.
+- Use a non-domain subagent only when delegation materially improves a complex task.
 - Use at most {limit} `task` calls in one response. Extra task calls are discarded.
 - For more than {limit} subtasks, run batches across turns.
 - Do not wrap simple one-step actions in `task`; use direct tools instead.
@@ -115,7 +113,10 @@ def compose_system_prompt(
     if available_skills:
         parts.append(available_skills)
     if settings.subagents_enabled:
-        parts.append(subagent_section(settings.subagent_max_concurrent))
+        from superassist.subagents import SubagentRegistry
+
+        registry = SubagentRegistry(settings)
+        parts.append(subagent_section(settings.subagent_max_concurrent, registry.available_agents_text()))
     if team_supervisor is not None and team_supervisor.enabled:
         parts.append(team_section(team_supervisor.available_agents_text()))
     elif team_config_error:

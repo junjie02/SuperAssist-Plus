@@ -32,6 +32,44 @@ def test_task_rejects_unknown_subagent(tmp_path, monkeypatch) -> None:
     assert "research" in result
 
 
+def test_blank_subagent_type_dispatches_directory_default(tmp_path, monkeypatch) -> None:
+    task_module = importlib.import_module("superassist.tools.task")
+    settings = Settings(
+        SUPERASSIST_DATA_DIR=tmp_path,
+        SUPERASSIST_EMBEDDING_PROVIDER="hash",
+        SUPERASSIST_SUBAGENTS_ENABLED=True,
+    )
+    captured = {}
+    monkeypatch.setattr(task_module, "get_settings", lambda: settings)
+
+    class FakeExecutor:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self, prompt, *, description):
+            return SubagentResult(
+                "t-default",
+                description,
+                captured["config"].name,
+                status=SubagentStatus.COMPLETED,
+                result="default ok",
+            )
+
+    monkeypatch.setattr(task_module, "SubagentExecutor", FakeExecutor)
+
+    result = task.invoke(
+        {
+            "description": "default",
+            "prompt": "do it",
+            "parameters": {"question_count": 5},
+        }
+    )
+
+    assert result == "Task Succeeded. Result: default ok"
+    assert captured["config"].name == "general-purpose"
+    assert captured["task_parameters"] == {"question_count": 5}
+
+
 def test_task_formats_success_failure_and_timeout(tmp_path, monkeypatch) -> None:
     task_module = importlib.import_module("superassist.tools.task")
     settings = Settings(

@@ -1,16 +1,141 @@
 import json
 
+from langchain.agents import create_agent
+from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.runnables import RunnableLambda
+from langchain_core.tools import tool
+from pydantic import Field
 
 from superassist.config import Settings
 from superassist.llm import (
+    FailoverChatModel,
     MiniMaxCompatibleChatModel,
     OneSecondRetryChatModel,
     create_chat_model,
     create_memory_model,
     is_minimax_model,
+    _route_messages,
 )
+
+
+def test_failover_model_switches_on_transient_failure_and_stays_on_route() -> None:
+    calls = []
+
+    def primary(_messages, **_kwargs):
+        calls.append("primary")
+        raise TimeoutError("primary timed out")
+
+    def secondary(_messages, **_kwargs):
+        calls.append("secondary")
+        return AIMessage(content="fallback answer")
+
+    model = FailoverChatModel(
+        [RunnableLambda(primary), RunnableLambda(secondary)],
+        ["gpt", "claude"],
+    )
+
+    first = model.invoke([HumanMessage(content="hello")])
+    second = model.invoke([HumanMessage(content="again")])
+
+    assert first.content == "fallback answer"
+    assert first.response_metadata["superassist_model_route"] == "claude"
+    assert second.content == "fallback answer"
+    assert calls == ["primary", "secondary", "secondary"]
+
+
+def test_failover_model_keeps_bound_tools_across_agent_route_switch() -> None:
+    class ToolLoopRoute(BaseChatModel):
+        fail: bool = False
+        calls: int = 0
+        bound_tool_names: list[str] = Field(default_factory=list)
+
+        @property
+        def _llm_type(self) -> str:
+            return "test-tool-loop-route"
+
+        def bind_tools(self, tools, *, tool_choice=None, **kwargs):  # type: ignore[no-untyped-def]
+            self.bound_tool_names = [item.name for item in tools]
+            return self
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            if self.fail:
+                raise TimeoutError("primary timed out")
+            tool_result = next(
+                (message.content for message in reversed(messages) if isinstance(message, ToolMessage)),
+                None,
+            )
+            if tool_result is not None:
+                message = AIMessage(content=f"finished with {tool_result}")
+            else:
+                message = AIMessage(
+                    content="",
+                    tool_calls=[{"name": "echo", "args": {"text": "hello"}, "id": "call_echo"}],
+                )
+            return ChatResult(generations=[ChatGeneration(message=message)])
+
+    @tool
+    def echo(text: str) -> str:
+        """Return text to the test agent."""
+
+        return f"echo:{text}"
+
+    primary = ToolLoopRoute(fail=True)
+    secondary = ToolLoopRoute()
+    model = FailoverChatModel([primary, secondary], ["gpt", "claude"])
+    agent = create_agent(model=model, tools=[echo])
+
+    result = agent.invoke({"messages": [HumanMessage(content="use the echo tool")]})
+
+    assert primary.bound_tool_names == ["echo"]
+    assert secondary.bound_tool_names == ["echo"]
+    assert primary.calls == 1
+    assert secondary.calls == 2
+    assert result["messages"][-1].content == "finished with echo:hello"
+
+
+def test_create_chat_model_builds_responses_primary_with_configured_fallbacks() -> None:
+    settings = Settings(
+        SUPERASSIST_MODEL="gpt-5.6-sol",
+        SUPERASSIST_API_KEY="primary-secret",
+        SUPERASSIST_USE_RESPONSES_API=True,
+        SUPERASSIST_CLAUDE_FALLBACK_API_KEY="claude-secret",
+        SUPERASSIST_CLAUDE_FALLBACK_BASE_URL="https://claude.example/v1",
+        SUPERASSIST_DEEPSEEK_FALLBACK_API_KEY="deepseek-secret",
+        SUPERASSIST_DEEPSEEK_FALLBACK_BASE_URL="https://deepseek.example/v1",
+    )
+
+    model = create_chat_model(settings)
+
+    assert isinstance(model, FailoverChatModel)
+    assert model._identifying_params["routes"] == [
+        "primary:gpt-5.6-sol",
+        "claude:claude-opus-5",
+        "deepseek:deepseek-v4-flash",
+    ]
+    assert model._routes[0].use_responses_api is True
+    assert model._routes[0].use_previous_response_id is False
+    assert model._routes[1].use_responses_api is False
+    assert model._routes[2].use_responses_api is False
+
+
+def test_deepseek_fallback_replaces_image_pixels_with_degradation_marker() -> None:
+    messages = [
+        HumanMessage(
+            content=[
+                {"type": "text", "text": "<AuxiliaryOCR>visible text</AuxiliaryOCR>"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U="}},
+            ]
+        )
+    ]
+
+    rendered = _route_messages(messages, "deepseek:deepseek-v4-flash")
+
+    assert all(item.get("type") != "image_url" for item in rendered[0].content)
+    assert any("VisionDegraded" in item.get("text", "") for item in rendered[0].content)
+    assert any("visible text" in item.get("text", "") for item in rendered[0].content)
 
 
 def test_minimax_defaults_temperature_to_one() -> None:
@@ -44,6 +169,7 @@ def test_gpt_5_6_uses_responses_api_with_reasoning_summary() -> None:
         SUPERASSIST_MODEL="gpt-5.6-sol",
         SUPERASSIST_API_KEY="secret",
         SUPERASSIST_REASONING_EFFORT="high",
+        SUPERASSIST_USE_RESPONSES_API=True,
     )
 
     model = create_chat_model(settings)
@@ -60,6 +186,7 @@ def test_gpt_5_6_none_effort_does_not_request_reasoning_summary() -> None:
         SUPERASSIST_MODEL="gpt-5.6-sol",
         SUPERASSIST_API_KEY="secret",
         SUPERASSIST_REASONING_EFFORT="none",
+        SUPERASSIST_USE_RESPONSES_API=True,
     )
 
     model = create_chat_model(settings)
@@ -68,10 +195,29 @@ def test_gpt_5_6_none_effort_does_not_request_reasoning_summary() -> None:
     assert payload["reasoning"] == {"effort": "none"}
 
 
+def test_gpt_5_6_can_use_chat_completions_for_compatible_gateways() -> None:
+    settings = Settings(
+        SUPERASSIST_MODEL="gpt-5.6-sol",
+        SUPERASSIST_API_KEY="secret",
+        SUPERASSIST_REASONING_EFFORT="medium",
+        SUPERASSIST_USE_RESPONSES_API=False,
+    )
+
+    model = create_chat_model(settings)
+    payload = model._get_request_payload([HumanMessage(content="hello")])
+
+    assert model.use_responses_api is False
+    assert payload["messages"] == [{"content": "hello", "role": "user"}]
+    assert payload["reasoning_effort"] == "medium"
+    assert "input" not in payload
+    assert "reasoning" not in payload
+
+
 def test_gpt_5_6_multimodal_message_becomes_responses_image_input() -> None:
     settings = Settings(
         SUPERASSIST_MODEL="gpt-5.6-sol",
         SUPERASSIST_API_KEY="secret",
+        SUPERASSIST_USE_RESPONSES_API=True,
     )
     model = create_chat_model(settings)
     content = [
@@ -97,6 +243,7 @@ def test_gpt_5_6_tool_followup_payload_still_contains_original_image() -> None:
     settings = Settings(
         SUPERASSIST_MODEL="gpt-5.6-sol",
         SUPERASSIST_API_KEY="secret",
+        SUPERASSIST_USE_RESPONSES_API=True,
     )
     model = create_chat_model(settings)
     image_url = "data:image/png;base64,aW1hZ2U="

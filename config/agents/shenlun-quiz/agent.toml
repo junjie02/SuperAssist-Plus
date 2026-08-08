@@ -1,0 +1,9 @@
+name = "shenlun-quiz"
+description = "根据近几日日报和错题本，生成并核验指定数量的政治理论选择题；可通过 task.parameters.question_count 指定 1-30 题，未指定时使用默认题量。"
+prompt_file = "system.md"
+enabled = true
+default = false
+model_profile = "memory"
+allowed_tools = ["daily_quiz_update", "read_file"]
+timeout_seconds = 600
+max_turns = 16

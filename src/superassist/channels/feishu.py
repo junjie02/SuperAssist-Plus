@@ -13,6 +13,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from html import escape
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -40,7 +41,7 @@ from .daily_quiz import (
     DailyQuizStore,
     get_daily_quiz_store,
 )
-from .store import FeishuThreadStore
+from .store import FeishuMessageStore, FeishuStoredMessage, FeishuThreadStore
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,6 @@ IMAGE_DOWNLOAD_FAILED_MESSAGE = (
 )
 IMAGE_TOO_LARGE_MESSAGE = "图片过大，暂时只支持 10 MB 以内的图片。"
 MAX_FEISHU_IMAGE_BYTES = 10 * 1024 * 1024
-MAX_FEISHU_IMAGES_PER_MESSAGE = 4
 SUPPORTED_MODEL_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 MULTIMODAL_RESPONSE_INSTRUCTIONS = """<MultimodalResponseInstructions>
 Inspect the original image(s) in this message and answer the user's request using the visual evidence directly.
@@ -74,6 +74,7 @@ class FeishuInboundMessage:
     chat_type: str = ""
     mentions: list[dict[str, Any]] = field(default_factory=list)
     files: list[dict[str, str]] = field(default_factory=list)
+    created_at: str = ""
 
     @property
     def topic_id(self) -> str:
@@ -105,6 +106,23 @@ class FeishuImageContext:
     expires_at: float
 
 
+@dataclass
+class FeishuPendingActivation:
+    trigger: FeishuInboundMessage
+    started_at: float
+    last_message_at: float
+    changed: asyncio.Event
+
+
+@dataclass(frozen=True)
+class FeishuBatchImage:
+    message_id: str
+    sender_open_id: str
+    index: int
+    data: bytes
+    mime_type: str
+
+
 class FeishuChannel:
     """Feishu/Lark WebSocket channel that calls AgentRuntime directly."""
 
@@ -114,22 +132,22 @@ class FeishuChannel:
         *,
         runtime_factory: Callable[..., AgentRuntime] | None = None,
         store: FeishuThreadStore | None = None,
+        message_store: FeishuMessageStore | None = None,
         monotonic_clock: Callable[[], float] = time.monotonic,
         daily_brief_trigger: (
             Callable[[str, DailyBriefProgressReporter | None], Awaitable[DailyBriefRunResult]] | None
         ) = None,
-        daily_quiz_trigger: Callable[[str], Awaitable[str]] | None = None,
         daily_quiz_store: DailyQuizStore | None = None,
     ) -> None:
         self.settings = settings
         self.store = store or FeishuThreadStore(settings.feishu_thread_store_path)
+        self.message_store = message_store or FeishuMessageStore(settings.feishu_message_store_path)
         self.runtime_factory = runtime_factory
         self.allowed_open_ids = settings.feishu_allowed_open_id_set
         self.mention_only = settings.feishu_mention_only
         self.active_session_seconds = settings.feishu_active_session_seconds
         self._monotonic_clock = monotonic_clock
         self.daily_brief_trigger = daily_brief_trigger
-        self.daily_quiz_trigger = daily_quiz_trigger
         self.daily_quiz_store = daily_quiz_store or get_daily_quiz_store(settings)
         self._active_group_until: dict[str, float] = {}
         self._main_loop: asyncio.AbstractEventLoop | None = None
@@ -139,7 +157,8 @@ class FeishuChannel:
         self._running_cards: dict[str, str] = {}
         self._last_card_text: dict[str, str] = {}
         self._card_views: dict[str, FeishuCardView] = {}
-        self._busy_scopes: set[str] = set()
+        self._scope_locks: dict[str, asyncio.Lock] = {}
+        self._pending_activations: dict[str, FeishuPendingActivation] = {}
         self._image_contexts: dict[str, FeishuImageContext] = {}
         self._image_context_expiry_handles: dict[str, asyncio.TimerHandle] = {}
         self._pending_card_updates: dict[
@@ -218,16 +237,45 @@ class FeishuChannel:
             handle.cancel()
         self._image_context_expiry_handles.clear()
         self._image_contexts.clear()
+        for pending in self._pending_activations.values():
+            pending.changed.set()
+        self._pending_activations.clear()
         if self._thread:
             self._thread.join(timeout=5)
             self._thread = None
 
     async def handle_inbound(self, inbound: FeishuInboundMessage) -> None:
-        if self.allowed_open_ids and inbound.sender_open_id not in self.allowed_open_ids:
+        sender_allowed = not self.allowed_open_ids or inbound.sender_open_id in self.allowed_open_ids
+        if inbound.is_private and not sender_allowed:
             logger.info("Ignoring Feishu message from non-allowed open_id=%s", inbound.sender_open_id)
             return
+        inserted, message_seq = self.message_store.add_message(
+            message_id=inbound.message_id,
+            chat_id=inbound.chat_id,
+            sender_open_id=inbound.sender_open_id,
+            sender_name=inbound.sender_name,
+            text=inbound.text,
+            root_id=inbound.root_id,
+            chat_type=inbound.chat_type,
+            mentions=inbound.mentions,
+            files=inbound.files,
+            created_at=inbound.created_at,
+        )
+        if not inserted:
+            logger.info("Ignoring duplicate Feishu message id=%s", inbound.message_id)
+            return
+        await self._cache_inbound_images(inbound)
+
+        scope_key = f"private:{inbound.chat_id}" if inbound.is_private else f"group:{inbound.chat_id}"
+        pending = self._pending_activations.get(scope_key)
+        if pending is not None:
+            pending.last_message_at = asyncio.get_running_loop().time()
+            pending.changed.set()
+
         clean_text = clean_mention_text(inbound.text, inbound.mentions).strip()
         accepted = self._should_accept_message(inbound)
+        if not sender_allowed:
+            accepted = False
         logger.info(
             "Feishu inbound gate chat_type=%s chat_suffix=%s mentioned=%s accepted=%s",
             inbound.chat_type or "unknown",
@@ -265,70 +313,108 @@ class FeishuChannel:
                 "failed": f"本次简报生成失败：{result.message}",
             }.get(result.status, result.message)
             await self._send_or_patch(inbound, status_text, final=True)
-            return
-        if clean_text.lower() == "/quiz":
-            if self.daily_quiz_trigger is None or not self.settings.daily_quiz_enabled:
-                await self._send_or_patch(inbound, "政治理论练习功能尚未启用。", final=True)
-                return
-            user_id, conversation_scope = feishu_memory_scope(inbound)
-            self.store.get_or_create_thread_id(
-                chat_id=inbound.chat_id,
-                topic_id=conversation_scope,
-                user_id=user_id,
-            )
-            await self._send_or_patch(inbound, "正在让主 Agent 生成今天的政治理论练习。", final=False)
-            result = await self.daily_quiz_trigger(inbound.chat_id)
-            await self._send_or_patch(inbound, result, final=True)
+            self.message_store.commit_consumed(inbound.chat_id, message_seq)
             return
         if not clean_text and not inbound.files:
             return
 
-        scope_key = f"private:{inbound.chat_id}" if inbound.is_private else f"group:{inbound.chat_id}"
-        if scope_key in self._busy_scopes:
-            logger.info(
-                "Ignoring Feishu message while scope is busy scope=%s message_suffix=%s",
-                scope_key,
-                inbound.message_id[-8:] if inbound.message_id else "unknown",
+        if not inbound.is_private:
+            if pending is not None:
+                if has_bot_mention(inbound):
+                    pending.trigger = inbound
+                return
+            loop_time = asyncio.get_running_loop().time()
+            pending = FeishuPendingActivation(
+                trigger=inbound,
+                started_at=loop_time,
+                last_message_at=loop_time,
+                changed=asyncio.Event(),
             )
+            self._pending_activations[scope_key] = pending
+            await self._collect_and_process_group(scope_key, pending)
             return
-        self._busy_scopes.add(scope_key)
+
+        lock = self._scope_locks.setdefault(scope_key, asyncio.Lock())
+        async with lock:
+            success = await self._process_single_message(inbound, clean_text, scope_key)
+        if success:
+            self.message_store.commit_consumed(inbound.chat_id, message_seq)
+
+    async def _collect_and_process_group(
+        self,
+        scope_key: str,
+        pending: FeishuPendingActivation,
+    ) -> None:
+        debounce = self.settings.feishu_activation_debounce_seconds
+        hard_deadline = pending.started_at + self.settings.feishu_activation_max_wait_seconds
         try:
-            active_image_context = self._get_image_context(scope_key)
-            images = [item for item in inbound.files if item.get("image_key")]
-            other_files = [item for item in inbound.files if not item.get("image_key")]
-            if other_files:
-                await self._send_or_patch(inbound, UNSUPPORTED_FILE_MESSAGE, final=True)
-                return
-            image_payloads: list[tuple[bytes, str]] = []
-            has_new_images = bool(images)
-            if images:
-                await self._send_or_patch(inbound, "Reading image...", final=False)
+            while debounce > 0:
+                now = asyncio.get_running_loop().time()
+                deadline = min(pending.last_message_at + debounce, hard_deadline)
+                if now >= deadline:
+                    break
                 try:
-                    clean_text = strip_file_placeholders(clean_text)
-                    image_payloads = await self._download_image_payloads(images, inbound.message_id)
-                except ImageTooLargeError:
-                    await self._send_or_patch(inbound, IMAGE_TOO_LARGE_MESSAGE, final=True)
-                    return
-                except ImageDownloadError:
-                    logger.exception("Failed to download Feishu image")
-                    await self._send_or_patch(inbound, IMAGE_DOWNLOAD_FAILED_MESSAGE, final=True)
-                    return
-            elif active_image_context is not None:
-                image_payloads = list(active_image_context.payloads)
-            if not clean_text and not image_payloads:
-                return
-            try:
-                await self._handle_scoped_message(
-                    inbound,
-                    clean_text,
-                    image_payloads,
-                    extract_image_ocr=has_new_images,
-                )
-            finally:
-                if image_payloads:
-                    self._set_image_context(scope_key, image_payloads)
+                    await asyncio.wait_for(pending.changed.wait(), timeout=deadline - now)
+                except TimeoutError:
+                    break
+                pending.changed.clear()
         finally:
-            self._busy_scopes.discard(scope_key)
+            if self._pending_activations.get(scope_key) is pending:
+                self._pending_activations.pop(scope_key, None)
+
+        through_seq = self.message_store.latest_seq(pending.trigger.chat_id)
+        lock = self._scope_locks.setdefault(scope_key, asyncio.Lock())
+        async with lock:
+            messages = self.message_store.list_unconsumed(
+                pending.trigger.chat_id,
+                through_seq=through_seq,
+            )
+            if not messages:
+                return
+            success = await self._process_group_batch(pending.trigger, messages, scope_key)
+            if success:
+                self.message_store.commit_consumed(pending.trigger.chat_id, through_seq)
+
+    async def _process_single_message(
+        self,
+        inbound: FeishuInboundMessage,
+        clean_text: str,
+        scope_key: str,
+    ) -> bool:
+        active_image_context = self._get_image_context(scope_key)
+        images = [item for item in inbound.files if item.get("image_key")]
+        other_files = [item for item in inbound.files if not item.get("image_key")]
+        if other_files:
+            await self._send_or_patch(inbound, UNSUPPORTED_FILE_MESSAGE, final=True)
+            return True
+        image_payloads: list[tuple[bytes, str]] = []
+        has_new_images = bool(images)
+        if images:
+            await self._send_or_patch(inbound, "Reading image...", final=False)
+            try:
+                clean_text = strip_file_placeholders(clean_text)
+                image_payloads = await self._download_image_payloads(images, inbound.message_id)
+            except ImageTooLargeError:
+                await self._send_or_patch(inbound, IMAGE_TOO_LARGE_MESSAGE, final=True)
+                return False
+            except ImageDownloadError:
+                logger.exception("Failed to download Feishu image")
+                await self._send_or_patch(inbound, IMAGE_DOWNLOAD_FAILED_MESSAGE, final=True)
+                return False
+        elif active_image_context is not None:
+            image_payloads = list(active_image_context.payloads)
+        if not clean_text and not image_payloads:
+            return True
+        try:
+            return await self._handle_scoped_message(
+                inbound,
+                clean_text,
+                image_payloads,
+                extract_image_ocr=has_new_images,
+            )
+        finally:
+            if image_payloads:
+                self._set_image_context(scope_key, image_payloads)
 
     def _should_accept_message(self, inbound: FeishuInboundMessage) -> bool:
         if inbound.is_private or not self.mention_only:
@@ -336,16 +422,7 @@ class FeishuChannel:
 
         if self.daily_quiz_store.is_active_reply(inbound.chat_id, inbound.root_id):
             return True
-
-        now = self._monotonic_clock()
-        expires_at = self._active_group_until.get(inbound.chat_id)
-        mentioned = has_bot_mention(inbound)
-        if not mentioned and (expires_at is None or now >= expires_at):
-            self._active_group_until.pop(inbound.chat_id, None)
-            return False
-
-        self._active_group_until[inbound.chat_id] = now + self.active_session_seconds
-        return True
+        return has_bot_mention(inbound)
 
     async def _download_image_payloads(
         self,
@@ -355,11 +432,130 @@ class FeishuChannel:
         return list(
             await asyncio.gather(
                 *(
-                    self._download_image(message_id, item["image_key"])
-                    for item in images[:MAX_FEISHU_IMAGES_PER_MESSAGE]
+                    self._get_or_download_image(message_id, item["image_key"])
+                    for item in images
                 )
             )
         )
+
+    async def _cache_inbound_images(self, inbound: FeishuInboundMessage) -> None:
+        images = [item for item in inbound.files if item.get("image_key")]
+        if not images:
+            return
+        for item in images:
+            image_key = item["image_key"]
+            if self.message_store.get_image(message_id=inbound.message_id, image_key=image_key):
+                continue
+            try:
+                data, mime_type = await self._download_image(inbound.message_id, image_key)
+            except (ImageTooLargeError, ImageDownloadError):
+                logger.warning(
+                    "Could not cache Feishu image at ingress message_suffix=%s",
+                    inbound.message_id[-8:] if inbound.message_id else "unknown",
+                )
+                continue
+            self.message_store.save_image(
+                message_id=inbound.message_id,
+                image_key=image_key,
+                data=data,
+                mime_type=mime_type,
+            )
+
+    async def _get_or_download_image(self, message_id: str, image_key: str) -> tuple[bytes, str]:
+        cached = self.message_store.get_image(message_id=message_id, image_key=image_key)
+        if cached is not None:
+            return cached
+        data, mime_type = await self._download_image(message_id, image_key)
+        self.message_store.save_image(
+            message_id=message_id,
+            image_key=image_key,
+            data=data,
+            mime_type=mime_type,
+        )
+        return data, mime_type
+
+    async def _process_group_batch(
+        self,
+        trigger: FeishuInboundMessage,
+        messages: list[FeishuStoredMessage],
+        scope_key: str,
+    ) -> bool:
+        trigger_text = clean_mention_text(trigger.text, trigger.mentions).strip()
+        is_effort_command, _requested_effort = parse_effort_command(trigger_text)
+        if is_effort_command:
+            return await self._handle_scoped_message(trigger, trigger_text)
+
+        image_specs: list[tuple[FeishuStoredMessage, dict[str, str]]] = []
+        for message in messages:
+            image_specs.extend(
+                (message, item)
+                for item in message.files
+                if item.get("image_key")
+            )
+        omitted_images = max(0, len(image_specs) - self.settings.feishu_max_images_per_activation)
+        image_specs = image_specs[: self.settings.feishu_max_images_per_activation]
+        batch_images: list[FeishuBatchImage] = []
+        if image_specs:
+            await self._send_or_patch(trigger, "Reading images...", final=False)
+            try:
+                payloads = await asyncio.gather(
+                    *(
+                        self._get_or_download_image(message.message_id, item["image_key"])
+                        for message, item in image_specs
+                    )
+                )
+            except ImageTooLargeError:
+                await self._send_or_patch(trigger, IMAGE_TOO_LARGE_MESSAGE, final=True)
+                return False
+            except ImageDownloadError:
+                logger.exception("Failed to download Feishu batch images")
+                await self._send_or_patch(trigger, IMAGE_DOWNLOAD_FAILED_MESSAGE, final=True)
+                return False
+            for index, ((message, _item), (data, mime_type)) in enumerate(
+                zip(image_specs, payloads, strict=True),
+                start=1,
+            ):
+                batch_images.append(
+                    FeishuBatchImage(
+                        message_id=message.message_id,
+                        sender_open_id=message.sender_open_id,
+                        index=index,
+                        data=data,
+                        mime_type=mime_type,
+                    )
+                )
+
+        ocr_text = await self._extract_images_ocr(
+            [(item.data, item.mime_type) for item in batch_images]
+        ) if batch_images else ""
+        runtime_text = build_feishu_conversation_batch(
+            messages,
+            ocr_text=ocr_text,
+            omitted_images=omitted_images,
+            trigger_message_ids={trigger.message_id},
+        )
+        message_content: str | list[dict[str, Any]] = runtime_text
+        if batch_images:
+            message_content = build_feishu_batch_multimodal_content(runtime_text, batch_images)
+        success = await self._handle_scoped_message(
+            trigger,
+            trigger_text or default_image_only_request(len(batch_images)),
+            runtime_text_override=runtime_text,
+            message_content_override=message_content,
+            memory_query=trigger_text or runtime_text[-4000:],
+            memory_source_context={
+                "batch_id": f"feishu:{trigger.chat_id}:{messages[0].seq}:{messages[-1].seq}",
+                "message_ids": [message.message_id for message in messages],
+                "sender_ids": list(dict.fromkeys(message.sender_open_id for message in messages)),
+                "channel": "feishu",
+            },
+        )
+        if success and batch_images:
+            self._set_image_context(
+                scope_key,
+                [(item.data, item.mime_type) for item in batch_images],
+            )
+        return success
 
     async def _download_image(self, message_id: str, image_key: str) -> tuple[bytes, str]:
         try:
@@ -398,7 +594,11 @@ class FeishuChannel:
         image_payloads: list[tuple[bytes, str]] | None = None,
         *,
         extract_image_ocr: bool = True,
-    ) -> None:
+        runtime_text_override: str | None = None,
+        message_content_override: str | list[dict[str, Any]] | None = None,
+        memory_query: str | None = None,
+        memory_source_context: dict[str, Any] | None = None,
+    ) -> bool:
         user_id, conversation_scope = feishu_memory_scope(inbound)
         thread_id = self.store.get_or_create_thread_id(
             chat_id=inbound.chat_id,
@@ -432,13 +632,13 @@ class FeishuChannel:
                 )
                 response = f"已将当前会话的推理强度设置为 `{requested_effort}`。"
             await self._send_or_patch(inbound, response, final=True)
-            return
+            return True
 
         await self._send_or_patch(inbound, "Preparing context...", final=False)
         memory_text = clean_text or default_image_only_request(len(image_payloads or []))
-        runtime_text = attributed_feishu_text(inbound, memory_text)
-        message_content: str | list[dict[str, Any]] = runtime_text
-        if image_payloads:
+        runtime_text = runtime_text_override or attributed_feishu_text(inbound, memory_text)
+        message_content: str | list[dict[str, Any]] = message_content_override or runtime_text
+        if image_payloads and runtime_text_override is None:
             ocr_text = await self._extract_images_ocr(image_payloads) if extract_image_ocr else ""
             persisted_text = build_image_memory_text(runtime_text, ocr_text)
             message_content = build_multimodal_image_content(
@@ -491,8 +691,12 @@ class FeishuChannel:
                 reasoning_effort=reasoning_effort,
             )
             runtime_kwargs: dict[str, Any] = {"user_id": user_id, "thread_id": thread_id}
-            if image_payloads:
+            if image_payloads or isinstance(message_content, list):
                 runtime_kwargs["message_content"] = message_content
+            if memory_query and isinstance(runtime, AgentRuntime):
+                runtime_kwargs["memory_query"] = memory_query
+            if memory_source_context and isinstance(runtime, AgentRuntime):
+                runtime_kwargs["memory_source_context"] = memory_source_context
             result = await asyncio.to_thread(
                 runtime.run_streaming,
                 runtime_text,
@@ -508,7 +712,10 @@ class FeishuChannel:
             await self._flush_card_updates(inbound.message_id)
             final_text = result.answer.strip() or self._last_card_text.get(inbound.message_id, "") or "(empty response)"
             if result.metadata.get("model_error"):
-                final_text = format_model_error(result.metadata, has_images=bool(image_payloads))
+                final_text = format_model_error(
+                    result.metadata,
+                    has_images=bool(image_payloads) or isinstance(message_content, list),
+                )
             previous = self._card_views.get(inbound.message_id)
             outbound_images = await self._prepare_outbound_images(result.metadata.get("outbound_images"))
             final_view: str | FeishuCardView = final_text
@@ -519,11 +726,21 @@ class FeishuChannel:
                     reasoning_expanded=False,
                     images=tuple(outbound_images),
                 )
-            await self._send_or_patch(inbound, final_view, final=True)
+            card_id = await self._send_or_patch(inbound, final_view, final=True)
+            active_quiz = self.daily_quiz_store.active_session(thread_id)
+            if (
+                card_id
+                and active_quiz
+                and not active_quiz.get("question_message_id")
+                and "政治理论·单项选择" in final_text
+            ):
+                self.daily_quiz_store.set_question_message_id(thread_id, card_id)
+            return not bool(result.metadata.get("model_error"))
         except Exception:
             logger.exception("Feishu agent run failed")
             await self._flush_card_updates(inbound.message_id)
             await self._send_or_patch(inbound, "处理这条飞书消息时出错了，请稍后重试。", final=True)
+            return False
         finally:
             close = getattr(runtime, "close", None)
             if callable(close):
@@ -828,7 +1045,7 @@ class FeishuChannel:
         return message_id
 
     async def start_daily_quiz(self, chat_id: str, scheduled_for: datetime) -> str:
-        """Ask the main Agent to create the scheduled political-theory question set."""
+        """Dispatch the scheduled question set to the dedicated quiz subagent."""
 
         entry = self.store.get_latest_chat_entry(chat_id)
         if entry is None:
@@ -841,47 +1058,33 @@ class FeishuChannel:
             return text
 
         thread_id = str(entry["thread_id"])
-        prompt = self.daily_quiz_store.build_start_prompt(chat_id, thread_id, scheduled_for)
-        runtime: AgentRuntime | None = None
+        self.daily_quiz_store.start_session(chat_id, thread_id, scheduled_for, replace_existing=True)
         try:
-            effort = self.store.get_reasoning_effort(
-                chat_id=chat_id,
-                topic_id=str(entry.get("topic_id") or "__group__"),
-                default=self.settings.reasoning_effort,
-            )
-            runtime = self._create_runtime(
-                lambda _event: None,
-                reasoning_effort=effort,
-            )
+            from superassist.tools.task import run_task
+
             result = await asyncio.to_thread(
-                runtime.run,
-                prompt,
-                user_id=str(entry["user_id"]),
-                thread_id=thread_id,
-                memory_query="开始近三日日报政治理论选择题测验",
-                suppress_memory_write=True,
-                suppress_short_memory_write=True,
+                run_task,
+                "生成今日政治理论练习",
+                "根据工具提供的近几日日报和错题材料，生成、核验并保存今天的完整政治理论题组。",
+                subagent_type="shenlun-quiz",
+                parent_thread_id=thread_id,
+                settings=self.settings,
             )
-            runtime.memory_queue.flush()
-            if result.metadata.get("model_error"):
-                raise RuntimeError(result.metadata.get("model_error_message") or result.metadata["model_error"])
+            if not result.startswith("Task Succeeded."):
+                raise RuntimeError(result)
             current = self.daily_quiz_store.current_quiz_text(thread_id)
             if not current:
-                raise RuntimeError("main Agent did not finalize a complete quiz set")
+                raise RuntimeError("quiz subagent did not finalize a complete quiz set")
             message_id = await self._create_card(chat_id, current)
             self.daily_quiz_store.set_question_message_id(thread_id, message_id)
             if message_id:
                 self._remember_quiz_visible_question(thread_id, current)
             return "政治理论测验已生成并完成检查，请在新卡片中一次提交全部答案。"
         except Exception as exc:
-            logger.exception("Main Agent failed to start daily quiz chat_suffix=%s", chat_id[-8:])
+            logger.exception("Quiz subagent failed to start daily quiz chat_suffix=%s", chat_id[-8:])
             text = f"政治理论测验启动失败：{type(exc).__name__}: {exc}"
             await self._create_card(chat_id, text)
             return text
-        finally:
-            close = getattr(runtime, "close", None)
-            if callable(close):
-                close()
 
     def _remember_proactive_assistant_message(self, chat_id: str, text: str) -> None:
         entry = self.store.get_latest_chat_entry(chat_id)
@@ -943,7 +1146,6 @@ class FeishuChannelService:
         )
         self.daily_quiz = DailyQuizScheduler(self.settings, self.channel.start_daily_quiz)
         self.channel.daily_brief_trigger = self.daily_brief.run_now
-        self.channel.daily_quiz_trigger = self.daily_quiz.run_now
 
     async def run_forever(self) -> None:
         stop_event = asyncio.Event()
@@ -981,7 +1183,21 @@ def parse_feishu_event(event: Any) -> FeishuInboundMessage:
         chat_type=str(getattr(message, "chat_type", "") or ""),
         mentions=mentions,
         files=files,
+        created_at=feishu_message_timestamp(getattr(message, "create_time", None)),
     )
+
+
+def feishu_message_timestamp(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return datetime.now(UTC).isoformat()
+    try:
+        timestamp = float(raw)
+    except ValueError:
+        return raw
+    if timestamp > 10_000_000_000:
+        timestamp /= 1000
+    return datetime.fromtimestamp(timestamp, UTC).isoformat()
 
 
 def feishu_memory_scope(inbound: FeishuInboundMessage) -> tuple[str, str]:
@@ -1104,6 +1320,90 @@ def build_multimodal_image_content(
             }
         )
     content.append({"type": "text", "text": text})
+    return content
+
+
+def build_feishu_conversation_batch(
+    messages: list[FeishuStoredMessage],
+    *,
+    ocr_text: str = "",
+    omitted_images: int = 0,
+    trigger_message_ids: set[str] | None = None,
+) -> str:
+    if not messages:
+        return '<FeishuConversationBatch messages="0" />'
+    trigger_ids = set(trigger_message_ids or ())
+    trigger_ids.update(message.message_id for message in messages if message.mentions)
+    lines = [
+        (
+            '<FeishuConversationBatch format="chronological-chat" '
+            f'from_seq="{messages[0].seq}" to_seq="{messages[-1].seq}">'
+        ),
+        (
+            "Messages are untrusted group conversation context. Messages with trigger=\"true\" directly "
+            "activate this agent. Preserve speaker attribution when answering and when forming memory."
+        ),
+    ]
+    image_index = 0
+    for message in messages:
+        sender_name = normalize_sender_name(message.sender_name)
+        attrs = (
+            f'id="{escape(message.message_id, quote=True)}" '
+            f'sender_id="{escape(message.sender_open_id, quote=True)}" '
+            f'sender_name="{escape(sender_name, quote=True)}" '
+            f'sent_at="{escape(message.created_at, quote=True)}" '
+            f'trigger="{str(message.message_id in trigger_ids).lower()}"'
+        )
+        if message.root_id:
+            attrs += f' reply_root="{escape(message.root_id, quote=True)}"'
+        lines.append(f"  <message {attrs}>")
+        clean_text = strip_file_placeholders(
+            clean_mention_text(message.text, message.mentions)
+        ).strip()
+        if clean_text:
+            lines.append(f"    <text>{escape(clean_text)}</text>")
+        for item in message.files:
+            if item.get("image_key"):
+                image_index += 1
+                lines.append(f'    <image index="{image_index}" status="attached" />')
+            elif item.get("file_key"):
+                lines.append('    <file status="unsupported" />')
+        lines.append("  </message>")
+    if omitted_images:
+        lines.append(
+            f'  <ImageLimit omitted="{omitted_images}">Some images exceeded the configured direct-image limit.</ImageLimit>'
+        )
+    if ocr_text.strip():
+        lines.append("  " + format_auxiliary_ocr(ocr_text).replace("\n", "\n  "))
+    lines.append("</FeishuConversationBatch>")
+    return "\n".join(lines)
+
+
+def build_feishu_batch_multimodal_content(
+    batch_text: str,
+    images: list[FeishuBatchImage],
+) -> list[dict[str, Any]]:
+    content: list[dict[str, Any]] = [
+        {"type": "text", "text": MULTIMODAL_RESPONSE_INSTRUCTIONS},
+        {"type": "text", "text": batch_text},
+    ]
+    for image in images:
+        content.append(
+            {
+                "type": "text",
+                "text": (
+                    f"Image {image.index} belongs to Feishu message {image.message_id} "
+                    f"from sender {image.sender_open_id}."
+                ),
+            }
+        )
+        encoded = base64.b64encode(image.data).decode("ascii")
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{image.mime_type};base64,{encoded}"},
+            }
+        )
     return content
 
 

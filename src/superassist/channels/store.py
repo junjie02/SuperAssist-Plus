@@ -1,11 +1,249 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import sqlite3
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+
+@dataclass(frozen=True)
+class FeishuStoredMessage:
+    seq: int
+    message_id: str
+    chat_id: str
+    sender_open_id: str
+    sender_name: str
+    text: str
+    root_id: str | None
+    chat_type: str
+    mentions: list[dict[str, Any]]
+    files: list[dict[str, str]]
+    created_at: str
+
+
+class FeishuMessageStore:
+    """Durable, idempotent inbox for all visible Feishu messages."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._init_schema()
+
+    def add_message(
+        self,
+        *,
+        message_id: str,
+        chat_id: str,
+        sender_open_id: str,
+        sender_name: str,
+        text: str,
+        root_id: str | None,
+        chat_type: str,
+        mentions: list[dict[str, Any]],
+        files: list[dict[str, str]],
+        created_at: str,
+    ) -> tuple[bool, int]:
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO feishu_messages (
+                    message_id, chat_id, sender_open_id, sender_name, text,
+                    root_id, chat_type, mentions_json, files_json, created_at, received_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    chat_id,
+                    sender_open_id,
+                    sender_name,
+                    text,
+                    root_id,
+                    chat_type,
+                    json.dumps(mentions, ensure_ascii=False),
+                    json.dumps(files, ensure_ascii=False),
+                    created_at or now,
+                    now,
+                ),
+            )
+            inserted = cursor.rowcount > 0
+            row = conn.execute(
+                "SELECT seq FROM feishu_messages WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"Feishu message was not persisted: {message_id}")
+            return inserted, int(row[0])
+
+    def list_unconsumed(self, chat_id: str, *, through_seq: int | None = None) -> list[FeishuStoredMessage]:
+        with self._lock, self._connect() as conn:
+            cursor_row = conn.execute(
+                "SELECT consumed_seq FROM feishu_conversation_cursors WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+            consumed_seq = int(cursor_row[0]) if cursor_row else 0
+            if through_seq is None:
+                rows = conn.execute(
+                    "SELECT * FROM feishu_messages WHERE chat_id = ? AND seq > ? ORDER BY seq",
+                    (chat_id, consumed_seq),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM feishu_messages WHERE chat_id = ? AND seq > ? AND seq <= ? ORDER BY seq",
+                    (chat_id, consumed_seq, through_seq),
+                ).fetchall()
+        return [self._to_message(row) for row in rows]
+
+    def latest_seq(self, chat_id: str) -> int:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM feishu_messages WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def commit_consumed(self, chat_id: str, through_seq: int) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO feishu_conversation_cursors (chat_id, consumed_seq, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    consumed_seq = MAX(consumed_seq, excluded.consumed_seq),
+                    updated_at = excluded.updated_at
+                """,
+                (chat_id, through_seq, now),
+            )
+            conn.execute(
+                """
+                DELETE FROM feishu_image_payloads
+                WHERE message_id IN (
+                    SELECT message_id FROM feishu_messages
+                    WHERE chat_id = ? AND seq <= ?
+                )
+                """,
+                (chat_id, through_seq),
+            )
+
+    def save_image(
+        self,
+        *,
+        message_id: str,
+        image_key: str,
+        data: bytes,
+        mime_type: str,
+    ) -> None:
+        try:
+            with self._lock, self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO feishu_image_payloads (
+                        message_id, image_key, sha256, mime_type, data, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(message_id, image_key) DO NOTHING
+                    """,
+                    (
+                        message_id,
+                        image_key,
+                        hashlib.sha256(data).hexdigest(),
+                        mime_type,
+                        data,
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            # Direct helper callers may download before their message has entered the inbox.
+            return
+
+    def get_image(self, *, message_id: str, image_key: str) -> tuple[bytes, str] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT data, mime_type FROM feishu_image_payloads WHERE message_id = ? AND image_key = ?",
+                (message_id, image_key),
+            ).fetchone()
+        if row is None:
+            return None
+        return bytes(row["data"]), str(row["mime_type"])
+
+    def _init_schema(self) -> None:
+        with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS feishu_messages (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id TEXT NOT NULL UNIQUE,
+                    chat_id TEXT NOT NULL,
+                    sender_open_id TEXT NOT NULL,
+                    sender_name TEXT NOT NULL DEFAULT '',
+                    text TEXT NOT NULL DEFAULT '',
+                    root_id TEXT,
+                    chat_type TEXT NOT NULL DEFAULT '',
+                    mentions_json TEXT NOT NULL DEFAULT '[]',
+                    files_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    received_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_feishu_messages_chat_seq
+                    ON feishu_messages(chat_id, seq);
+                CREATE TABLE IF NOT EXISTS feishu_conversation_cursors (
+                    chat_id TEXT PRIMARY KEY,
+                    consumed_seq INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS feishu_image_payloads (
+                    message_id TEXT NOT NULL,
+                    image_key TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    data BLOB NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(message_id, image_key),
+                    FOREIGN KEY(message_id) REFERENCES feishu_messages(message_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_feishu_image_payloads_sha256
+                    ON feishu_image_payloads(sha256);
+                """
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=30)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 30000")
+        return connection
+
+    @staticmethod
+    def _to_message(row: sqlite3.Row) -> FeishuStoredMessage:
+        return FeishuStoredMessage(
+            seq=int(row["seq"]),
+            message_id=str(row["message_id"]),
+            chat_id=str(row["chat_id"]),
+            sender_open_id=str(row["sender_open_id"]),
+            sender_name=str(row["sender_name"] or ""),
+            text=str(row["text"] or ""),
+            root_id=str(row["root_id"]) if row["root_id"] else None,
+            chat_type=str(row["chat_type"] or ""),
+            mentions=_json_list(row["mentions_json"]),
+            files=_json_list(row["files_json"]),
+            created_at=str(row["created_at"]),
+        )
+
+
+def _json_list(value: Any) -> list[Any]:
+    try:
+        parsed = json.loads(str(value or "[]"))
+    except json.JSONDecodeError:
+        return []
+    return parsed if isinstance(parsed, list) else []
 
 
 class FeishuThreadStore:
@@ -62,6 +300,15 @@ class FeishuThreadStore:
         if not matches:
             return None
         return max(matches, key=lambda item: float(item.get("updated_at") or 0.0))
+
+    def get_entry_by_thread_id(self, thread_id: str) -> dict[str, Any] | None:
+        """Resolve the Feishu conversation that owns a main-agent thread."""
+
+        with self._lock:
+            for key, entry in self._data.items():
+                if entry.get("thread_id") == thread_id:
+                    return {**entry, "key": key}
+        return None
 
     def get_reasoning_effort(self, *, chat_id: str, topic_id: str, default: str) -> str:
         key = self._key(chat_id, topic_id)

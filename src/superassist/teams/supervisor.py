@@ -15,7 +15,6 @@ an :class:`AsyncLoopThread` plus a per-(thread, workspace) cache of
 from __future__ import annotations
 
 import logging
-import shutil
 import threading
 import time
 from dataclasses import dataclass
@@ -229,26 +228,11 @@ class TeamMember:
         self._sessions.clear()
         for session in sessions:
             await session.close()
-
-
-# -- Backwards-compatible aliases for tests that import the old names ----
-
-TeamMemberProcess = TeamMember
-
-
-def _resolve_command(command: str) -> str:
-    """Compatibility shim: previously exposed by supervisor; now backed by shutil.which."""
-
-    return shutil.which(command) or command
-
-
 __all__ = [
     "TeamMember",
-    "TeamMemberProcess",
     "TeamSupervisor",
     "TeamSupervisorError",
     "TeamTaskResult",
-    "_resolve_command",
     "get_team_supervisor",
     "set_team_supervisor",
 ]

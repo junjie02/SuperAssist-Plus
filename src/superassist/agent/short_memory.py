@@ -63,12 +63,6 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    content = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
-    path.write_text(content, encoding="utf-8")
-
-
 def append_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -118,8 +112,6 @@ def turn_records(
     *,
     user_message: str,
     assistant_answer: str,
-    tool_events: list[dict[str, Any]],
-    include_tool_events: bool,
     user_created_at: str | None = None,
     assistant_created_at: str | None = None,
 ) -> list[dict[str, Any]]:

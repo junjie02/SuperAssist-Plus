@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from langchain_core.tools import BaseTool
 
-from superassist.tools.basic import echo
 from superassist.tools.files import delete_path, list_files, read_file, write_file
 from superassist.tools.images import image_search, inspect_image, present_images
 from superassist.tools.shell import shell as shell_tool
@@ -18,7 +17,6 @@ def default_tools(
     run_event_reporter=None,
 ) -> list[BaseTool]:
     tools = [
-        echo,
         list_files,
         read_file,
         write_file,

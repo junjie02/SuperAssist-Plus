@@ -39,10 +39,10 @@ Go 是面向浏览器的产品入口：负责认证、WebSocket 生命周期、�
 - **长期记忆**：`event/concept/intent/time` 四类节点、九类边，结合向量入口、BFS、Personalized PageRank、时间和访问频次召回。
 - **LightRAG 知识库**：批量上传 PDF、DOCX、PPTX、XLSX、TXT、Markdown、JSON、CSV 和 HTML，异步完成切片、实体关系抽取和建图。
 - **Agentic RAG**：首轮默认 `mix` 检索；证据不足时允许模型改写查询，并由中间件保证最多完成三轮检索。失败后可按工具配置联网，最终回答明确标注上传资料、网页或模型知识来源。
-- **工具与 Subagent**：支持文件、网页、主 Agent 图片搜索和可选 Shell 工具，通过 `task` 把复杂任务交给 general-purpose 或 research 子 Agent。图片候选只作为本轮临时视觉上下文，主 Agent 明确选择后才会发送到飞书。
+- **工具与 Subagent**：支持文件、网页、主 Agent 图片搜索和可选 Shell 工具；运行时扫描 `config/agents/*/agent.toml`，把 Agent 名称和描述注入主 Agent，再通过 `task` 动态调用对应模块。图片候选只作为本轮临时视觉上下文，主 Agent 明确选择后才会发送到飞书。
 - **ACP Agent Teams**：通过 `agent_team.toml` 接入 Claude Code 等外部 Agent，使用带文件锁、hash chain 和 HMAC 的 JSONL ledger 记录协作过程。
 - **可视化与管理**：导航栏提供 Chat、Memory Graph、Knowledge、Settings；管理员额外拥有 Users 页面，可查看各 Web/飞书/企业微信身份的会话、消息记录与长期记忆图，并可删除选中的未压缩短记忆记录。
-- **飞书 Bot**：支持可配置的群聊触发、合并且保序的流式卡片更新及会话映射；图片与用户问题在同一次主 Agent 多模态请求中处理，可选本地 OCR 仅作校对辅助，主模型会在回答中附加可复用的针对性图片描述；后续历史只保留文本而不重复发送 Base64 图片。私聊按用户隔离，群聊按 `chat_id` 共享短记忆、长期 Memory 图和 RAG。
+- **飞书 Bot**：所有可见群消息先按 `message_id` 幂等落入持久化账本；艾特后以 1.5 秒静默窗口聚合后续文字和图片，并按成员、时间与回复关系形成一轮短期记忆。图片原始字节在入口缓存并随批次直接交给主模型，可选本地 OCR 仅作校对辅助；批次成功消费后立即清理对应原始字节。私聊按用户隔离，群聊按 `chat_id` 共享短记忆、长期 Memory 图和 RAG；同会话任务串行排队，不再丢弃忙碌期间的消息。
 - **企业微信 Bot**：使用官方 WebSocket SDK，无需公网回调；支持流式回复、成员白名单、单聊隔离、群聊共享记忆、RAG 开关、重复消息过滤和断线重连。
 
 ## 快速开始
@@ -114,19 +114,24 @@ superassist-wecom
 superassist-wecom-rpa
 ```
 
+飞书开放平台需要使用长连接订阅 `im.message.receive_v1`，并开通
+`im:message:receive_as_bot`。同时要把机器人群消息接收范围配置为全部群消息；如果平台仍只推送艾特消息，
+未艾特内容不会到达本地账本，也就无法在下次激活时补入批次。
+
 飞书进程可同时运行申论官媒晨晚报。它先从 `config/official_media.toml` 配置的官媒最新栏目发现当天内容，
 再由独立的日报研究 Agent 使用 deep-research 流程核验和整理；定时与目标群通过 `SUPERASSIST_DAILY_BRIEF_*`
 环境变量配置。默认时间为 `07:45,19:45`、时区为 `Asia/Shanghai`。在飞书当前会话输入
 `/brief` 可立即生成一次预览，预览不会占用正式定时时段或更新增量窗口。
 
 正式推送的日报会写入 `.superassist/study/shenlun/chats/<会话哈希>/日报笔记本.md`，按自然日保留最近
-3 天。主 Agent 默认在每天 `17:00` 基于近几日日报和未掌握错题一次生成 10 道行测政治理论四选一题，
+3 天。专用申论出题 Agent 默认在每天 `17:00` 基于近几日日报和未掌握错题一次生成 10 道行测政治理论四选一题，
 先把整套草稿交给工具做结构校验，再逐题检查材料依据、唯一答案、干扰项和重复度后确认保存。题目、答案、
 解析和复核记录同时归档到同目录的 `quizzes/`；飞书只发送不含答案的整套题面。用户一次回复完整答案表，
 例如 `1A 2B ... 10D`；主 Agent一次读取整套题、标准答案、材料依据和用户答案，逐题判分并输出全部解析，
 评分工具只保存主 Agent 的判断并据此更新 `错题本.md`，不再由程序比较选项，也不再逐题重复调用主 Agent。
-`/quiz` 仅作为立即出题的测试入口，不再提供 `/quiz status`、`/quiz stop`，也没有独立答题模式。每天定时
-出题后，用户像普通对话一样直接回复整套答案，主 Agent 主动读取已保存的答案和材料并完成批改。测验时间、题数和窗口天数通过
+不再提供 `/quiz` 等独立命令或答题模式。每天定时出题，用户也可以直接在普通对话中要求主 Agent 出题；
+主 Agent 会根据动态加载的 Agent 描述调用专用申论出题 Agent。出题后用户直接回复整套答案，主 Agent
+主动读取已保存的答案和材料并完成批改。测验时间、题数和窗口天数通过
 `SUPERASSIST_DAILY_QUIZ_*` 配置。日报全文、错题状态、标准答案和内部复核提示不写入主线程短期历史；
 短期历史只保留用户看到的整套题面、完整答案表和判分解析。
 
@@ -152,11 +157,18 @@ Python 配置集中在 `src/superassist/config.py`，示例见 [.env.example](.e
 | --- | --- | --- |
 | `SUPERASSIST_MODEL` | `gpt-4o-mini` | 主 Agent 与 LightRAG 使用的模型 |
 | `SUPERASSIST_REASONING_EFFORT` | `medium` | GPT-5.6 推理强度；飞书可用 `/effort` 按会话覆盖 |
+| `SUPERASSIST_USE_RESPONSES_API` | `true` | GPT-5.6 是否使用 `/responses`；不支持该接口的兼容网关可设为 `false`，改走 `/chat/completions` |
+| `SUPERASSIST_CLAUDE_FALLBACK_*` | `claude-opus-5` / 空密钥 | GPT 失败后的 OpenAI 兼容 Claude Chat Completions 路由 |
+| `SUPERASSIST_DEEPSEEK_FALLBACK_*` | `deepseek-v4-flash` / 空密钥 | Claude 失败后的最终文本路由；使用独立密钥和地址 |
 | `SUPERASSIST_MODEL_INPUT_LOG_ENABLED` | `false` | 将最终模型请求 payload 追加到 `logs/model-input.jsonl` |
 | `SUPERASSIST_MODEL_INPUT_LOG_MAX_BYTES` | `52428800` | 模型输入日志单文件轮转阈值，保留 3 个备份 |
+| `SUPERASSIST_AGENTS_DIR` | `config/agents` | 模块化 Subagent 定义目录；每个子目录包含 `agent.toml` 和提示文件 |
 | `SUPERASSIST_FEISHU_IMAGE_OCR_ENABLED` | `true` | 飞书图片启用本地 RapidOCR 辅助；原图无论 OCR 是否成功都会直接交给主模型 |
 | `SUPERASSIST_FEISHU_IMAGE_OCR_MAX_CHARS` | `12000` | 单条飞书多图 OCR 写入当前轮文本历史的字符上限 |
 | `SUPERASSIST_FEISHU_IMAGE_CONTEXT_TTL_SECONDS` | `180` | 飞书会话原图上下文的滑动 TTL；有效消息会刷新，过期后只复用文本描述 |
+| `SUPERASSIST_FEISHU_ACTIVATION_DEBOUNCE_SECONDS` | `1.5` | 群聊艾特后的全消息静默收集窗口 |
+| `SUPERASSIST_FEISHU_ACTIVATION_MAX_WAIT_SECONDS` | `6.0` | 活跃群聊批次的最长等待时间 |
+| `SUPERASSIST_FEISHU_MAX_IMAGES_PER_ACTIVATION` | `12` | 一次激活直接提交给视觉模型的图片上限；超出会显式标记 |
 | `SUPERASSIST_DAILY_QUIZ_ENABLED` | `true` | 启用近三日日报政治理论选择题测验 |
 | `SUPERASSIST_DAILY_QUIZ_TIME` | `17:00` | 每天自动生成整套测验的本地时间 |
 | `SUPERASSIST_DAILY_QUIZ_QUESTION_COUNT` | `10` | 每组测验题数 |
@@ -178,6 +190,15 @@ Python 配置集中在 `src/superassist/config.py`，示例见 [.env.example](.e
 | `SUPERASSIST_RAG_MAX_ATTEMPTS` | `3` | 每轮聊天最多上传资料检索次数 |
 | `SUPERASSIST_RAG_TOP_K` | `20` | LightRAG 实体/关系候选数 |
 | `SUPERASSIST_RAG_CHUNK_TOP_K` | `10` | LightRAG 原文 chunk 候选数 |
+
+### 模块化 Agent
+
+所有进程内 Subagent 都来自 `config/agents/<name>/`，包括默认的 `general-purpose`、资料研究
+`research` 和申论出题 `shenlun-quiz`。每个目录的 `agent.toml` 声明名称、描述、默认状态、模型 profile、
+工具白名单、超时和最大轮数，`system.md` 保存仅在该 Agent 执行时加载的完整提示。主 Agent 启动时只扫描并
+注入名称与描述，不会加载其他 Agent 的完整提示。新增 Agent 只需增加目录；启用 Subagent 时必须且只能有
+一个清单设置 `default = true`。`task` 支持独立的 `parameters` JSON；例如委派 `shenlun-quiz` 时传
+`{"question_count": 5}`，该值会进入子 Agent 首轮上下文并成为本次题组保存、复核和批改的数量契约。
 
 
 短期记忆按完整回合追加，不使用滑动窗口。活动段达到 `30` 个已完成回合或约 `80000` tokens 时，由独立模型把“上一份摘要 + 整个活动段”压成新摘要，并从新的空活动段继续累计。`messages.jsonl` 始终追加，摘要通过 `thread_meta.json` 检查点切换；后续模型上下文只保留用户消息与最终助手回复，不保留工具参数或原始结果。
@@ -213,6 +234,7 @@ MySQL URL 在 Python/SQLAlchemy 中使用 `mysql+pymysql://...`，Go/GORM 使用
 │   └── thread_meta.json
 ├── teams/<thread-id>/ledger.jsonl
 ├── channels/feishu_threads.json
+├── channels/feishu_messages.sqlite3
 ├── channels/wecom_threads.json
 ├── huggingface/
 └── workspace/
@@ -234,6 +256,7 @@ Skill 采用三层渐进式加载，避免把整个技能库长期塞进模型�
 
 ```text
 SuperAssist/
+├── config/agents/            模块化 Agent 清单与私有系统提示
 ├── frontend/                 React + Vite，Chat/Graph/Knowledge/Users/Settings
 ├── go-server/                Gin 网关、认证、线程、WS 和 Python 代理
 ├── src/superassist/
@@ -241,7 +264,7 @@ SuperAssist/
 │   ├── memory/               CogniFold 图、向量入口和 PPR/BFS 排名
 │   ├── rag/                  LightRAG 文档、索引、检索和技术文档
 │   ├── middlewares/          Memory、RAG、工具和最终文本中间件
-│   ├── subagents/            进程内子 Agent
+│   ├── subagents/            Agent 清单加载、执行与任务状态
 │   ├── acp_client/           ACP 客户端
 │   ├── teams/                ACP 团队与可审计 ledger
 │   ├── channels/             飞书与企业微信通道

@@ -43,6 +43,7 @@ class MemoryWritePayload:
     memory_context: dict[str, Any] | None = None
     user_message_created_at: str = ""
     assistant_message_created_at: str = ""
+    source_context: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

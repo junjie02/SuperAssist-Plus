@@ -30,7 +30,6 @@ def test_default_tools_include_file_and_web_tools() -> None:
         "shell",
         "task",
     }.issubset(names)
-    assert "current_time" not in names
 
 
 def test_file_tools_are_workspace_scoped(tmp_path: Path, monkeypatch) -> None:

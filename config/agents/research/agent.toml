@@ -1,0 +1,9 @@
+name = "research"
+description = "Research-focused worker for source-backed investigation and synthesis using web and file tools."
+prompt_file = "system.md"
+enabled = true
+default = false
+model_profile = "main"
+allowed_tools = ["web_search", "web_fetch", "read_file", "list_files", "write_file"]
+timeout_seconds = 900
+max_turns = 20

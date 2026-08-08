@@ -11,10 +11,11 @@ from collections import Counter
 from collections.abc import Awaitable, Callable
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo
 
 from langchain_core.tools import BaseTool, tool
+from pydantic import Field
 
 from superassist.config import Settings
 from superassist.teams.context import current_team_thread_id
@@ -98,7 +99,9 @@ class DailyQuizStore:
         now: datetime,
         *,
         replace_existing: bool = False,
+        question_count: int | str | None = None,
     ) -> dict[str, Any]:
+        resolved_question_count = self._resolve_question_count(question_count)
         with self._lock:
             existing = self._load_session(thread_id)
             if (
@@ -117,7 +120,7 @@ class DailyQuizStore:
                 "status": "generating",
                 "started_at": when.isoformat(),
                 "updated_at": when.isoformat(),
-                "question_count": self.settings.daily_quiz_question_count,
+                "question_count": resolved_question_count,
                 "questions": [],
                 "review_summary": "",
                 "answered_count": 0,
@@ -161,9 +164,30 @@ class DailyQuizStore:
         questions = session.get("questions") if session else None
         return self._render_question_set(questions) if isinstance(questions, list) and questions else ""
 
-    def build_start_prompt(self, chat_id: str, thread_id: str, now: datetime) -> str:
-        session = self.start_session(chat_id, thread_id, now, replace_existing=True)
-        return self._build_agent_context(session)
+    def prepare_generation(
+        self,
+        chat_id: str,
+        thread_id: str,
+        now: datetime | None = None,
+        *,
+        question_count: int | str | None = None,
+    ) -> str:
+        if not self.has_notebook(chat_id):
+            return "Error: recent daily brief notebook is empty"
+        try:
+            session = self.start_session(
+                chat_id,
+                thread_id,
+                self._local_datetime(now),
+                replace_existing=question_count is not None,
+                question_count=question_count,
+            )
+        except ValueError as exc:
+            return f"Error: invalid quiz question_count: {exc}"
+        return f"""<QuizGenerationMaterials>
+题量：{session.get('question_count')}。
+{self._study_material(session)}
+</QuizGenerationMaterials>"""
 
     def save_draft(self, thread_id: str, questions: list[dict[str, Any]]) -> str:
         with self._lock:
@@ -305,28 +329,6 @@ class DailyQuizStore:
             self._archive_quiz(session)
             return f"Agent grading saved. Score: {correct_count}/{len(questions)}. Now present the full grading report."
 
-    def _build_agent_context(self, session: dict[str, Any]) -> str:
-        count = int(session.get("question_count") or self.settings.daily_quiz_question_count)
-        return f"""<DailyPoliticalQuiz>
-你是当前主 Agent。请基于近几日日报和错题本，一次性生成 {count} 道 A、B、C、D 四选一政治理论题，并保存答案。
-
-执行流程：
-1. 先完整生成 {count} 题草稿，每题必须包含 question、option_a、option_b、option_c、option_d、correct_option、explanation、source_date、source_title、evidence、wrong_question_id。
-2. 调用 `daily_quiz_update`，action=`draft`，一次提交全部 questions。工具会检查题量、字段、重复题、选项和答案分布；若失败，修正后重新提交草稿。
-3. 草稿保存成功后，逐题对照 evidence 做第二遍检查：事实和答案是否一致、是否只有一个最佳答案、干扰项是否同层级、题目是否重复、解析是否足以证明答案。发现问题时修正整套题并重新调用 action=`draft`。
-4. 检查完成后调用 action=`finalize`，填写具体 review_summary。只有 finalize 后题目才会发送给用户。
-5. 最终回复只说明整套题已生成并检查，不展示题面、答案或解析；飞书通道会从保存状态渲染题目。
-
-出题要求：
-- 重点测查党的创新理论、方针政策和材料体现的治理逻辑，不考日期、人名、地名等新闻细枝末节。
-- 四个选项必须完整、同层级、有区分度，且只能有一个最佳答案。
-- 题目之间不得重复或仅替换措辞；正确选项应合理分布。
-- 优先针对 active 错题生成变式题，填写 wrong_question_id，但同一道错题在本组最多复习一次。
-- explanation 必须说明正确依据及主要干扰项为什么错误；evidence 必须摘自给定材料，禁止编造来源。
-
-{self._study_material(session)}
-</DailyPoliticalQuiz>"""
-
     def _study_material(self, session: dict[str, Any]) -> str:
         chat_id = str(session.get("chat_id") or "")
         records = self._notebook_records(chat_id)
@@ -396,6 +398,21 @@ class DailyQuizStore:
         if expected_count >= 6 and (len(counts) < 3 or max(counts.values()) > (expected_count + 1) // 2):
             raise ValueError("correct answers must use at least three option letters without excessive concentration")
         return normalized
+
+    def _resolve_question_count(self, value: int | str | None) -> int:
+        if value is None:
+            return self.settings.daily_quiz_question_count
+        if isinstance(value, bool):
+            raise ValueError("question_count must be an integer from 1 to 30")
+        if isinstance(value, int):
+            resolved = value
+        elif isinstance(value, str) and value.strip().isdigit():
+            resolved = int(value.strip())
+        else:
+            raise ValueError("question_count must be an integer from 1 to 30")
+        if not 1 <= resolved <= 30:
+            raise ValueError("question_count must be between 1 and 30")
+        return resolved
 
     def _update_wrongbook(
         self,
@@ -608,12 +625,20 @@ def get_daily_quiz_store(settings: Settings) -> DailyQuizStore:
         return store
 
 
-def make_daily_quiz_tool(settings: Settings) -> BaseTool:
+def make_daily_quiz_tool(
+    settings: Settings,
+    *,
+    delegated_question_count: Any = None,
+) -> BaseTool:
     store = get_daily_quiz_store(settings)
 
     @tool("daily_quiz_update")
     def daily_quiz_update(
-        action: Literal["draft", "finalize", "grading_context", "grade"],
+        action: Literal["prepare_generation", "draft", "finalize", "public_view", "grading_context", "grade"],
+        question_count: Annotated[
+            int | None,
+            Field(ge=1, le=30, description="Requested size for a new generated quiz set."),
+        ] = None,
         questions: list[dict[str, Any]] | None = None,
         review_summary: str = "",
         answers: list[str] | None = None,
@@ -622,10 +647,14 @@ def make_daily_quiz_tool(settings: Settings) -> BaseTool:
     ) -> str:
         """Save and review a quiz set, or persist the main Agent's grading decisions.
 
-        Use action=draft with every question in one call. Each question must contain
+        A generation agent starts with action=prepare_generation to create the session
+        and load private study materials. Pass question_count when the delegated task
+        requests a specific size; otherwise the configured default is used. Then use action=draft with every question in
+        one call. Each question must contain
         question, option_a through option_d, correct_option, explanation, source_date,
         source_title, evidence, and optional wrong_question_id. After reviewing the saved
-        draft, use action=finalize with a concrete review_summary. When the user answers
+        draft, use action=finalize with a concrete review_summary and action=public_view
+        to retrieve only the answer-free question set. When the user answers
         in ordinary conversation, use action=grading_context with the complete ordered
         answers to load the saved questions, answer key, explanations, and evidence. Then
         use action=grade with one result per question containing number, is_correct,
@@ -636,6 +665,22 @@ def make_daily_quiz_tool(settings: Settings) -> BaseTool:
         thread_id = current_team_thread_id()
         if not thread_id:
             return "Error: quiz tool requires an active conversation thread"
+        if action == "prepare_generation":
+            from superassist.channels.store import FeishuThreadStore
+
+            entry = FeishuThreadStore(settings.feishu_thread_store_path).get_entry_by_thread_id(thread_id)
+            if entry is None:
+                return "Error: no Feishu conversation is mapped to this thread"
+            requested_count = (
+                question_count if question_count is not None else delegated_question_count
+            )
+            return store.prepare_generation(
+                str(entry.get("chat_id") or ""),
+                thread_id,
+                question_count=requested_count,
+            )
+        if action == "public_view":
+            return store.current_quiz_text(thread_id) or "Error: no finalized quiz is active"
         if action == "grading_context":
             context = store.build_grading_prompt(thread_id, list(answers or []))
             return context or "Error: no active quiz matches that complete answer sheet"

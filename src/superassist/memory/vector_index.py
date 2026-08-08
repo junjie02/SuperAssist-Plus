@@ -109,16 +109,3 @@ class PersistentFaissIndex:
                 path.unlink()
             except FileNotFoundError:
                 continue
-
-
-class EmptyVectorIndex:
-    """Fallback index that simply returns no matches."""
-
-    def rebuild(self, nodes: Iterable[MemoryNode]) -> None:
-        return None
-
-    def search(self, query_embedding: list[float], limit: int) -> list[VectorMatch]:
-        return []
-
-    def remove(self, node_ids: Iterable[str], current_nodes: Iterable[MemoryNode]) -> None:
-        return None

@@ -129,12 +129,6 @@ def get_embedder(settings: Settings | None = None) -> Embedder:
         settings.embedding_device,
         str(settings.huggingface_cache_dir),
     )
-
-
-def embed_text(text: str, settings: Settings | None = None) -> list[float]:
-    return get_embedder(settings).embed(text)
-
-
 def cosine_similarity(left: list[float] | None, right: list[float] | None) -> float:
     if not left or not right or len(left) != len(right):
         return 0.0

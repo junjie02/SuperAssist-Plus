@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from superassist.channels.daily_quiz import DailyQuizScheduler, DailyQuizStore, make_daily_quiz_tool
+from superassist.channels.store import FeishuThreadStore
 from superassist.config import Settings
 from superassist.teams.context import team_thread_context
 
@@ -160,17 +161,68 @@ def test_batch_grading_updates_wrongbook_and_correct_review_marks_mastered(tmp_p
     assert f"~~{wrong_id}｜错 1 次~~" in wrongbook
 
 
-def test_quiz_prompt_requires_batch_draft_and_second_pass_review(tmp_path) -> None:
+def test_quiz_generation_materials_are_loaded_for_the_dedicated_agent(tmp_path) -> None:
     store = DailyQuizStore(_settings(tmp_path))
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
     store.archive_brief("chat_1", now, "湖北推进基层治理创新。")
-    prompt = store.build_start_prompt("chat_1", "thread_1", now)
+    prompt = store.prepare_generation("chat_1", "thread_1", now)
 
-    assert "一次性生成 2 道" in prompt
-    assert "action=`draft`" in prompt
-    assert "action=`finalize`" in prompt
-    assert "逐题对照 evidence 做第二遍检查" in prompt
-    assert "不得重复" in prompt
+    assert "<QuizGenerationMaterials>" in prompt
+    assert "题量：2" in prompt
+    assert "湖北推进基层治理创新" in prompt
+    assert "action=`draft`" not in prompt
+
+
+def test_quiz_tool_prepares_generation_from_feishu_thread_mapping(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    thread_store = FeishuThreadStore(settings.feishu_thread_store_path)
+    thread_id = thread_store.get_or_create_thread_id(
+        chat_id="chat_1",
+        topic_id="topic_1",
+        user_id="user_1",
+    )
+    store = DailyQuizStore(settings)
+    store.archive_brief("chat_1", datetime.now(ZoneInfo("Asia/Shanghai")), "湖北推进基层治理创新。")
+    tool = make_daily_quiz_tool(settings)
+
+    with team_thread_context(thread_id):
+        prompt = tool.invoke({"action": "prepare_generation"})
+
+    assert "<QuizGenerationMaterials>" in prompt
+    assert "湖北推进基层治理创新" in prompt
+    session_path = next((settings.daily_quiz_data_dir / "sessions").glob("*.json"))
+    session = json.loads(session_path.read_text(encoding="utf-8"))
+    assert session["thread_id"] == thread_id
+    assert session["status"] == "generating"
+
+
+def test_delegated_question_count_becomes_session_validation_contract(tmp_path) -> None:
+    settings = _settings(tmp_path, SUPERASSIST_DAILY_QUIZ_QUESTION_COUNT=10)
+    thread_store = FeishuThreadStore(settings.feishu_thread_store_path)
+    thread_id = thread_store.get_or_create_thread_id(
+        chat_id="chat_1",
+        topic_id="topic_1",
+        user_id="user_1",
+    )
+    store = DailyQuizStore(settings)
+    store.archive_brief(
+        "chat_1",
+        datetime.now(ZoneInfo("Asia/Shanghai")),
+        "湖北推进基层治理创新。",
+    )
+    tool = make_daily_quiz_tool(settings, delegated_question_count=5)
+
+    with team_thread_context(thread_id):
+        prompt = tool.invoke({"action": "prepare_generation"})
+
+    assert "题量：5" in prompt
+    session_path = next((settings.daily_quiz_data_dir / "sessions").glob("*.json"))
+    session = json.loads(session_path.read_text(encoding="utf-8"))
+    assert session["question_count"] == 5
+    assert "expected exactly 5 questions, received 2" in store.save_draft(
+        thread_id,
+        _questions(),
+    )
 
 
 def test_main_agent_tool_loads_grading_context_from_an_ordinary_answer_turn(tmp_path) -> None:
@@ -189,12 +241,15 @@ def test_main_agent_tool_loads_grading_context_from_an_ordinary_answer_turn(tmp_
     schema = tool.args_schema.model_json_schema()
     assert set(schema["properties"]) == {
         "action",
+        "question_count",
         "questions",
         "review_summary",
         "answers",
         "results",
         "overall_feedback",
     }
+    assert "prepare_generation" in schema["properties"]["action"]["enum"]
+    assert "public_view" in schema["properties"]["action"]["enum"]
     assert "grading_context" in schema["properties"]["action"]["enum"]
 
 

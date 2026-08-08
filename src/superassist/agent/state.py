@@ -27,6 +27,7 @@ class SuperAssistState(AgentState):
     memory_event_id: NotRequired[str]
     memory_recall: NotRequired[dict[str, Any]]
     memory_write_context: NotRequired[dict[str, Any]]
+    memory_source_context: NotRequired[dict[str, Any]]
     tool_events: NotRequired[list[dict[str, Any]]]
     loaded_skills: NotRequired[list[str]]
     skill_activations: NotRequired[dict[str, float]]

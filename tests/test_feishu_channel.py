@@ -40,7 +40,7 @@ from superassist.channels.feishu import (
     parse_feishu_event,
     should_trigger_agent,
 )
-from superassist.channels.store import FeishuThreadStore
+from superassist.channels.store import FeishuMessageStore, FeishuThreadStore
 from superassist.config import Settings, get_settings
 from superassist.models import AgentRunEvent, AgentRunResult
 
@@ -220,7 +220,7 @@ def test_should_trigger_private_or_mentions() -> None:
     assert should_trigger_agent(group_with_mention, mention_only=True) is True
 
 
-def test_group_activation_session_resets_on_each_message_and_expires(tmp_path) -> None:
+def test_group_requires_explicit_activation_for_each_batch(tmp_path) -> None:
     now = [1000.0]
     channel = FeishuChannel(
         _settings(tmp_path, SUPERASSIST_FEISHU_ACTIVE_SESSION_SECONDS=180),
@@ -240,10 +240,6 @@ def test_group_activation_session_resets_on_each_message_and_expires(tmp_path) -
     assert channel._should_accept_message(mentioned) is True
 
     now[0] += 179
-    assert channel._should_accept_message(inactive) is True
-    now[0] += 179
-    assert channel._should_accept_message(inactive) is True
-    now[0] += 180
     assert channel._should_accept_message(inactive) is False
     assert channel._should_accept_message(mentioned) is True
 
@@ -308,6 +304,129 @@ def test_thread_store_reuses_chat_topic(tmp_path) -> None:
     assert first == second
     assert first != other
     assert store.list_entries()[0]["user_id"] == "feishu:ou"
+
+
+def test_feishu_message_store_is_idempotent_and_advances_cursor(tmp_path) -> None:
+    store = FeishuMessageStore(tmp_path / "messages.sqlite3")
+    values = {
+        "message_id": "msg_1",
+        "chat_id": "chat_1",
+        "sender_open_id": "ou_1",
+        "sender_name": "Alice",
+        "text": "hello",
+        "root_id": None,
+        "chat_type": "group",
+        "mentions": [],
+        "files": [],
+        "created_at": "2026-08-08T10:00:00+08:00",
+    }
+
+    inserted, seq = store.add_message(**values)
+    duplicate, duplicate_seq = store.add_message(**values)
+
+    assert inserted is True
+    assert duplicate is False
+    assert duplicate_seq == seq
+    assert [item.message_id for item in store.list_unconsumed("chat_1")] == ["msg_1"]
+    store.save_image(
+        message_id="msg_1",
+        image_key="img_1",
+        data=b"pixels",
+        mime_type="image/png",
+    )
+    assert store.get_image(message_id="msg_1", image_key="img_1") == (b"pixels", "image/png")
+    store.commit_consumed("chat_1", seq)
+    assert store.list_unconsumed("chat_1") == []
+    assert store.get_image(message_id="msg_1", image_key="img_1") is None
+
+
+def test_group_activation_batches_multiple_speakers_and_late_image(tmp_path) -> None:
+    received = []
+
+    class Runtime:
+        def __init__(self, _reporter):
+            self.memory_queue = SimpleNamespace(flush=lambda: None)
+
+        def run_streaming(self, message, *, user_id, thread_id, message_content=None):
+            received.append((message, message_content, user_id, thread_id))
+            return AgentRunResult(thread_id=thread_id, answer="done", metadata={})
+
+    async def go():
+        channel = FeishuChannel(
+            _settings(
+                tmp_path,
+                SUPERASSIST_FEISHU_ALLOWED_OPEN_IDS="ou_owner",
+                SUPERASSIST_FEISHU_ACTIVATION_DEBOUNCE_SECONDS=0.02,
+                SUPERASSIST_FEISHU_ACTIVATION_MAX_WAIT_SECONDS=0.1,
+            ),
+            runtime_factory=lambda reporter: Runtime(reporter),
+        )
+
+        async def create(_chat_id, _text):
+            return "card"
+
+        async def update(_message_id, _text):
+            return None
+
+        async def download(message_id, image_key):
+            assert (message_id, image_key) == ("msg_image", "img_1")
+            return b"image", "image/png"
+
+        async def ocr(_payloads):
+            return "[Image 1]\nvisible text"
+
+        channel._create_card = create
+        channel._update_card = update
+        channel._download_image = download
+        channel._extract_images_ocr = ocr
+
+        await channel.handle_inbound(
+            FeishuInboundMessage("chat", "msg_a", "ou_a", "先讨论需求", sender_name="Alice", chat_type="group")
+        )
+        await channel.handle_inbound(
+            FeishuInboundMessage("chat", "msg_b", "ou_b", "我补充一个条件", sender_name="Bob", chat_type="group")
+        )
+        trigger = asyncio.create_task(
+            channel.handle_inbound(
+                FeishuInboundMessage(
+                    "chat",
+                    "msg_trigger",
+                    "ou_owner",
+                    "@bot 请综合处理",
+                    sender_name="Owner",
+                    chat_type="group",
+                    mentions=[{"name": "@bot"}],
+                )
+            )
+        )
+        await asyncio.sleep(0.005)
+        await channel.handle_inbound(
+            FeishuInboundMessage(
+                "chat",
+                "msg_image",
+                "ou_b",
+                "[image]",
+                sender_name="Bob",
+                chat_type="group",
+                files=[{"image_key": "img_1"}],
+            )
+        )
+        await trigger
+
+        assert len(received) == 1
+        message, content, user_id, _thread_id = received[0]
+        assert user_id == "feishu-group:chat"
+        assert 'sender_id="ou_a" sender_name="Alice"' in message
+        assert 'sender_id="ou_b" sender_name="Bob"' in message
+        assert 'sender_id="ou_owner" sender_name="Owner"' in message
+        assert '<text>请综合处理</text>' in message
+        assert "[Image 1]" in message
+        assert "visible text" in message
+        assert isinstance(content, list)
+        assert any(item.get("type") == "image_url" for item in content)
+        assert any("from sender ou_b" in item.get("text", "") for item in content)
+
+    _run(go())
 
 
 def test_thread_store_rotates_when_scope_owner_changes(tmp_path) -> None:
@@ -500,15 +619,19 @@ def test_feishu_daily_brief_command_runs_preview_for_current_chat(tmp_path) -> N
     _run(go())
 
 
-def test_feishu_daily_quiz_command_starts_for_current_chat(tmp_path) -> None:
-    triggered: list[str] = []
+def test_feishu_quiz_text_is_not_a_special_command(tmp_path) -> None:
+    runtime_messages: list[str] = []
 
-    async def trigger(chat_id: str) -> str:
-        triggered.append(chat_id)
-        return "政治理论测验已生成并完成检查，请在新卡片中一次提交全部答案。"
+    class Runtime:
+        def __init__(self, _reporter):
+            self.memory_queue = SimpleNamespace(flush=lambda: None)
+
+        def run_streaming(self, message, *, user_id, thread_id):
+            runtime_messages.append(message)
+            return AgentRunResult(thread_id=thread_id, answer="主 Agent 已收到普通消息。", metadata={})
 
     async def go():
-        channel = FeishuChannel(_settings(tmp_path), daily_quiz_trigger=trigger)
+        channel = FeishuChannel(_settings(tmp_path), runtime_factory=lambda reporter: Runtime(reporter))
         sent: list[str] = []
 
         async def reply(_message_id, text):
@@ -522,8 +645,8 @@ def test_feishu_daily_quiz_command_starts_for_current_chat(tmp_path) -> None:
         channel._update_card = update
         await channel.handle_inbound(FeishuInboundMessage("chat_1", "msg_1", "ou_1", "/quiz", chat_type="p2p"))
 
-        assert triggered == ["chat_1"]
-        assert sent[-1] == "政治理论测验已生成并完成检查，请在新卡片中一次提交全部答案。"
+        assert runtime_messages == ["/quiz"]
+        assert sent[-1] == "主 Agent 已收到普通消息。"
 
     _run(go())
 
@@ -654,7 +777,7 @@ def test_feishu_quiz_answer_reaches_main_agent_as_an_ordinary_turn(tmp_path) -> 
     _run(go())
 
 
-def test_scheduled_quiz_reuses_main_thread_but_persists_only_visible_question(tmp_path) -> None:
+def test_scheduled_quiz_uses_dedicated_subagent_and_persists_only_visible_question(tmp_path, monkeypatch) -> None:
     settings = _settings(tmp_path, SUPERASSIST_DAILY_QUIZ_QUESTION_COUNT=2)
     thread_store = FeishuThreadStore(settings.feishu_thread_store_path)
     thread_id = thread_store.get_or_create_thread_id(
@@ -723,12 +846,26 @@ def test_scheduled_quiz_reuses_main_thread_but_persists_only_visible_question(tm
             quiz_store.finalize(thread_id, "已检查两题的材料依据、唯一答案、差异性和选项质量。")
             return AgentRunResult(thread_id=thread_id, answer="内部状态已保存。", metadata={})
 
+    subagent_calls: list[dict[str, object]] = []
+
+    def run_quiz_subagent(description, prompt, **kwargs):
+        subagent_calls.append({"description": description, "prompt": prompt, **kwargs})
+        Runtime(None).run(
+            prompt,
+            user_id="dedicated-subagent",
+            thread_id=kwargs["parent_thread_id"],
+        )
+        return "Task Succeeded. Result: public questions saved"
+
+    task_module = __import__("superassist.tools.task", fromlist=["run_task"])
+    monkeypatch.setattr(task_module, "run_task", run_quiz_subagent)
+
     async def go():
         channel = FeishuChannel(
             settings,
             store=thread_store,
             daily_quiz_store=quiz_store,
-            runtime_factory=lambda reporter: Runtime(reporter),
+            runtime_factory=lambda _reporter: pytest.fail("scheduled quiz must not create a main Agent runtime"),
         )
         cards: list[str] = []
 
@@ -742,12 +879,14 @@ def test_scheduled_quiz_reuses_main_thread_but_persists_only_visible_question(tm
         assert result == "政治理论测验已生成并完成检查，请在新卡片中一次提交全部答案。"
         assert "材料体现了哪一种治理理念" in cards[-1]
         assert "基层治理创新应坚持什么方法" in cards[-1]
+        assert subagent_calls[0]["subagent_type"] == "shenlun-quiz"
+        assert subagent_calls[0]["parent_thread_id"] == thread_id
         assert runtime_controls[0]["thread_id"] == thread_id
-        assert runtime_controls[0]["user_id"] == "feishu-group:chat_1"
-        assert runtime_controls[0]["memory_query"] == "开始近三日日报政治理论选择题测验"
-        assert runtime_controls[0]["suppress_memory_write"] is True
-        assert runtime_controls[0]["suppress_short_memory_write"] is True
-        assert "日报内部全文" in str(runtime_controls[0]["message"])
+        assert runtime_controls[0]["user_id"] == "dedicated-subagent"
+        assert runtime_controls[0]["memory_query"] is None
+        assert runtime_controls[0]["suppress_memory_write"] is False
+        assert runtime_controls[0]["suppress_short_memory_write"] is False
+        assert "日报内部全文" not in str(runtime_controls[0]["message"])
 
         records = read_jsonl(settings.data_dir / "threads" / thread_id / "messages.jsonl")
         assert [record["role"] for record in records] == ["assistant"]
@@ -833,7 +972,7 @@ def test_feishu_channel_uses_one_runtime_per_message(tmp_path) -> None:
     _run(go())
 
 
-def test_feishu_channel_discards_messages_received_while_scope_is_busy(tmp_path) -> None:
+def test_feishu_channel_queues_messages_received_while_scope_is_busy(tmp_path) -> None:
     started = threading.Event()
     release = threading.Event()
     calls: list[str] = []
@@ -867,19 +1006,19 @@ def test_feishu_channel_discards_messages_received_while_scope_is_busy(tmp_path)
         )
         assert await asyncio.to_thread(started.wait, 2)
 
-        await asyncio.wait_for(
-            channel.handle_inbound(FeishuInboundMessage("chat", "msg_2", "ou", "second", chat_type="p2p")),
-            timeout=0.2,
+        second = asyncio.create_task(
+            channel.handle_inbound(FeishuInboundMessage("chat", "msg_2", "ou", "second", chat_type="p2p"))
         )
         assert calls == ["first"]
         assert "msg_2" not in replied_message_ids
 
         release.set()
         await first
+        await second
         await channel.handle_inbound(FeishuInboundMessage("chat", "msg_3", "ou", "third", chat_type="p2p"))
 
-        assert calls == ["first", "third"]
-        assert replied_message_ids == ["msg_1", "msg_3"]
+        assert calls == ["first", "second", "third"]
+        assert replied_message_ids == ["msg_1", "msg_2", "msg_3"]
 
     _run(go())
 
@@ -1151,7 +1290,11 @@ def test_feishu_channel_shows_agent_text_and_final_card(tmp_path) -> None:
             self.reporter = reporter
 
         def run_streaming(self, message, *, user_id, thread_id):
-            assert message == "[飞书群成员: ou_1] 做个计划"
+            assert '<FeishuConversationBatch format="chronological-chat"' in message
+            assert 'sender_id="ou_1"' in message
+            assert 'sender_name="小馨"' in message
+            assert '<text>做个计划</text>' in message
+            assert 'trigger="true"' in message
             assert user_id == "feishu-group:chat_1"
             assert thread_id.startswith("feishu_")
             self.reporter(AgentRunEvent(type="thinking", message="Inspecting the request...", metadata={}))

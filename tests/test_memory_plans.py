@@ -8,7 +8,6 @@ from superassist.memory.plans import (
     AddEdgeOp,
     AddNodeOp,
     MergeNodesOp,
-    RemoveEdgeOp,
     RemoveNodeOp,
     UpdateNodeOp,
     UpdatePlan,

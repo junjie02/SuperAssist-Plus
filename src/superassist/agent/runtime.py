@@ -22,9 +22,6 @@ from uuid import uuid4
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 from superassist.agent.factory import AgentBundle, build_agent
-from superassist.agent.prompts import SYSTEM_PROMPT
-from superassist.agent.prompts import subagent_section as subagent_prompt_section
-from superassist.agent.prompts import team_section as team_prompt_section
 from superassist.agent.short_memory import format_short_memory_section, load_short_memory, timestamp_user_content
 from superassist.agent.state import SuperAssistState
 from superassist.agent.streaming import StreamParts, accumulate_stream_parts, clean_answer_text
@@ -182,6 +179,7 @@ class AgentRuntime:
         memory_query: str | None = None,
         suppress_memory_write: bool = False,
         suppress_short_memory_write: bool = False,
+        memory_source_context: dict[str, Any] | None = None,
     ) -> AgentRunResult:
         return self._run_streaming_traced(
             message,
@@ -191,6 +189,7 @@ class AgentRuntime:
             memory_query=memory_query,
             suppress_memory_write=suppress_memory_write,
             suppress_short_memory_write=suppress_short_memory_write,
+            memory_source_context=memory_source_context,
         )
 
     @traceable(name="superassist.turn.streaming", run_type="chain", process_inputs=without_self)
@@ -204,6 +203,7 @@ class AgentRuntime:
         memory_query: str | None = None,
         suppress_memory_write: bool = False,
         suppress_short_memory_write: bool = False,
+        memory_source_context: dict[str, Any] | None = None,
     ) -> AgentRunResult:
         state = self._initial_state(
             message,
@@ -213,6 +213,7 @@ class AgentRuntime:
             memory_query=memory_query,
             suppress_memory_write=suppress_memory_write,
             suppress_short_memory_write=suppress_short_memory_write,
+            memory_source_context=memory_source_context,
         )
         with run_event_reporter_context(self._run_event_reporter):
             self._report_run_event("preparing_context", "Preparing context...", thread_id=state["thread_id"])
@@ -299,6 +300,7 @@ class AgentRuntime:
         memory_query: str | None = None,
         suppress_memory_write: bool = False,
         suppress_short_memory_write: bool = False,
+        memory_source_context: dict[str, Any] | None = None,
     ) -> SuperAssistState:
         resolved_thread_id = thread_id or f"thread_{uuid4().hex[:12]}"
         message_created_at = datetime.now(UTC).isoformat()
@@ -330,6 +332,7 @@ class AgentRuntime:
             ],
             "input": message,
             "memory_query": memory_query or message,
+            "memory_source_context": dict(memory_source_context or {}),
             "suppress_memory_write": suppress_memory_write,
             "suppress_short_memory_write": suppress_short_memory_write,
             "message_created_at": message_created_at,
@@ -459,4 +462,4 @@ def _accumulate_stream_usage(
     totals["cache_read"] += int(input_details.get("cache_read") or 0)
 
 
-__all__ = ["AgentRuntime", "SYSTEM_PROMPT", "subagent_prompt_section", "team_prompt_section"]
+__all__ = ["AgentRuntime"]
