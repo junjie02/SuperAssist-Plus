@@ -334,16 +334,17 @@ def create_chat_model(settings: Settings | None = None) -> BaseChatModel:
         "timeout": 60,
         "max_retries": 2,
         "stream_usage": True,
+        "use_responses_api": settings.use_responses_api,
     }
+    if settings.use_responses_api:
+        # Preserve the full multimodal turn across tool-loop requests.
+        kwargs["use_previous_response_id"] = False
     if is_gpt_5_6_model(settings.model) and settings.use_responses_api:
         reasoning: dict[str, str] = {"effort": settings.reasoning_effort}
         if settings.reasoning_effort != "none":
             reasoning["summary"] = "detailed"
         kwargs.update(
             {
-                "use_responses_api": True,
-                # Keep the original multimodal HumanMessage in every tool-loop request.
-                "use_previous_response_id": False,
                 "reasoning": reasoning,
             }
         )
@@ -412,7 +413,8 @@ def _create_compatible_fallback_model(
         timeout=60,
         max_retries=1,
         stream_usage=True,
-        use_responses_api=False,
+        use_responses_api=settings.use_responses_api,
+        use_previous_response_id=False,
     )
     fallback.configure_input_logging(
         path=settings.model_input_log_path if settings.model_input_log_enabled else None,
@@ -440,6 +442,8 @@ def create_memory_model(
         "timeout": 60,
         "max_retries": 2,
         "stream_usage": True,
+        "use_responses_api": settings.use_responses_api,
+        "use_previous_response_id": False,
     }
     if settings.memory_max_tokens is not None:
         kwargs["max_tokens"] = settings.memory_max_tokens

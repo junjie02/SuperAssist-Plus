@@ -39,7 +39,7 @@ Go 是面向浏览器的产品入口：负责认证、WebSocket 生命周期、�
 - **长期记忆**：`event/concept/intent/time` 四类节点、九类边，结合向量入口、BFS、Personalized PageRank、时间和访问频次召回。
 - **LightRAG 知识库**：批量上传 PDF、DOCX、PPTX、XLSX、TXT、Markdown、JSON、CSV 和 HTML，异步完成切片、实体关系抽取和建图。
 - **Agentic RAG**：首轮默认 `mix` 检索；证据不足时允许模型改写查询，并由中间件保证最多完成三轮检索。失败后可按工具配置联网，最终回答明确标注上传资料、网页或模型知识来源。
-- **工具与 Subagent**：支持文件、网页、主 Agent 图片搜索和可选 Shell 工具；运行时扫描 `config/agents/*/agent.toml`，把 Agent 名称和描述注入主 Agent，再通过 `task` 动态调用对应模块。图片候选只作为本轮临时视觉上下文，主 Agent 明确选择后才会发送到飞书。
+- **工具与 Subagent**：支持文件、网页、主 Agent 图片搜索、`gpt-image-2` 生图和可选 Shell 工具；运行时扫描 `config/agents/*/agent.toml`，把 Agent 名称和描述注入主 Agent，再通过 `task` 动态调用对应模块。搜索图片候选只作为本轮临时视觉上下文，主 Agent 明确选择后才会发送到飞书；生成图片会自动进入当前飞书回复。
 - **ACP Agent Teams**：通过 `agent_team.toml` 接入 Claude Code 等外部 Agent，使用带文件锁、hash chain 和 HMAC 的 JSONL ledger 记录协作过程。
 - **可视化与管理**：导航栏提供 Chat、Memory Graph、Knowledge、Settings；管理员额外拥有 Users 页面，可查看各 Web/飞书/企业微信身份的会话、消息记录与长期记忆图，并可删除选中的未压缩短记忆记录。
 - **飞书 Bot**：所有可见群消息先按 `message_id` 幂等落入持久化账本；艾特后以 1.5 秒静默窗口聚合后续文字和图片，并按成员、时间与回复关系形成一轮短期记忆。图片原始字节在入口缓存并随批次直接交给主模型，可选本地 OCR 仅作校对辅助；批次成功消费后立即清理对应原始字节。私聊按用户隔离，群聊按 `chat_id` 共享短记忆、长期 Memory 图和 RAG；同会话任务串行排队，不再丢弃忙碌期间的消息。
@@ -68,6 +68,14 @@ Set-Location ..
 ```powershell
 Copy-Item .env.example .env
 ```
+
+可选 Redis 运行状态层可通过仓库内 Compose 文件启动：
+
+```powershell
+docker compose -f compose.redis.yml up -d
+```
+
+随后在 `.env` 设置 `SUPERASSIST_REDIS_ENABLED=true`。Redis 不可用时默认降级到现有本地/SQLite 实现；多实例部署应同时设置 `SUPERASSIST_REDIS_REQUIRED=true`，避免无提示地退回进程内锁。
 
 分别启动两个后端进程：
 
@@ -118,6 +126,10 @@ superassist-wecom-rpa
 `im:message:receive_as_bot`。同时要把机器人群消息接收范围配置为全部群消息；如果平台仍只推送艾特消息，
 未艾特内容不会到达本地账本，也就无法在下次激活时补入批次。
 
+包含 LaTeX 公式的最终回答会创建飞书云文档，写入原生公式并发送文档链接；还需开通文档创建/编辑和
+云空间协作者权限（`docx:document`、`drive:permission:member:create`）。普通回答继续使用消息卡片；文档
+创建、写入或授权失败时会自动回退到原卡片，避免丢失回答。
+
 飞书进程可同时运行申论官媒晨晚报。它先从 `config/official_media.toml` 配置的官媒最新栏目发现当天内容，
 再由独立的日报研究 Agent 使用 deep-research 流程核验和整理；定时与目标群通过 `SUPERASSIST_DAILY_BRIEF_*`
 环境变量配置。默认时间为 `07:45,19:45`、时区为 `Asia/Shanghai`。在飞书当前会话输入
@@ -157,8 +169,8 @@ Python 配置集中在 `src/superassist/config.py`，示例见 [.env.example](.e
 | --- | --- | --- |
 | `SUPERASSIST_MODEL` | `gpt-4o-mini` | 主 Agent 与 LightRAG 使用的模型 |
 | `SUPERASSIST_REASONING_EFFORT` | `medium` | GPT-5.6 推理强度；飞书可用 `/effort` 按会话覆盖 |
-| `SUPERASSIST_USE_RESPONSES_API` | `true` | GPT-5.6 是否使用 `/responses`；不支持该接口的兼容网关可设为 `false`，改走 `/chat/completions` |
-| `SUPERASSIST_CLAUDE_FALLBACK_*` | `claude-opus-5` / 空密钥 | GPT 失败后的 OpenAI 兼容 Claude Chat Completions 路由 |
+| `SUPERASSIST_USE_RESPONSES_API` | `true` | 所有文本模型是否使用 `/responses`；不支持该接口的兼容网关可设为 `false`，整体改走 `/chat/completions` |
+| `SUPERASSIST_CLAUDE_FALLBACK_*` | `claude-opus-5` / 空密钥 | GPT 失败后的 OpenAI 兼容 Claude Responses 路由 |
 | `SUPERASSIST_DEEPSEEK_FALLBACK_*` | `deepseek-v4-flash` / 空密钥 | Claude 失败后的最终文本路由；使用独立密钥和地址 |
 | `SUPERASSIST_MODEL_INPUT_LOG_ENABLED` | `false` | 将最终模型请求 payload 追加到 `logs/model-input.jsonl` |
 | `SUPERASSIST_MODEL_INPUT_LOG_MAX_BYTES` | `52428800` | 模型输入日志单文件轮转阈值，保留 3 个备份 |
@@ -166,6 +178,10 @@ Python 配置集中在 `src/superassist/config.py`，示例见 [.env.example](.e
 | `SUPERASSIST_FEISHU_IMAGE_OCR_ENABLED` | `true` | 飞书图片启用本地 RapidOCR 辅助；原图无论 OCR 是否成功都会直接交给主模型 |
 | `SUPERASSIST_FEISHU_IMAGE_OCR_MAX_CHARS` | `12000` | 单条飞书多图 OCR 写入当前轮文本历史的字符上限 |
 | `SUPERASSIST_FEISHU_IMAGE_CONTEXT_TTL_SECONDS` | `180` | 飞书会话原图上下文的滑动 TTL；有效消息会刷新，过期后只复用文本描述 |
+| `SUPERASSIST_FEISHU_DOC_URL_BASE` | `https://feishu.cn/docx` | 公式回答创建后的飞书云文档链接前缀；Lark 国际版可改为对应租户域名 |
+| `SUPERASSIST_IMAGE_GENERATION_MODEL` | `gpt-image-2` | `generate_image` 工具调用的生图模型名称 |
+| `SUPERASSIST_IMAGE_GENERATION_API_KEY` | 空 | `gpt-image-2` 生图专用密钥；为空时复用主模型密钥 |
+| `SUPERASSIST_IMAGE_GENERATION_BASE_URL` | 空 | 生图专用 OpenAI-compatible `/v1` 地址；为空时复用主模型地址 |
 | `SUPERASSIST_FEISHU_ACTIVATION_DEBOUNCE_SECONDS` | `1.5` | 群聊艾特后的全消息静默收集窗口 |
 | `SUPERASSIST_FEISHU_ACTIVATION_MAX_WAIT_SECONDS` | `6.0` | 活跃群聊批次的最长等待时间 |
 | `SUPERASSIST_FEISHU_MAX_IMAGES_PER_ACTIVATION` | `12` | 一次激活直接提交给视觉模型的图片上限；超出会显式标记 |
@@ -177,6 +193,11 @@ Python 配置集中在 `src/superassist/config.py`，示例见 [.env.example](.e
 | `SUPERASSIST_BASE_URL` | OpenAI API | OpenAI 兼容接口地址 |
 | `SUPERASSIST_DATA_DIR` | `.superassist` | SQLite、FAISS、RAG、线程等数据根目录 |
 | `SUPERASSIST_DB_URL` | 空 | Python MySQL DSN；为空使用 SQLite |
+| `SUPERASSIST_REDIS_ENABLED` | `false` | 启用 Redis 运行状态层；SQLite/JSONL 仍保存持久数据 |
+| `SUPERASSIST_REDIS_URL` | `redis://127.0.0.1:6379/0` | Redis 连接地址 |
+| `SUPERASSIST_REDIS_PREFIX` | `superassist` | Redis key 命名空间；不同环境必须使用不同前缀 |
+| `SUPERASSIST_REDIS_REQUIRED` | `false` | Redis 不可用时是否阻止启动；多实例生产环境应设为 `true` |
+| `SUPERASSIST_API_RATE_LIMIT_PER_MINUTE` | `0` | Redis 按用户统计的每分钟请求上限；`0` 表示关闭 |
 | `SUPERASSIST_EMBEDDING_PROVIDER` | `bge` | `bge` 或测试用 `hash` |
 | `SUPERASSIST_EMBEDDING_MODEL` | `BAAI/bge-base-zh-v1.5` | Memory 与 LightRAG 共用的向量模型 |
 | `SUPERASSIST_ENABLE_TOOLS` | `false` | 常规工具总开关 |

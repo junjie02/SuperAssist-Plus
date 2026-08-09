@@ -22,7 +22,13 @@ from uuid import uuid4
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 from superassist.agent.factory import AgentBundle, build_agent
-from superassist.agent.short_memory import format_short_memory_section, load_short_memory, timestamp_user_content
+from superassist.agent.short_memory import (
+    ShortMemoryLoad,
+    format_short_memory_section,
+    load_short_memory,
+    record_to_message,
+    timestamp_user_content,
+)
 from superassist.agent.state import SuperAssistState
 from superassist.agent.streaming import StreamParts, accumulate_stream_parts, clean_answer_text
 from superassist.config import Settings, get_settings
@@ -31,6 +37,7 @@ from superassist.models import AgentRunEvent, AgentRunResult
 from superassist.observability import runnable_trace_config, traceable, without_self
 from superassist.rag.context import rag_turn_context
 from superassist.rag.service import LightRAGService
+from superassist.redis_store import get_redis_store
 from superassist.run_events import run_event_reporter_context
 from superassist.skills import active_skill_activations, active_skill_names
 from superassist.teams import set_team_supervisor
@@ -56,6 +63,7 @@ class AgentRuntime:
         self._run_event_reporter = run_event_reporter
         self._active_agent_text_seen: set[str] | None = None
         self._tool_event_reporter = tool_event_reporter
+        self._redis = get_redis_store(self.settings)
         self._bundle: AgentBundle = build_agent(
             self.settings,
             tool_event_reporter=self._report_tool_event,
@@ -135,6 +143,9 @@ class AgentRuntime:
         suppress_memory_write: bool,
         suppress_short_memory_write: bool,
     ) -> AgentRunResult:
+        allowed, count = self._redis.allow_request(user_id)
+        if not allowed:
+            return self._rate_limit_result(thread_id, count)
         state = self._initial_state(
             message,
             user_id=user_id,
@@ -205,6 +216,9 @@ class AgentRuntime:
         suppress_short_memory_write: bool = False,
         memory_source_context: dict[str, Any] | None = None,
     ) -> AgentRunResult:
+        allowed, count = self._redis.allow_request(user_id)
+        if not allowed:
+            return self._rate_limit_result(thread_id, count)
         state = self._initial_state(
             message,
             user_id=user_id,
@@ -307,7 +321,10 @@ class AgentRuntime:
         thread_metadata = self._load_thread_metadata(resolved_thread_id)
         history = self._load_history(resolved_thread_id, thread_metadata)
         skill_activations = active_skill_activations(
-            thread_metadata.get("skill_activations"),
+            {
+                **dict(thread_metadata.get("skill_activations") or {}),
+                **self._redis.load_skill_activations(resolved_thread_id),
+            },
             self.settings.skill_active_ttl_seconds,
         )
         loaded_skills = active_skill_names(
@@ -351,6 +368,21 @@ class AgentRuntime:
 
     def _load_history(self, thread_id: str, metadata: dict[str, Any]) -> Any:
         path = self.settings.data_dir / "threads" / thread_id / "messages.jsonl"
+        cached = self._redis.load_short_memory(thread_id)
+        cache_matches_file = True
+        if cached is not None and path.exists():
+            stat = path.stat()
+            cache_matches_file = (
+                int(cached.get("file_size") or -1) == stat.st_size
+                and int(cached.get("file_mtime_ns") or -1) == stat.st_mtime_ns
+            )
+        if cached is not None and cache_matches_file and isinstance(cached.get("records"), list):
+            records = [item for item in cached["records"] if isinstance(item, dict)]
+            return ShortMemoryLoad(
+                messages=[record_to_message(record) for record in records],
+                records=records,
+                summary=str(cached.get("summary") or ""),
+            )
         return load_short_memory(
             path,
             metadata,
@@ -367,6 +399,19 @@ class AgentRuntime:
         except (OSError, json.JSONDecodeError):
             return {}
         return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _rate_limit_result(thread_id: str | None, count: int) -> AgentRunResult:
+        message = "请求过于频繁，请稍后再试。"
+        return AgentRunResult(
+            thread_id=thread_id or "",
+            answer=message,
+            metadata={
+                "rate_limited": True,
+                "rate_limit_count": count,
+                "final_assistant_text": message,
+            },
+        )
 
     def _result_from(self, thread_id: str, final_state: dict[str, Any]) -> AgentRunResult:
         messages = list(final_state.get("messages") or [])

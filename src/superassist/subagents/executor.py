@@ -345,7 +345,7 @@ def _settings_for_model_profile(settings: Settings, profile: str) -> Settings:
             "api_key": settings.memory_api_key or settings.api_key,
             "base_url": settings.memory_base_url or settings.base_url,
             "max_tokens": settings.memory_max_tokens,
-            "use_responses_api": False,
+            "use_responses_api": settings.use_responses_api,
         }
     )
 

@@ -1,0 +1,5 @@
+name = "worker"
+description = "Worker"
+prompt_file = "system.md"
+default = false
+allowed_tools = "*"

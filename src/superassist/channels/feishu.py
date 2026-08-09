@@ -28,7 +28,8 @@ from superassist.config import PROJECT_ROOT, REASONING_EFFORTS, Settings, get_se
 from superassist.llm import is_gpt_5_6_model
 from superassist.memory.embedding import get_embedder
 from superassist.models import AgentRunEvent
-from superassist.tools.images import MAX_ORIGINAL_BYTES, download_image_url
+from superassist.redis_store import get_redis_store
+from superassist.tools.images import MAX_ORIGINAL_BYTES, download_image_url, load_generated_image
 
 from .daily_brief import (
     DailyBriefProgress,
@@ -41,6 +42,7 @@ from .daily_quiz import (
     DailyQuizStore,
     get_daily_quiz_store,
 )
+from .feishu_documents import FeishuDocumentPublisher, PublishedDocument, contains_math_formula
 from .store import FeishuMessageStore, FeishuStoredMessage, FeishuThreadStore
 
 logger = logging.getLogger(__name__)
@@ -90,7 +92,7 @@ class FeishuCardView:
     answer: str = ""
     reasoning: str = ""
     reasoning_expanded: bool = True
-    images: tuple["FeishuCardImage", ...] = ()
+    images: tuple[FeishuCardImage, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -149,11 +151,14 @@ class FeishuChannel:
         self._monotonic_clock = monotonic_clock
         self.daily_brief_trigger = daily_brief_trigger
         self.daily_quiz_store = daily_quiz_store or get_daily_quiz_store(settings)
+        self._redis = get_redis_store(settings)
         self._active_group_until: dict[str, float] = {}
         self._main_loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._running = False
         self._api_client = None
+        self._document_publisher: FeishuDocumentPublisher | None = None
+        self._published_documents: dict[str, PublishedDocument] = {}
         self._running_cards: dict[str, str] = {}
         self._last_card_text: dict[str, str] = {}
         self._card_views: dict[str, FeishuCardView] = {}
@@ -194,10 +199,10 @@ class FeishuChannel:
         try:
             import lark_oapi as lark
             from lark_oapi.api.im.v1 import (
-                CreateMessageRequest,
-                CreateMessageRequestBody,
                 CreateImageRequest,
                 CreateImageRequestBody,
+                CreateMessageRequest,
+                CreateMessageRequestBody,
                 GetMessageResourceRequest,
                 PatchMessageRequest,
                 PatchMessageRequestBody,
@@ -223,6 +228,10 @@ class FeishuChannel:
             .app_secret(self.settings.feishu_app_secret)
             .domain(self.settings.feishu_domain)
             .build()
+        )
+        self._document_publisher = FeishuDocumentPublisher(
+            self._api_client,
+            doc_url_base=self.settings.feishu_doc_url_base,
         )
         self._main_loop = asyncio.get_running_loop()
         await asyncio.to_thread(get_embedder(self.settings).preload)
@@ -264,10 +273,18 @@ class FeishuChannel:
         if not inserted:
             logger.info("Ignoring duplicate Feishu message id=%s", inbound.message_id)
             return
+        if not self._redis.claim_once("feishu-message", inbound.message_id, ttl_seconds=7 * 86400):
+            logger.info("Ignoring Redis-deduplicated Feishu message id=%s", inbound.message_id)
+            return
         await self._cache_inbound_images(inbound)
 
         scope_key = f"private:{inbound.chat_id}" if inbound.is_private else f"group:{inbound.chat_id}"
         pending = self._pending_activations.get(scope_key)
+        if self._redis.activation_times(scope_key) is not None:
+            self._redis.touch_activation(
+                scope_key,
+                ttl_seconds=max(30, int(self.settings.feishu_activation_max_wait_seconds) + 30),
+            )
         if pending is not None:
             pending.last_message_at = asyncio.get_running_loop().time()
             pending.changed.set()
@@ -331,6 +348,11 @@ class FeishuChannel:
                 changed=asyncio.Event(),
             )
             self._pending_activations[scope_key] = pending
+            self._redis.touch_activation(
+                scope_key,
+                started=True,
+                ttl_seconds=max(30, int(self.settings.feishu_activation_max_wait_seconds) + 30),
+            )
             await self._collect_and_process_group(scope_key, pending)
             return
 
@@ -348,7 +370,7 @@ class FeishuChannel:
         debounce = self.settings.feishu_activation_debounce_seconds
         hard_deadline = pending.started_at + self.settings.feishu_activation_max_wait_seconds
         try:
-            while debounce > 0:
+            while debounce > 0 and not self._redis.enabled:
                 now = asyncio.get_running_loop().time()
                 deadline = min(pending.last_message_at + debounce, hard_deadline)
                 if now >= deadline:
@@ -358,22 +380,40 @@ class FeishuChannel:
                 except TimeoutError:
                     break
                 pending.changed.clear()
+            while debounce > 0 and self._redis.enabled:
+                times = self._redis.activation_times(scope_key)
+                if times is None:
+                    break
+                started_at, last_message_at = times
+                now_wall = time.time()
+                deadline = min(
+                    last_message_at + debounce,
+                    started_at + self.settings.feishu_activation_max_wait_seconds,
+                )
+                if now_wall >= deadline:
+                    break
+                await asyncio.sleep(min(0.1, max(0.01, deadline - now_wall)))
         finally:
             if self._pending_activations.get(scope_key) is pending:
                 self._pending_activations.pop(scope_key, None)
 
-        through_seq = self.message_store.latest_seq(pending.trigger.chat_id)
-        lock = self._scope_locks.setdefault(scope_key, asyncio.Lock())
-        async with lock:
-            messages = self.message_store.list_unconsumed(
-                pending.trigger.chat_id,
-                through_seq=through_seq,
-            )
-            if not messages:
+        with self._redis.lock("feishu-scope", scope_key, ttl_seconds=1200) as acquired:
+            if not acquired:
                 return
-            success = await self._process_group_batch(pending.trigger, messages, scope_key)
-            if success:
-                self.message_store.commit_consumed(pending.trigger.chat_id, through_seq)
+            through_seq = self.message_store.latest_seq(pending.trigger.chat_id)
+            lock = self._scope_locks.setdefault(scope_key, asyncio.Lock())
+            async with lock:
+                messages = self.message_store.list_unconsumed(
+                    pending.trigger.chat_id,
+                    through_seq=through_seq,
+                )
+                if not messages:
+                    self._redis.clear_activation(scope_key)
+                    return
+                success = await self._process_group_batch(pending.trigger, messages, scope_key)
+                if success:
+                    self.message_store.commit_consumed(pending.trigger.chat_id, through_seq)
+            self._redis.clear_activation(scope_key)
 
     async def _process_single_message(
         self,
@@ -814,7 +854,15 @@ class FeishuChannel:
             source_url = _public_link(str(raw.get("source_url") or ""))
             image_key = ""
             try:
-                data, _mime_type = await asyncio.to_thread(_download_outbound_candidate, raw)
+                local_path = str(raw.get("local_path") or "").strip()
+                if local_path:
+                    data = await asyncio.to_thread(
+                        load_generated_image,
+                        local_path,
+                        self.settings.generated_image_cache_dir,
+                    )
+                else:
+                    data, _mime_type = await asyncio.to_thread(_download_outbound_candidate, raw)
                 image_key = await self._upload_image(data)
             except Exception as exc:  # noqa: BLE001 - media failure must not fail the text response
                 logger.warning(
@@ -846,7 +894,18 @@ class FeishuChannel:
     def _get_image_context(self, scope_key: str) -> FeishuImageContext | None:
         context = self._image_contexts.get(scope_key)
         if context is None:
-            return None
+            payloads = self._redis.load_image_context(scope_key)
+            if not payloads:
+                return None
+            self._redis.save_image_context(
+                scope_key,
+                payloads,
+                ttl_seconds=self.settings.feishu_image_context_ttl_seconds,
+            )
+            expires_at = self._monotonic_clock() + self.settings.feishu_image_context_ttl_seconds
+            context = FeishuImageContext(tuple(payloads), expires_at)
+            self._image_contexts[scope_key] = context
+            self._schedule_image_context_expiry(scope_key, expires_at)
         if self._monotonic_clock() >= context.expires_at:
             self._clear_image_context(scope_key)
             return None
@@ -858,6 +917,11 @@ class FeishuChannel:
             return
         expires_at = self._monotonic_clock() + self.settings.feishu_image_context_ttl_seconds
         self._image_contexts[scope_key] = FeishuImageContext(tuple(payloads), expires_at)
+        self._redis.save_image_context(
+            scope_key,
+            payloads,
+            ttl_seconds=self.settings.feishu_image_context_ttl_seconds,
+        )
         self._schedule_image_context_expiry(scope_key, expires_at)
 
     def _schedule_image_context_expiry(self, scope_key: str, expires_at: float) -> None:
@@ -894,6 +958,7 @@ class FeishuChannel:
 
     def _clear_image_context(self, scope_key: str) -> None:
         self._image_contexts.pop(scope_key, None)
+        self._redis.delete("feishu:image-context", scope_key)
         handle = self._image_context_expiry_handles.pop(scope_key, None)
         if handle is not None:
             handle.cancel()
@@ -990,7 +1055,45 @@ class FeishuChannel:
         visible_text = text.answer if isinstance(text, FeishuCardView) else text
         if visible_text:
             self._last_card_text[inbound.message_id] = visible_text
-        card_id = self._running_cards.get(inbound.message_id)
+        remote_card = self._redis.get_card_state(inbound.message_id)
+        card_id = self._running_cards.get(inbound.message_id) or (
+            str(remote_card.get("card_id") or "") if remote_card else ""
+        )
+        if final and visible_text and contains_math_formula(visible_text):
+            try:
+                document_text = visible_text
+                if isinstance(text, FeishuCardView):
+                    source_lines = [
+                        f"- [{image.title or '图片来源'}]({image.source_url})"
+                        for image in text.images
+                        if image.source_url
+                    ]
+                    if source_lines:
+                        document_text += "\n\n## 图片来源\n" + "\n".join(source_lines)
+                document = await self._publish_math_document(inbound, document_text)
+                link_message_id = await self._send_document_link(inbound, document)
+                if link_message_id:
+                    if card_id:
+                        await self._delete_message_best_effort(card_id)
+                    if isinstance(text, FeishuCardView):
+                        for image in text.images:
+                            if image.image_key:
+                                try:
+                                    await self._send_image_message(inbound, image.image_key)
+                                except Exception as exc:  # noqa: BLE001 - document delivery already succeeded
+                                    logger.warning(
+                                        "Failed to send image beside Feishu document error_type=%s",
+                                        type(exc).__name__,
+                                    )
+                    self._finish_card_state(inbound.message_id)
+                    return link_message_id
+                logger.warning("Feishu document was created but its link message could not be sent")
+            except Exception as exc:  # noqa: BLE001 - card fallback must preserve the answer
+                logger.warning(
+                    "Failed to publish math answer as Feishu document message_id=%s error_type=%s",
+                    inbound.message_id,
+                    type(exc).__name__,
+                )
         if card_id:
             await self._update_card(card_id, text)
         elif inbound.is_private and inbound.message_id:
@@ -1001,12 +1104,129 @@ class FeishuChannel:
             card_id = await self._create_card(inbound.chat_id, text)
             if card_id:
                 self._running_cards[inbound.message_id] = card_id
+        if card_id:
+            self._redis.set_card_state(
+                inbound.message_id,
+                card_id=card_id,
+                last_text=str(visible_text or ""),
+            )
         if final:
-            self._pending_card_updates.pop(inbound.message_id, None)
-            self._running_cards.pop(inbound.message_id, None)
-            self._last_card_text.pop(inbound.message_id, None)
-            self._card_views.pop(inbound.message_id, None)
+            self._finish_card_state(inbound.message_id)
         return card_id
+
+    async def _publish_math_document(
+        self,
+        inbound: FeishuInboundMessage,
+        markdown: str,
+    ) -> PublishedDocument:
+        cached = self._published_documents.get(inbound.message_id)
+        if cached is not None:
+            return cached
+        remote = self._redis.get_json("feishu:math-document", inbound.message_id)
+        if isinstance(remote, dict) and remote.get("document_id") and remote.get("url"):
+            cached = PublishedDocument(
+                document_id=str(remote["document_id"]),
+                title=str(remote.get("title") or "SuperAssist 公式回答"),
+                url=str(remote["url"]),
+            )
+            self._published_documents[inbound.message_id] = cached
+            return cached
+        if self._document_publisher is None:
+            if self._api_client is None:
+                raise RuntimeError("Feishu document client is not initialized")
+            self._document_publisher = FeishuDocumentPublisher(
+                self._api_client,
+                doc_url_base=self.settings.feishu_doc_url_base,
+            )
+        published = await asyncio.to_thread(
+            self._document_publisher.publish,
+            markdown,
+            chat_id=inbound.chat_id,
+            sender_open_id=inbound.sender_open_id,
+            is_private=inbound.is_private,
+            idempotency_key=inbound.message_id,
+        )
+        self._published_documents[inbound.message_id] = published
+        self._redis.set_json(
+            "feishu:math-document",
+            inbound.message_id,
+            {
+                "document_id": published.document_id,
+                "title": published.title,
+                "url": published.url,
+            },
+            ttl_seconds=30 * 86400,
+        )
+        return published
+
+    async def _send_document_link(
+        self,
+        inbound: FeishuInboundMessage,
+        document: PublishedDocument,
+    ) -> str | None:
+        text = f"包含公式的完整回答已整理为飞书云文档：\n{document.title}\n{document.url}"
+        return await self._send_plain_message(inbound, "text", json.dumps({"text": text}, ensure_ascii=False))
+
+    async def _send_image_message(self, inbound: FeishuInboundMessage, image_key: str) -> str | None:
+        return await self._send_plain_message(
+            inbound,
+            "image",
+            json.dumps({"image_key": image_key}, ensure_ascii=False),
+        )
+
+    async def _send_plain_message(
+        self,
+        inbound: FeishuInboundMessage,
+        msg_type: str,
+        content: str,
+    ) -> str | None:
+        if not self._api_client:
+            return None
+        if inbound.is_private and inbound.message_id:
+            request = self._ReplyMessageRequest.builder().message_id(inbound.message_id).request_body(
+                self._ReplyMessageRequestBody.builder()
+                .msg_type(msg_type)
+                .content(content)
+                .reply_in_thread(True)
+                .build()
+            ).build()
+            response = await asyncio.to_thread(self._api_client.im.v1.message.reply, request)
+        else:
+            request = self._CreateMessageRequest.builder().receive_id_type("chat_id").request_body(
+                self._CreateMessageRequestBody.builder()
+                .receive_id(inbound.chat_id)
+                .msg_type(msg_type)
+                .content(content)
+                .build()
+            ).build()
+            response = await asyncio.to_thread(self._api_client.im.v1.message.create, request)
+        response_data = getattr(response, "data", None)
+        return getattr(response_data, "message_id", None)
+
+    async def _delete_message_best_effort(self, message_id: str) -> None:
+        if not self._api_client or not message_id:
+            return
+        try:
+            from lark_oapi.api.im.v1 import DeleteMessageRequest
+
+            request = DeleteMessageRequest.builder().message_id(message_id).build()
+            response = await asyncio.to_thread(self._api_client.im.v1.message.delete, request)
+            success = getattr(response, "success", None)
+            if callable(success) and not success():
+                logger.warning("Failed to remove temporary Feishu card message_id=%s", message_id)
+        except Exception as exc:  # noqa: BLE001 - the document link was already delivered
+            logger.warning(
+                "Failed to remove temporary Feishu card message_id=%s error_type=%s",
+                message_id,
+                type(exc).__name__,
+            )
+
+    def _finish_card_state(self, message_id: str) -> None:
+        self._pending_card_updates.pop(message_id, None)
+        self._running_cards.pop(message_id, None)
+        self._last_card_text.pop(message_id, None)
+        self._card_views.pop(message_id, None)
+        self._redis.delete("feishu:card", message_id)
 
     async def _reply_card(self, message_id: str, text: str | FeishuCardView) -> str | None:
         if not self._api_client:

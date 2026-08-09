@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import logging
 import re
 import threading
+import time
 from collections import deque
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
@@ -15,6 +16,7 @@ from langchain_core.language_models import BaseChatModel
 from superassist.memory.plans import AddNodeOp, UpdatePlan
 from superassist.memory.prompts import format_memory_writer_prompt
 from superassist.memory.service import MemoryService, MemoryWritePayload
+from superassist.redis_store import get_redis_store
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +71,7 @@ class MemoryWriter:
                     ]
                 )
                 return UpdatePlan.parse(_extract_json(_response_text(response.content)))
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - model/provider failures use the deterministic writer
                 logger.warning("LLM memory writer failed; using fallback plan: %s", exc)
         return self._fallback_plan(payload)
 
@@ -257,6 +259,7 @@ class MemoryWriteQueue:
         self._queued_job_ids: set[str] = set()
         self._lock = threading.Lock()
         self._timer: threading.Timer | None = None
+        self._redis = get_redis_store(writer.service.settings)
         self._recover_jobs()
 
     def add(self, payload: MemoryWritePayload) -> None:
@@ -267,6 +270,14 @@ class MemoryWriteQueue:
             asdict(payload),
         )
         if not should_run:
+            return
+        if self._redis.enabled:
+            self._redis.schedule_memory_job(
+                job_id,
+                asdict(payload),
+                due_at=time.time() + max(0.0, self.debounce_seconds),
+            )
+            self._schedule_redis_timer()
             return
         with self._lock:
             if job_id not in self._queued_job_ids:
@@ -279,6 +290,9 @@ class MemoryWriteQueue:
             self._timer.start()
 
     def flush(self) -> None:
+        if self._redis.enabled:
+            self._flush_redis(force=True)
+            return
         with self._lock:
             timer = self._timer
             if timer is not None and timer is not threading.current_thread():
@@ -329,16 +343,88 @@ class MemoryWriteQueue:
                 logger.warning("Skipping invalid persisted memory job id=%s", row.get("id"))
                 continue
             job_id = str(row["id"])
+            if self._redis.enabled:
+                self._redis.schedule_memory_job(
+                    job_id,
+                    asdict(payload),
+                    due_at=time.time() + max(1.0, self.debounce_seconds),
+                )
+                continue
             self._queue.append((job_id, payload))
             self._queued_job_ids.add(job_id)
+        if self._redis.enabled:
+            self._schedule_redis_timer()
+            return
         if self._queue:
             self._timer = threading.Timer(max(1.0, self.debounce_seconds), self.flush)
             self._timer.daemon = True
             self._timer.start()
 
+    def _schedule_redis_timer(self) -> None:
+        due_at = self._redis.next_memory_job_due_at()
+        if due_at is None:
+            return
+        delay = max(0.05, due_at - time.time())
+        with self._lock:
+            if self._timer is not None and self._timer.is_alive():
+                return
+            self._timer = threading.Timer(delay, self._flush_redis_due)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _flush_redis_due(self) -> None:
+        self._flush_redis(force=False)
+
+    def _flush_redis(self, *, force: bool) -> None:
+        with self._lock:
+            timer = self._timer
+            if timer is not None and timer is not threading.current_thread():
+                timer.cancel()
+            self._timer = None
+        while True:
+            job_ids = self._redis.claim_memory_jobs(force=force, limit=1000 if force else 50)
+            if not job_ids:
+                break
+            for job_id in job_ids:
+                raw = self._redis.get_memory_job(job_id)
+                if raw is None:
+                    self._redis.finish_memory_job(job_id)
+                    continue
+                try:
+                    payload = MemoryWritePayload(**raw)
+                except (TypeError, ValueError):
+                    self.writer.service.store.finish_memory_job(job_id, error="Invalid Redis memory job payload")
+                    self._redis.finish_memory_job(job_id)
+                    continue
+                attempts = self.writer.service.store.mark_memory_job_running(job_id)
+                if attempts == 0:
+                    self._redis.finish_memory_job(job_id)
+                    continue
+                try:
+                    self.writer.write(payload)
+                except Exception as exc:
+                    self.writer.service.store.finish_memory_job(
+                        job_id,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    logger.exception("Memory write failed for thread %s", payload.thread_id)
+                    if attempts < 3:
+                        retry_delay = self.debounce_seconds * (4 ** max(0, attempts - 1))
+                        self._redis.reschedule_memory_job(
+                            job_id,
+                            due_at=time.time() + max(1.0, retry_delay),
+                        )
+                    else:
+                        self._redis.finish_memory_job(job_id)
+                else:
+                    self.writer.service.store.finish_memory_job(job_id)
+                    self._redis.finish_memory_job(job_id)
+            break
+        self._schedule_redis_timer()
+
 
 def _memory_job_id(payload: MemoryWritePayload) -> str:
     source_context = payload.source_context or {}
     source_id = str(source_context.get("batch_id") or payload.event_id)
-    digest = hashlib.sha256(f"{payload.user_id}\0{source_id}".encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(f"{payload.user_id}\0{source_id}".encode()).hexdigest()
     return f"memory_job_{digest[:32]}"

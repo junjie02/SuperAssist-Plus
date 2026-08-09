@@ -27,6 +27,7 @@ from superassist.agent.short_memory import (
 from superassist.agent.state import SuperAssistState
 from superassist.agent.streaming import clean_answer_text
 from superassist.config import Settings
+from superassist.redis_store import get_redis_store
 from superassist.skills import active_skill_activations, active_skill_names
 
 
@@ -39,6 +40,7 @@ class ShortMemoryMiddleware(AgentMiddleware[SuperAssistState]):
         super().__init__()
         self._settings = settings
         self._model = _legacy_model
+        self._redis = get_redis_store(settings)
 
     def after_agent(self, state: SuperAssistState, runtime: Runtime) -> dict[str, Any] | None:
         if state.get("suppress_short_memory_write"):
@@ -110,6 +112,22 @@ class ShortMemoryMiddleware(AgentMiddleware[SuperAssistState]):
             + sum(estimate_tokens(record_text(record)) for record in active_records),
         )
         self._save_thread_metadata(thread_dir, meta_update)
+        merged_metadata = {**existing_metadata, **meta_update}
+        self._redis.save_skill_activations(
+            thread_id,
+            skill_activations,
+            ttl_seconds=self._settings.skill_active_ttl_seconds,
+        )
+        self._redis.save_short_memory(
+            thread_id,
+            {
+                "summary": str(merged_metadata.get("summary") or ""),
+                "records": active_records,
+                "summary_version": int(merged_metadata.get("summary_version") or 0),
+                "file_size": path.stat().st_size,
+                "file_mtime_ns": path.stat().st_mtime_ns,
+            },
+        )
 
         metadata = dict(state.get("metadata") or {})
         metadata["messages_path"] = str(path)

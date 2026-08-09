@@ -2,18 +2,30 @@ from __future__ import annotations
 
 import base64
 import importlib
+import io
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.types import Command
+from PIL import Image
 
-from superassist.config import Settings
 from superassist.agent import AgentRuntime
+from superassist.config import Settings
 from superassist.llm import FallbackChatModel, create_chat_model
 from superassist.tools import images as image_module
-from superassist.tools.images import image_search, inspect_image, present_images, validate_image_bytes
+from superassist.tools.images import (
+    GPT_IMAGE_MODEL,
+    generate_image,
+    image_search,
+    inspect_image,
+    load_generated_image,
+    present_images,
+    validate_image_bytes,
+)
 
 
 def _candidate(candidate_id: str = "img_test") -> dict:
@@ -147,10 +159,85 @@ def test_present_images_rejects_unknown_or_excessive_ids() -> None:
 
 
 def test_image_tool_schemas_hide_injected_state() -> None:
-    for image_tool in (image_search, inspect_image, present_images):
+    for image_tool in (image_search, inspect_image, present_images, generate_image):
         properties = image_tool.tool_call_schema.model_json_schema()["properties"]
         assert "state" not in properties
         assert "tool_call_id" not in properties
+
+
+def test_generate_image_uses_exact_model_and_selects_feishu_output(monkeypatch, tmp_path) -> None:
+    output = io.BytesIO()
+    Image.new("RGB", (2, 2), color="white").save(output, format="PNG")
+    png = output.getvalue()
+    calls: dict[str, object] = {}
+    settings = Settings(
+        SUPERASSIST_DATA_DIR=tmp_path,
+        SUPERASSIST_EMBEDDING_PROVIDER="hash",
+        SUPERASSIST_IMAGE_GENERATION_MODEL="custom-image-model",
+        SUPERASSIST_IMAGE_GENERATION_API_KEY="image-key",
+        SUPERASSIST_IMAGE_GENERATION_BASE_URL="https://images.example/v1",
+    )
+    monkeypatch.setattr(image_module, "get_settings", lambda: settings)
+
+    class Images:
+        def generate(self, **kwargs):
+            calls.update(kwargs)
+            return SimpleNamespace(data=[SimpleNamespace(b64_json=base64.b64encode(png).decode("ascii"))])
+
+    monkeypatch.setattr(
+        image_module,
+        "OpenAI",
+        lambda **kwargs: calls.update({"client": kwargs}) or SimpleNamespace(images=Images()),
+    )
+
+    result = generate_image.func(
+        "A precise ink illustration of a city library",
+        "1024x1024",
+        "medium",
+        state={},
+        tool_call_id="call_generate",
+    )
+
+    assert calls["model"] == "custom-image-model"
+    assert calls["client"] == {"api_key": "image-key", "base_url": "https://images.example/v1"}
+    assert calls["size"] == "1024x1024"
+    candidate = result.update["outbound_images"][0]
+    path = Path(candidate["local_path"])
+    assert path.is_relative_to(settings.generated_image_cache_dir.resolve())
+    assert path.read_bytes() == png
+    content = _tool_message(result).content
+    assert isinstance(content, list)
+    assert any(item.get("type") == "input_image" for item in content)
+
+
+def test_image_generation_model_defaults_to_gpt_image_2() -> None:
+    settings = Settings(_env_file=None, SUPERASSIST_EMBEDDING_PROVIDER="hash")
+
+    assert settings.image_generation_model == GPT_IMAGE_MODEL == "gpt-image-2"
+
+
+def test_generate_image_provider_failure_is_a_tool_error(monkeypatch, tmp_path) -> None:
+    settings = Settings(
+        SUPERASSIST_DATA_DIR=tmp_path,
+        SUPERASSIST_EMBEDDING_PROVIDER="hash",
+        SUPERASSIST_IMAGE_GENERATION_API_KEY="image-key",
+    )
+    monkeypatch.setattr(image_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(image_module, "OpenAI", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("offline")))
+
+    result = generate_image.func("draw a tree", state={}, tool_call_id="call_generate")
+
+    assert _tool_message(result).status == "error"
+    assert "RuntimeError" in str(_tool_message(result).content)
+    assert isinstance(result.update, dict) and "outbound_images" not in result.update
+
+
+def test_load_generated_image_rejects_path_outside_cache(tmp_path) -> None:
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"not read")
+
+    with pytest.raises(ValueError, match="outside the configured cache"):
+        load_generated_image(str(outside), tmp_path / "cache")
 
 
 def test_image_validation_rejects_header_only_corrupt_png() -> None:
@@ -166,11 +253,11 @@ def test_multimodal_tool_result_becomes_responses_function_output() -> None:
     model = create_chat_model(
         Settings(
             SUPERASSIST_MODEL="gpt-5.6-sol",
-                SUPERASSIST_API_KEY="test-key",
-                SUPERASSIST_BASE_URL="https://gateway.example/v1",
-                SUPERASSIST_EMBEDDING_PROVIDER="hash",
-                SUPERASSIST_USE_RESPONSES_API=True,
-            )
+            SUPERASSIST_API_KEY="test-key",
+            SUPERASSIST_BASE_URL="https://gateway.example/v1",
+            SUPERASSIST_EMBEDDING_PROVIDER="hash",
+            SUPERASSIST_USE_RESPONSES_API=True,
+        )
     )
     payload = model._get_request_payload(
         [
@@ -237,9 +324,7 @@ def test_agent_searches_then_explicitly_selects_image_without_persisting_tool_pa
             if not tool_messages:
                 message = AIMessage(
                     content="我先搜索图片。",
-                    tool_calls=[
-                        {"name": "image_search", "args": {"query": "千叶豆腐"}, "id": "call_search"}
-                    ],
+                    tool_calls=[{"name": "image_search", "args": {"query": "千叶豆腐"}, "id": "call_search"}],
                 )
             elif tool_messages[-1].name == "image_search":
                 content = tool_messages[-1].content

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import io
 import ipaddress
 import json
+import re
 import socket
+import time
+from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -14,6 +18,7 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
+from openai import OpenAI
 from PIL import Image
 
 from superassist.config import get_settings
@@ -23,6 +28,12 @@ MAX_PRESENTED_IMAGES = 3
 MAX_INSPECTED_IMAGES = 4
 MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024
 MAX_ORIGINAL_BYTES = 10 * 1024 * 1024
+MAX_GENERATED_IMAGE_BYTES = MAX_ORIGINAL_BYTES
+MAX_IMAGE_PROMPT_CHARS = 4000
+GENERATED_IMAGE_TTL_SECONDS = 24 * 60 * 60
+GPT_IMAGE_MODEL = "gpt-image-2"
+GPT_IMAGE_SIZES = {"auto", "1024x1024", "1536x1024", "1024x1536"}
+GPT_IMAGE_QUALITIES = {"auto", "low", "medium", "high"}
 SUPPORTED_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 
 
@@ -206,6 +217,116 @@ def present_images(
     )
 
 
+@tool("generate_image")
+def generate_image(
+    prompt: str,
+    size: str = "1024x1024",
+    quality: str = "medium",
+    *,
+    state: Annotated[dict[str, Any], InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+) -> Command[Any]:
+    """Generate one user-visible image with GPT Image 2.
+
+    The generated image is returned for visual inspection and is automatically
+    attached to the final Feishu response. Do not call present_images for it.
+
+    Args:
+        prompt: A concrete visual description of the image to create.
+        size: Output size: 1024x1024, 1536x1024, 1024x1536, or auto.
+        quality: Output quality: low, medium, high, or auto.
+    """
+
+    del state  # Injected for a stable tool interface; generated images do not need a candidate registry.
+    settings = get_settings()
+    if not settings.tool_network_enabled:
+        return _command_message(
+            tool_call_id,
+            "Image generation is disabled by SUPERASSIST_TOOL_NETWORK_ENABLED=false.",
+            status="error",
+        )
+    prompt = str(prompt or "").strip()
+    if not prompt:
+        return _command_message(tool_call_id, "Image generation requires a non-empty prompt.", status="error")
+    if len(prompt) > MAX_IMAGE_PROMPT_CHARS:
+        return _command_message(
+            tool_call_id,
+            f"Image prompt is too long (maximum {MAX_IMAGE_PROMPT_CHARS} characters).",
+            status="error",
+        )
+    size = str(size or "").strip().lower()
+    quality = str(quality or "").strip().lower()
+    if size not in GPT_IMAGE_SIZES:
+        return _command_message(tool_call_id, f"Unsupported image size: {size}.", status="error")
+    if quality not in GPT_IMAGE_QUALITIES:
+        return _command_message(tool_call_id, f"Unsupported image quality: {quality}.", status="error")
+    if not settings.resolved_image_generation_api_key:
+        return _command_message(
+            tool_call_id,
+            "Image generation requires SUPERASSIST_IMAGE_GENERATION_API_KEY or SUPERASSIST_API_KEY.",
+            status="error",
+        )
+
+    try:
+        client = OpenAI(
+            api_key=settings.resolved_image_generation_api_key,
+            base_url=settings.resolved_image_generation_base_url,
+        )
+        response = client.images.generate(
+            model=settings.image_generation_model,
+            prompt=prompt,
+            size=size,
+            quality=quality,
+            n=1,
+            output_format="png",
+        )
+        data = _generated_image_bytes(response)
+        if len(data) > MAX_GENERATED_IMAGE_BYTES:
+            raise ValueError("Generated image exceeds the 10 MB Feishu upload limit")
+        mime_type = detect_image_mime_type(data)
+        if mime_type != "image/png":
+            raise ValueError("Image generation API did not return a PNG image")
+        validate_image_bytes(data)
+        path = _save_generated_image(data, settings.generated_image_cache_dir)
+    except Exception as exc:  # noqa: BLE001 - provider failures must remain tool-level errors
+        return _command_message(
+            tool_call_id,
+            f"Image generation failed ({type(exc).__name__}): {_safe_error_text(exc)}",
+            status="error",
+        )
+
+    candidate_id = f"gen_{path.stem}"
+    title = _generated_image_title(prompt)
+    candidate = {
+        "candidate_id": candidate_id,
+        "title": title,
+        "local_path": str(path),
+        "mime_type": mime_type,
+        "source": settings.image_generation_model,
+        "source_url": "",
+    }
+    return Command(
+        update={
+            "outbound_images": [candidate],
+            "messages": [
+                ToolMessage(
+                    content=[
+                        {
+                            "type": "input_text",
+                            "text": (
+                                f"Generated image {candidate_id} with {settings.image_generation_model}. "
+                                "It is already selected for the final Feishu response. Inspect it before replying."
+                            ),
+                        },
+                        {"type": "input_image", "image_url": _image_data_url(data, mime_type), "detail": "high"},
+                    ],
+                    tool_call_id=tool_call_id,
+                )
+            ],
+        }
+    )
+
+
 def download_image_url(url: str, *, max_bytes: int, timeout: int = 15) -> tuple[bytes, str]:
     """Download a public HTTP image with SSRF, type, and size checks."""
 
@@ -251,6 +372,26 @@ def validate_image_bytes(data: bytes) -> None:
             image.verify()
     except Exception as exc:
         raise ValueError("Downloaded image data is corrupt or incomplete") from exc
+
+
+def load_generated_image(path_value: str, allowed_root: Path, *, max_bytes: int = MAX_GENERATED_IMAGE_BYTES) -> bytes:
+    """Read a generated image only when it is inside SuperAssist's controlled cache."""
+
+    root = allowed_root.resolve()
+    path = Path(str(path_value or "")).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("Generated image path is outside the configured cache directory") from exc
+    if not path.is_file():
+        raise ValueError("Generated image file is missing")
+    if path.stat().st_size > max_bytes:
+        raise ValueError("Generated image exceeds the upload size limit")
+    data = path.read_bytes()
+    if len(data) > max_bytes:
+        raise ValueError("Generated image exceeds the upload size limit")
+    validate_image_bytes(data)
+    return data
 
 
 class _PublicRedirectHandler(HTTPRedirectHandler):
@@ -359,6 +500,53 @@ def _image_data_url(data: bytes, mime_type: str) -> str:
     return f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}"
 
 
+def _generated_image_bytes(response: Any) -> bytes:
+    items = getattr(response, "data", None) or []
+    if not items:
+        raise ValueError("Image generation API returned no image")
+    item = items[0]
+    encoded = str(getattr(item, "b64_json", None) or "").strip()
+    if encoded:
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("Image generation API returned invalid base64 data") from exc
+    url = str(getattr(item, "url", None) or "").strip()
+    if url:
+        data, _mime_type = download_image_url(url, max_bytes=MAX_GENERATED_IMAGE_BYTES)
+        return data
+    raise ValueError("Image generation API returned neither base64 data nor a URL")
+
+
+def _save_generated_image(data: bytes, root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    _cleanup_generated_images(root)
+    path = root / f"{uuid4().hex}.png"
+    path.write_bytes(data)
+    return path.resolve()
+
+
+def _cleanup_generated_images(root: Path) -> None:
+    cutoff = time.time() - GENERATED_IMAGE_TTL_SECONDS
+    for path in root.glob("*.png"):
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            continue
+
+
+def _generated_image_title(prompt: str) -> str:
+    compact = " ".join(prompt.split())
+    return compact[:80] or "Generated image"
+
+
+def _safe_error_text(exc: Exception) -> str:
+    text = " ".join(str(exc).split())
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]+", "[redacted]", text)
+    return text[:300] or "provider returned no details"
+
+
 def _positive_int(value: Any) -> int | None:
     try:
         number = int(value)
@@ -368,10 +556,13 @@ def _positive_int(value: Any) -> int | None:
 
 
 __all__ = [
+    "GPT_IMAGE_MODEL",
     "detect_image_mime_type",
     "download_image_url",
+    "generate_image",
     "image_search",
     "inspect_image",
+    "load_generated_image",
     "present_images",
     "validate_image_bytes",
 ]

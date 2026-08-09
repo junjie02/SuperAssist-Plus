@@ -5,6 +5,9 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from threading import Lock
+from typing import Any
+
+from superassist.redis_store import get_redis_store
 
 
 class SubagentStatus(StrEnum):
@@ -34,6 +37,21 @@ class SubagentResult:
         data["completed_at"] = self.completed_at.isoformat() if self.completed_at else None
         return data
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SubagentResult:
+        started_at = _parse_datetime(data.get("started_at")) or datetime.now(UTC)
+        return cls(
+            task_id=str(data.get("task_id") or ""),
+            description=str(data.get("description") or ""),
+            subagent_type=str(data.get("subagent_type") or ""),
+            status=SubagentStatus(str(data.get("status") or SubagentStatus.PENDING.value)),
+            result=str(data.get("result") or ""),
+            error=str(data.get("error") or ""),
+            ai_messages=[str(item) for item in data.get("ai_messages") or []],
+            started_at=started_at,
+            completed_at=_parse_datetime(data.get("completed_at")),
+        )
+
 
 class SubagentTaskStore:
     def __init__(self, max_items: int = 200) -> None:
@@ -50,22 +68,55 @@ class SubagentTaskStore:
             while len(self._order) > self.max_items:
                 old_id = self._order.pop()
                 self._items.pop(old_id, None)
+        get_redis_store().save_task(result.to_dict())
 
     def get(self, task_id: str) -> SubagentResult | None:
+        remote = get_redis_store().get_task(task_id)
+        if remote is not None:
+            try:
+                result = SubagentResult.from_dict(remote)
+            except (TypeError, ValueError):
+                result = None
+            if result is not None:
+                with self._lock:
+                    if result.task_id not in self._items:
+                        self._order.appendleft(result.task_id)
+                    self._items[result.task_id] = result
+                return result
         with self._lock:
             return self._items.get(task_id)
 
     def list(self, limit: int = 50) -> list[SubagentResult]:
+        remote = get_redis_store().list_tasks(max(1, min(limit, self.max_items)))
+        if remote is not None:
+            results: list[SubagentResult] = []
+            for item in remote:
+                try:
+                    results.append(SubagentResult.from_dict(item))
+                except (TypeError, ValueError):
+                    continue
+            return results
         with self._lock:
             task_ids = list(self._order)[: max(1, min(limit, self.max_items))]
             return [self._items[task_id] for task_id in task_ids if task_id in self._items]
 
     def delete(self, task_id: str) -> bool:
+        remote_existed = get_redis_store().delete_task(task_id)
         with self._lock:
             existed = self._items.pop(task_id, None) is not None
             if existed:
                 self._order = deque(item for item in self._order if item != task_id)
-            return existed
+            return existed or remote_existed
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 TASK_STORE = SubagentTaskStore()

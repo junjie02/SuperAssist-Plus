@@ -148,7 +148,7 @@
 | `temperature` | `SUPERASSIST_TEMPERATURE` | `None` | 模型名含 `minimax` 且未显式设置时强制为 `1.0`。 |
 | `reasoning_effort` | `SUPERASSIST_REASONING_EFFORT` | `medium` | GPT-5.6 支持 `none/low/medium/high/xhigh/max`；飞书 `/effort` 可按会话覆盖。 |
 | `max_tokens` | `SUPERASSIST_MAX_TOKENS` | `None` | 仅当非 None 才透传。 |
-| `claude_fallback_*` | `SUPERASSIST_CLAUDE_FALLBACK_*` | `claude-opus-5` / 空 key | 配置 key 与 OpenAI-compatible `/v1` 地址后成为第二 lead route，固定走 Chat Completions。 |
+| `claude_fallback_*` | `SUPERASSIST_CLAUDE_FALLBACK_*` | `claude-opus-5` / 空 key | 配置 key 与 OpenAI-compatible `/v1` 地址后成为第二 lead route，并遵循全局 Responses 开关。 |
 | `deepseek_fallback_*` | `SUPERASSIST_DEEPSEEK_FALLBACK_*` | `deepseek-v4-flash` / 空 key | 配置独立 key/base URL 后成为第三 lead route；不隐式复用 Memory 凭据。 |
 | `prompt_cache_explicit_enabled` | `SUPERASSIST_PROMPT_CACHE_EXPLICIT_ENABLED` | `True` | 仅 GPT-5.6：启用 Responses 显式提示词缓存断点；可关闭以兼容不支持该协议的中转网关。 |
 | `model_input_log_enabled` | `SUPERASSIST_MODEL_INPUT_LOG_ENABLED` | `False` | 开启后记录最终 provider payload 到 `<data_dir>/logs/model-input.jsonl`。 |
@@ -279,9 +279,9 @@
    - 请求 `reasoning.effort`；非 `none` 时同时请求 `reasoning.summary="detailed"`，供流式飞书卡片展示。
    - 开启 `stream_usage`，`AgentRuntime` 把 `input_tokens/cache_read/cache_hit_rate` 写入结果 metadata 和日志。
 4. **其它 OpenAI 兼容** → `OneSecondRetryChatModel`，仅对连接、超时、429 与 5xx 等可恢复错误在 1 秒后重试一次。
-5. **可选 lead failover** → `FailoverChatModel` 按 GPT → Claude → DeepSeek 顺序包装已配置 route；每轮切换后保持 route，不在工具循环中跳回。Responses 的 prompt-cache kwargs 不会传给 Chat Completions fallback。流式请求只在首 chunk 前失败时透明切换，避免拼接两个模型的半截回答。
+5. **可选 lead failover** → `FailoverChatModel` 按 GPT → Claude → DeepSeek 顺序包装已配置 route；所有 route 遵循全局 Responses 开关，每轮切换后保持 route，不在工具循环中跳回。流式请求只在首 chunk 前失败时透明切换，避免拼接两个模型的半截回答。
 
-`create_memory_model` 默认使用 `deepseek-v4-flash`，从 `memory_api_key/memory_base_url` 取独立配置（空值回退主模型凭据），不附加 GPT-5.6 的 Responses/reasoning 参数。Memory Updater 与短记忆压缩各持有一个该模型客户端。
+`create_memory_model` 默认使用 `deepseek-v4-flash`，从 `memory_api_key/memory_base_url` 取独立配置（空值回退主模型凭据），遵循全局 Responses 开关，但不附加 GPT-5.6 专用 reasoning 参数。Memory Updater 与短记忆压缩各持有一个该模型客户端。
 
 所有真实模型请求都可写入 `logs/model-input.jsonl`；记录包含 `call_kind`、近似 token 总量、按 static system / short memory / turn context / current user / tool schemas 等划分的 `input_manifest`，并按配置大小轮转。
 

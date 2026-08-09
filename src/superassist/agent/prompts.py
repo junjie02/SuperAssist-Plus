@@ -28,6 +28,8 @@ SYSTEM_PROMPT = """
   again when needed. Never imply that a candidate was shown to the user merely because it appeared in a tool result.
 - To include searched images in the final Feishu response, you MUST explicitly call `present_images` with candidate
   IDs you have judged relevant. Without that call, no searched image is delivered. Do not fabricate candidate IDs.
+- Use `generate_image` when the user asks you to create an original image. Pass a precise visual description. The
+  generated image is automatically attached to the final Feishu response, so do not call `present_images` for it.
 </tool_use>
 
 <memory_use>

@@ -27,9 +27,10 @@ from superassist.memory.embedding import Embedder, cosine_similarity, get_embedd
 from superassist.memory.operations import ApplyContext, ApplyResult, apply_plan
 from superassist.memory.plans import UpdatePlan
 from superassist.memory.scoring import EventProbe, MemoryContextRanker
-from superassist.memory.storage import MemoryGraphStore, create_engine_from_settings
+from superassist.memory.storage import MemoryGraphStore, create_engine_from_settings, new_id
 from superassist.memory.vector_index import PersistentFaissIndex
 from superassist.models import EdgeType, MemoryNode, MemoryRecall, NodeType
+from superassist.redis_store import get_redis_store
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,7 @@ class MemoryService:
         self.embedder: Embedder = get_embedder(self.settings)
         self._faiss_indexes: dict[str, PersistentFaissIndex] = {}
         self._ranker = MemoryContextRanker(self.store, self.settings)
+        self._redis = get_redis_store(self.settings)
 
     # -- Turn lifecycle ----------------------------------------------------
 
@@ -70,6 +72,30 @@ class MemoryService:
         return contexts.event_id, contexts.write_recall
 
     def prepare_turn_contexts(self, user_id: str, thread_id: str, message: str) -> TurnMemoryContexts:
+        cached = self._redis.load_recall(user_id, message)
+        if cached is not None:
+            try:
+                read_recall = MemoryRecall.model_validate(cached.get("read_recall") or {})
+                write_recall = MemoryRecall.model_validate(cached.get("write_recall") or {})
+                snapshot = list(cached.get("snapshot") or [])
+            except (TypeError, ValueError):
+                cached = None
+            else:
+                self.store.replace_recall_snapshot(user_id, snapshot)
+                self.store.touch_nodes(
+                    user_id,
+                    [
+                        node.id
+                        for recall in (read_recall, write_recall)
+                        for tier in (recall.immediate, recall.working, recall.background, recall.buffer)
+                        for node in tier
+                    ],
+                )
+                return TurnMemoryContexts(
+                    event_id=new_id("event"),
+                    read_recall=read_recall,
+                    write_recall=write_recall,
+                )
         probe = EventProbe(user_id=user_id, text=message, embedding=self.embed(message))
         self.rebuild_vector_index(user_id)
         entry_matches = self.vector_index(user_id).search(probe.embedding, self.settings.memory_read_entry_points)
@@ -81,23 +107,53 @@ class MemoryService:
 
         # Pre-allocate an event id — the actual event node is created later
         # by the LLM memory writer (or fallback writer) with a proper summary.
-        from superassist.memory.storage import new_id
-
         event_id = new_id("event")
-
-        return TurnMemoryContexts(
+        result = TurnMemoryContexts(
             event_id=event_id,
             read_recall=_to_recall(read_context),
             write_recall=_to_recall(write_context),
         )
+        self._redis.save_recall(
+            user_id,
+            message,
+            {
+                "read_recall": result.read_recall.model_dump(mode="json"),
+                "write_recall": result.write_recall.model_dump(mode="json"),
+                "snapshot": _recall_snapshot_items(read_context),
+            },
+        )
+        return result
 
     def recall(self, user_id: str, query: str, limit: int = 12) -> MemoryRecall:
+        cache_query = f"direct:{limit}:{query}"
+        cached = self._redis.load_recall(user_id, cache_query)
+        if cached is not None:
+            try:
+                recall = MemoryRecall.model_validate(cached.get("recall") or {})
+            except (TypeError, ValueError):
+                cached = None
+            else:
+                self.store.touch_nodes(
+                    user_id,
+                    [
+                        node.id
+                        for tier in (recall.immediate, recall.working, recall.background, recall.buffer)
+                        for node in tier
+                    ],
+                )
+                return recall
         probe = EventProbe(user_id=user_id, text=query, embedding=self.embed(query))
         self.rebuild_vector_index(user_id)
         entry_matches = self.vector_index(user_id).search(probe.embedding, self.settings.memory_read_entry_points)
         context = self._ranker.assemble_read_context(probe, entry_matches, limit=limit)
         self.store.touch_nodes(user_id, [node.id for node in context.ordered_nodes()])
-        return _to_recall(context)
+        recall = _to_recall(context)
+        self._redis.save_recall(
+            user_id,
+            cache_query,
+            {"recall": recall.model_dump(mode="json")},
+        )
+        return recall
 
     def best_concept_match(self, user_id: str, text: str) -> tuple[MemoryNode | None, float]:
         query_embedding = self.embed(text)
@@ -131,6 +187,7 @@ class MemoryService:
         result: ApplyResult = apply_plan(update_plan, context)
         if result.nodes or result.updated or result.merged or result.removed_nodes:
             self.rebuild_vector_index(payload.user_id)
+            self._redis.bump_memory_version(payload.user_id)
         return result.to_summary()
 
     # -- Vector index ------------------------------------------------------
@@ -222,11 +279,14 @@ class MemoryService:
         return added
 
     def consolidate(self, user_id: str) -> dict[str, int]:
-        return {
+        result = {
             "merged": self.merge_similar_concepts(user_id),
             "decayed": self.decay_edges(user_id),
             "completed": self.complete_orphans(user_id),
         }
+        if any(result.values()):
+            self._redis.bump_memory_version(user_id)
+        return result
 
     # -- Embedding helpers -------------------------------------------------
 

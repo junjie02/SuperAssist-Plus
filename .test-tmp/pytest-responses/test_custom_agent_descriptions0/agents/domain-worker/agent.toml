@@ -1,0 +1,5 @@
+name = "domain-worker"
+description = "Domain worker discovered dynamically."
+prompt_file = "system.md"
+default = false
+allowed_tools = "*"

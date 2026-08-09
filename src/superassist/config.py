@@ -58,6 +58,36 @@ class Settings(BaseSettings):
     )
     data_dir: Path = Field(default=Path(".superassist"), alias="SUPERASSIST_DATA_DIR")
     db_url: str = Field(default="", alias="SUPERASSIST_DB_URL")
+    redis_enabled: bool = Field(default=False, alias="SUPERASSIST_REDIS_ENABLED")
+    redis_url: str = Field(default="redis://127.0.0.1:6379/0", alias="SUPERASSIST_REDIS_URL")
+    redis_prefix: str = Field(default="superassist", alias="SUPERASSIST_REDIS_PREFIX")
+    redis_required: bool = Field(default=False, alias="SUPERASSIST_REDIS_REQUIRED")
+    redis_socket_timeout_seconds: float = Field(
+        default=1.0,
+        ge=0.1,
+        le=30.0,
+        alias="SUPERASSIST_REDIS_SOCKET_TIMEOUT_SECONDS",
+    )
+    redis_task_ttl_seconds: int = Field(
+        default=86400,
+        ge=60,
+        alias="SUPERASSIST_REDIS_TASK_TTL_SECONDS",
+    )
+    redis_short_memory_ttl_seconds: int = Field(
+        default=3600,
+        ge=60,
+        alias="SUPERASSIST_REDIS_SHORT_MEMORY_TTL_SECONDS",
+    )
+    redis_recall_ttl_seconds: int = Field(
+        default=120,
+        ge=1,
+        alias="SUPERASSIST_REDIS_RECALL_TTL_SECONDS",
+    )
+    api_rate_limit_per_minute: int = Field(
+        default=0,
+        ge=0,
+        alias="SUPERASSIST_API_RATE_LIMIT_PER_MINUTE",
+    )
     tool_workspace_dir: Path | None = Field(default=None, alias="SUPERASSIST_TOOL_WORKSPACE_DIR")
     tool_network_enabled: bool = Field(default=True, alias="SUPERASSIST_TOOL_NETWORK_ENABLED")
     tool_shell_enabled: bool = Field(default=False, alias="SUPERASSIST_TOOL_SHELL_ENABLED")
@@ -65,6 +95,9 @@ class Settings(BaseSettings):
     tool_shell_output_max_chars: int = Field(default=20000, alias="SUPERASSIST_TOOL_SHELL_OUTPUT_MAX_CHARS")
     max_tool_calls: int = Field(default=8, alias="SUPERASSIST_MAX_TOOL_CALLS")
     enable_tools: bool = Field(default=False, alias="SUPERASSIST_ENABLE_TOOLS")
+    image_generation_model: str = Field(default="gpt-image-2", alias="SUPERASSIST_IMAGE_GENERATION_MODEL")
+    image_generation_api_key: str = Field(default="", alias="SUPERASSIST_IMAGE_GENERATION_API_KEY")
+    image_generation_base_url: str = Field(default="", alias="SUPERASSIST_IMAGE_GENERATION_BASE_URL")
     subagents_enabled: bool = Field(default=True, alias="SUPERASSIST_SUBAGENTS_ENABLED")
     agent_teams_enabled: bool = Field(default=True, alias="SUPERASSIST_AGENT_TEAMS_ENABLED")
     subagent_max_concurrent: int = Field(default=3, alias="SUPERASSIST_SUBAGENT_MAX_CONCURRENT")
@@ -154,6 +187,10 @@ class Settings(BaseSettings):
         default=180,
         ge=1,
         alias="SUPERASSIST_FEISHU_IMAGE_CONTEXT_TTL_SECONDS",
+    )
+    feishu_doc_url_base: str = Field(
+        default="https://feishu.cn/docx",
+        alias="SUPERASSIST_FEISHU_DOC_URL_BASE",
     )
     daily_brief_enabled: bool = Field(default=False, alias="SUPERASSIST_DAILY_BRIEF_ENABLED")
     daily_brief_times: str = Field(default="07:45,19:45", alias="SUPERASSIST_DAILY_BRIEF_TIMES")
@@ -247,6 +284,18 @@ class Settings(BaseSettings):
     @property
     def resolved_tool_workspace_dir(self) -> Path:
         return self.tool_workspace_dir or self.data_dir / "workspace"
+
+    @property
+    def resolved_image_generation_api_key(self) -> str:
+        return self.image_generation_api_key or self.api_key
+
+    @property
+    def resolved_image_generation_base_url(self) -> str:
+        return self.image_generation_base_url or self.base_url
+
+    @property
+    def generated_image_cache_dir(self) -> Path:
+        return self.data_dir / "cache" / "generated-images"
 
     @property
     def huggingface_cache_dir(self) -> Path:

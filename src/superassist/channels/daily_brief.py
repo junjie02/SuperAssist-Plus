@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 from superassist.agent import AgentRuntime
 from superassist.config import Settings
 from superassist.models import AgentRunEvent
+from superassist.redis_store import get_redis_store
 from superassist.tools.web import _fetch_url, is_allowed_official_url, official_media_web_scope
 
 logger = logging.getLogger(__name__)
@@ -294,6 +295,7 @@ class DailyBriefScheduler:
         self.schedule = parse_schedule_times(settings.daily_brief_times)
         self.now_factory = now_factory or (lambda timezone: datetime.now(timezone))
         self.brief_recorder = brief_recorder
+        self._redis = get_redis_store(settings)
         self._task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
 
@@ -352,6 +354,12 @@ class DailyBriefScheduler:
             if now.tzinfo is None:
                 now = now.replace(tzinfo=self.timezone)
             slot_id = now.strftime("%Y-%m-%dT%H:%M")
+            if not force and not self._redis.claim_once(
+                "schedule-daily-brief",
+                slot_id,
+                ttl_seconds=max(3600, self.settings.daily_brief_catch_up_minutes * 60 + 3600),
+            ):
+                return DailyBriefRunResult("skipped", f"slot {slot_id} is already running or completed")
             state = self._load_state()
             if not force and slot_id in state.get("completed_slots", []):
                 return DailyBriefRunResult("skipped", f"slot {slot_id} already completed")

@@ -20,6 +20,7 @@ from superassist.config import PROJECT_ROOT, Settings, get_settings
 from superassist.memory.service import MemoryService
 from superassist.models import AgentRunEvent, AgentRunResult, MemoryEdge, MemoryNode, NodeType
 from superassist.rag.service import LightRAGService
+from superassist.redis_store import get_redis_store
 from superassist.subagents import TASK_STORE
 from superassist.ui.rag import register_rag_routes
 from superassist.ui.settings import register_settings_routes
@@ -213,7 +214,11 @@ def create_ai_engine_app(settings: Settings | None = None, settings_env_path: Pa
 
     @app.get("/internal/health")
     def health() -> dict[str, str]:
-        return {"status": "ok"}
+        redis_store = get_redis_store(resolved)
+        redis_status = "disabled"
+        if resolved.redis_enabled:
+            redis_status = "ok" if redis_store.ping() else "degraded"
+        return {"status": "ok", "redis": redis_status}
 
     # -- Runtime settings ------------------------------------------------
 

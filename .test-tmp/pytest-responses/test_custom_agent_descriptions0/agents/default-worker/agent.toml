@@ -1,0 +1,5 @@
+name = "default-worker"
+description = "Default worker from disk."
+prompt_file = "system.md"
+default = true
+allowed_tools = "*"

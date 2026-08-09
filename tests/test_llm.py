@@ -117,8 +117,10 @@ def test_create_chat_model_builds_responses_primary_with_configured_fallbacks() 
     ]
     assert model._routes[0].use_responses_api is True
     assert model._routes[0].use_previous_response_id is False
-    assert model._routes[1].use_responses_api is False
-    assert model._routes[2].use_responses_api is False
+    assert model._routes[1].use_responses_api is True
+    assert model._routes[1].use_previous_response_id is False
+    assert model._routes[2].use_responses_api is True
+    assert model._routes[2].use_previous_response_id is False
 
 
 def test_deepseek_fallback_replaces_image_pixels_with_degradation_marker() -> None:
@@ -304,7 +306,11 @@ def test_memory_model_uses_independent_openai_compatible_settings() -> None:
     assert model.model_name == "deepseek-v4-flash"
     assert str(model.openai_api_base) == "https://memory.example/v1"
     assert model.openai_api_key.get_secret_value() == "memory-secret"
+    assert model.use_responses_api is True
+    assert model.use_previous_response_id is False
     assert payload["model"] == "deepseek-v4-flash"
+    assert "input" in payload
+    assert "messages" not in payload
     assert "reasoning" not in payload
     assert "reasoning_effort" not in payload
 

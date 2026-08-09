@@ -18,6 +18,7 @@ from langchain_core.tools import BaseTool, tool
 from pydantic import Field
 
 from superassist.config import Settings
+from superassist.redis_store import get_redis_store
 from superassist.teams.context import current_team_thread_id
 
 logger = logging.getLogger(__name__)
@@ -706,6 +707,7 @@ class DailyQuizScheduler:
         self.timezone = ZoneInfo(settings.daily_brief_timezone)
         self.quiz_time = _parse_quiz_time(settings.daily_quiz_time)
         self.now_factory = now_factory or (lambda timezone: datetime.now(timezone))
+        self._redis = get_redis_store(settings)
         self._task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
 
@@ -733,6 +735,12 @@ class DailyQuizScheduler:
         async with self._lock:
             now = self._local(scheduled_for or self.now_factory(self.timezone))
             slot = now.strftime("%Y-%m-%dT%H:%M")
+            if not force and not self._redis.claim_once(
+                "schedule-daily-quiz",
+                slot,
+                ttl_seconds=max(1800, self.settings.daily_brief_catch_up_minutes * 60 + 1800),
+            ):
+                return []
             state = _read_json(self.settings.daily_quiz_scheduler_state_path, {"completed_slots": []})
             if not force and slot in state.get("completed_slots", []):
                 return []

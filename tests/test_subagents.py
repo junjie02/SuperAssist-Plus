@@ -112,7 +112,7 @@ def test_memory_model_profile_reuses_existing_deepseek_configuration(tmp_path, m
     assert resolved.model == "deepseek-v4-flash"
     assert resolved.api_key == "memory-secret"
     assert resolved.base_url == "https://api.deepseek.com/v1"
-    assert resolved.use_responses_api is False
+    assert resolved.use_responses_api is True
     assert {tool.name for tool in executor.tools} == {"daily_quiz_update", "read_file"}
 
 

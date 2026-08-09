@@ -4,10 +4,10 @@ from pathlib import Path
 
 from superassist.config import Settings
 from superassist.tools import default_tools
+from superassist.tools import web as web_module
 from superassist.tools.files import delete_path, list_files, read_file, write_file
 from superassist.tools.shell import shell
 from superassist.tools.web import official_media_web_scope, web_fetch, web_search
-from superassist.tools import web as web_module
 
 
 def _tool(name: str):
@@ -27,6 +27,7 @@ def test_default_tools_include_file_and_web_tools() -> None:
         "image_search",
         "inspect_image",
         "present_images",
+        "generate_image",
         "shell",
         "task",
     }.issubset(names)
@@ -148,7 +149,7 @@ def test_default_tools_can_exclude_task_for_subagents() -> None:
 def test_subagent_tools_can_exclude_lead_only_image_delivery_tools() -> None:
     names = {tool.name for tool in default_tools(include_task=False, include_images=False)}
 
-    assert {"image_search", "inspect_image", "present_images"}.isdisjoint(names)
+    assert {"image_search", "inspect_image", "present_images", "generate_image"}.isdisjoint(names)
 
 
 def test_shell_tool_is_disabled_by_default(tmp_path: Path, monkeypatch) -> None:
