@@ -1198,7 +1198,7 @@ LangChain `@tool("team_task")`：
 `handle_inbound(inbound)`：
 1. 私聊先执行 sender 白名单；群聊中所有可见成员消息先写 `FeishuMessageStore`，白名单只决定谁能触发 Agent。
 2. `(channel,message_id)` 由 SQLite 唯一约束去重；图片在入口立即缓存原始字节，失败时保留 resource key 并在激活时重试。
-3. 私聊立即进入每 scope 串行锁；群聊需 `mention_only=False`、明确 @ 或测验回复才能触发。
+3. 私聊立即进入每 scope 串行锁；群聊需 `mention_only=False`、明确 @ 或测验回复才能触发。只有机器人 @、没有附加文字的消息也是有效触发，语义是处理前面的未消费消息。
 4. 群聊触发后等待 `activation_debounce_seconds=1.5` 的全消息静默窗口，任何文字或图片都会重置窗口；`activation_max_wait_seconds=6` 是硬上限。
 5. 水位内全部未消费消息按 seq 形成一个 `<FeishuConversationBatch>`，每条保留 message ID、sender open_id/name、时间、reply root 与 trigger 标记；Agent 成功后才推进消费游标。
 6. scope 正忙时新任务等待锁而非丢弃。Agent 运行期间到达但超过水位的消息留给下一次显式激活。

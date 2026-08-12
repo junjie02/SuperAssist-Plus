@@ -220,6 +220,20 @@ def test_should_trigger_private_or_mentions() -> None:
     assert should_trigger_agent(group_with_mention, mention_only=True) is True
 
 
+def test_group_with_only_mention_is_an_explicit_activation() -> None:
+    inbound = FeishuInboundMessage(
+        "chat",
+        "msg",
+        "ou",
+        "@bot",
+        chat_type="group",
+        mentions=[{"name": "@bot"}],
+    )
+
+    assert should_trigger_agent(inbound, mention_only=True) is True
+    assert clean_mention_text(inbound.text, inbound.mentions) == ""
+
+
 def test_group_requires_explicit_activation_for_each_batch(tmp_path) -> None:
     now = [1000.0]
     channel = FeishuChannel(
@@ -425,6 +439,71 @@ def test_group_activation_batches_multiple_speakers_and_late_image(tmp_path) -> 
         assert isinstance(content, list)
         assert any(item.get("type") == "image_url" for item in content)
         assert any("from sender ou_b" in item.get("text", "") for item in content)
+
+    _run(go())
+
+
+def test_group_only_mention_activates_preceding_messages(tmp_path) -> None:
+    received = []
+
+    class Runtime:
+        def __init__(self, _reporter):
+            self.memory_queue = SimpleNamespace(flush=lambda: None)
+
+        def run_streaming(self, message, *, user_id, thread_id, message_content=None):
+            received.append((message, message_content, user_id, thread_id))
+            return AgentRunResult(thread_id=thread_id, answer="done", metadata={})
+
+    async def go():
+        channel = FeishuChannel(
+            _settings(
+                tmp_path,
+                SUPERASSIST_FEISHU_ALLOWED_OPEN_IDS="ou_owner",
+                SUPERASSIST_FEISHU_ACTIVATION_DEBOUNCE_SECONDS=0,
+            ),
+            runtime_factory=lambda reporter: Runtime(reporter),
+        )
+
+        async def create(_chat_id, _text):
+            return "card"
+
+        async def update(_message_id, _text):
+            return None
+
+        channel._create_card = create
+        channel._update_card = update
+
+        await channel.handle_inbound(
+            FeishuInboundMessage(
+                "chat",
+                "msg_context",
+                "ou_a",
+                "Please summarize the proposal above.",
+                sender_name="Alice",
+                chat_type="group",
+            )
+        )
+        await channel.handle_inbound(
+            FeishuInboundMessage(
+                "chat",
+                "msg_trigger",
+                "ou_owner",
+                "@bot",
+                sender_name="Owner",
+                chat_type="group",
+                mentions=[{"name": "@bot"}],
+            )
+        )
+
+        assert len(received) == 1
+        message, content, user_id, _thread_id = received[0]
+        assert user_id == "feishu-group:chat"
+        assert content is None
+        assert "Please summarize the proposal above." in message
+        assert '<message id="msg_trigger"' in message
+        assert 'trigger="true"' in message
+        assert '<activation intent="handle-preceding-context" />' in message
+        assert channel.message_store.list_unconsumed("chat") == []
 
     _run(go())
 

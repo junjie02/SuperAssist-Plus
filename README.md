@@ -125,6 +125,7 @@ superassist-wecom-rpa
 飞书开放平台需要使用长连接订阅 `im.message.receive_v1`，并开通
 `im:message:receive_as_bot`。同时要把机器人群消息接收范围配置为全部群消息；如果平台仍只推送艾特消息，
 未艾特内容不会到达本地账本，也就无法在下次激活时补入批次。
+群聊中只发送一个机器人艾特也会触发 Agent；此时 Agent 会处理上次成功激活后尚未消费的群聊消息。
 
 包含 LaTeX 公式的最终回答会创建飞书云文档，写入原生公式并发送文档链接；还需开通文档创建/编辑和
 云空间协作者权限（`docx:document`、`drive:permission:member:create`）。普通回答继续使用消息卡片；文档
