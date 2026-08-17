@@ -1,6 +1,6 @@
 # 企业微信智能机器人接入
 
-SuperAssist 使用企业微信官方智能机器人 WebSocket 长连接 SDK。企业微信主动把消息推送到本机适配器，适配器再调用现有 Python AI Engine 的 `/internal/chat` SSE 接口。因此不需要公网回调地址、固定公网 IP 或自行处理回调加解密，也不会创建第二套 Agent、Memory 或 LightRAG 实例。
+SuperAssist 使用企业微信官方智能机器人 WebSocket 长连接 SDK。企业微信主动把消息推送到本机适配器，适配器再调用现有 Python AI Engine 的 `/internal/chat` SSE 接口。因此不需要公网回调地址、固定公网 IP 或自行处理回调加解密，也不会创建第二套 Agent、Memory 或 Hybrid RAG 实例。
 
 ## 运行结构
 
@@ -9,11 +9,11 @@ SuperAssist 使用企业微信官方智能机器人 WebSocket 长连接 SDK。�
   -> 企业微信 WebSocket 服务
   -> superassist-wecom
   -> http://127.0.0.1:8765/internal/chat (SSE)
-  -> Agent + CogniFold Memory + Tools/Subagents + optional LightRAG
+  -> Agent + CogniFold Memory + Tools/Subagents + optional Hybrid RAG
   -> 企业微信流式 Markdown 回复
 ```
 
-机器人进程和 AI Engine 必须在同一台机器上运行，或将 `SUPERASSIST_WECOM_AI_ENGINE_URL` 指向受信任的 AI Engine 地址。不要让多个 Python 进程直接构造并写入同一份本地 LightRAG 存储。
+机器人进程和 AI Engine 必须在同一台机器上运行，或将 `SUPERASSIST_WECOM_AI_ENGINE_URL` 指向受信任的 AI Engine 地址。不要让多个 Python 进程直接写入同一个用户的本地 SQLite/FAISS 索引。
 
 ## 一、企业微信后台操作
 
@@ -58,8 +58,8 @@ SUPERASSIST_WECOM_AI_ENGINE_URL=http://127.0.0.1:8765
 | --- | --- |
 | `BOT_ID` / `BOT_SECRET` | 官方长连接认证凭据，必填。前端只显示“已配置”，不会回显 Secret。 |
 | `ALLOWED_USER_IDS` | 逗号分隔的企业微信 `userid` 白名单；留空表示允许机器人可见范围内的所有成员。正式使用建议显式配置。 |
-| `USER_ID_MAP` | JSON 对象。单聊键使用企业微信 `userid`；群聊键使用 `chat:<chatid>`。映射后可与指定网页用户共享 Memory 和 LightRAG；Settings 页面会显示当前网页登录用户 ID。 |
-| `RAG_MODE_DEFAULT` | 新企业微信会话是否默认检索用户上传的 LightRAG 知识库。 |
+| `USER_ID_MAP` | JSON 对象。单聊键使用企业微信 `userid`；群聊键使用 `chat:<chatid>`。映射后可与指定网页用户共享 Memory 和 Hybrid RAG；Settings 页面会显示当前网页登录用户 ID。 |
+| `RAG_MODE_DEFAULT` | 新企业微信会话是否默认检索用户上传的 Hybrid RAG 知识库。 |
 | `MAX_CONCURRENT` | 所有企业微信会话同时执行的 Agent 请求上限。 |
 | `STREAM_INTERVAL_MS` | 合并模型增量后向企业微信更新回复的最小间隔，防止过于频繁。 |
 | `AI_ENGINE_URL` | 适配器调用的 Python AI Engine 地址，默认仅本机。 |

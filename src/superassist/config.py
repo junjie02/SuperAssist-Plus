@@ -5,7 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -137,15 +137,34 @@ class Settings(BaseSettings):
     memory_read_bfs_weight: float = Field(default=0.6, alias="SUPERASSIST_MEMORY_READ_BFS_WEIGHT")
     memory_read_ppr_weight: float = Field(default=0.4, alias="SUPERASSIST_MEMORY_READ_PPR_WEIGHT")
     memory_read_bfs_decay: float = Field(default=0.7, alias="SUPERASSIST_MEMORY_READ_BFS_DECAY")
+    memory_retrieval_log_enabled: bool = Field(
+        default=True,
+        alias="SUPERASSIST_MEMORY_RETRIEVAL_LOG_ENABLED",
+    )
+    memory_retrieval_log_max_bytes: int = Field(
+        default=20 * 1024 * 1024,
+        ge=1024,
+        alias="SUPERASSIST_MEMORY_RETRIEVAL_LOG_MAX_BYTES",
+    )
     embedding_provider: str = Field(default="bge", alias="SUPERASSIST_EMBEDDING_PROVIDER")
     embedding_model: str = Field(default="BAAI/bge-base-zh-v1.5", alias="SUPERASSIST_EMBEDDING_MODEL")
     embedding_device: str = Field(default="cpu", alias="SUPERASSIST_EMBEDDING_DEVICE")
     rag_max_file_size_mb: int = Field(default=25, alias="SUPERASSIST_RAG_MAX_FILE_SIZE_MB")
     rag_max_files_per_batch: int = Field(default=20, alias="SUPERASSIST_RAG_MAX_FILES_PER_BATCH")
-    rag_max_attempts: int = Field(default=3, alias="SUPERASSIST_RAG_MAX_ATTEMPTS")
-    rag_top_k: int = Field(default=20, alias="SUPERASSIST_RAG_TOP_K")
-    rag_chunk_top_k: int = Field(default=10, alias="SUPERASSIST_RAG_CHUNK_TOP_K")
-    rag_context_max_chars: int = Field(default=24000, alias="SUPERASSIST_RAG_CONTEXT_MAX_CHARS")
+    rag_chunk_target_tokens: int = Field(default=384, ge=64, le=2048, alias="SUPERASSIST_RAG_CHUNK_TARGET_TOKENS")
+    rag_chunk_max_tokens: int = Field(default=480, ge=64, le=4096, alias="SUPERASSIST_RAG_CHUNK_MAX_TOKENS")
+    rag_chunk_overlap_tokens: int = Field(default=64, ge=0, le=1024, alias="SUPERASSIST_RAG_CHUNK_OVERLAP_TOKENS")
+    rag_candidate_top_k: int = Field(default=50, ge=1, le=500, alias="SUPERASSIST_RAG_CANDIDATE_TOP_K")
+    rag_chunk_top_k: int = Field(default=10, ge=1, le=100, alias="SUPERASSIST_RAG_CHUNK_TOP_K")
+    rag_rrf_k: int = Field(default=60, ge=1, le=1000, alias="SUPERASSIST_RAG_RRF_K")
+    rag_context_max_tokens: int = Field(default=5000, ge=256, le=50000, alias="SUPERASSIST_RAG_CONTEXT_MAX_TOKENS")
+    rag_accumulated_evidence_max_tokens: int = Field(
+        default=8000,
+        ge=256,
+        le=100000,
+        alias="SUPERASSIST_RAG_ACCUMULATED_EVIDENCE_MAX_TOKENS",
+    )
+    rag_stagnant_search_limit: int = Field(default=2, ge=1, le=10, alias="SUPERASSIST_RAG_STAGNANT_SEARCH_LIMIT")
     feishu_app_id: str = Field(default="", alias="SUPERASSIST_FEISHU_APP_ID")
     feishu_app_secret: str = Field(default="", alias="SUPERASSIST_FEISHU_APP_SECRET")
     feishu_domain: str = Field(default="https://open.feishu.cn", alias="SUPERASSIST_FEISHU_DOMAIN")
@@ -238,6 +257,14 @@ class Settings(BaseSettings):
     daily_brief_api_key: str = Field(default="", alias="SUPERASSIST_DAILY_BRIEF_API_KEY")
     daily_brief_base_url: str = Field(default="", alias="SUPERASSIST_DAILY_BRIEF_BASE_URL")
     daily_quiz_enabled: bool = Field(default=True, alias="SUPERASSIST_DAILY_QUIZ_ENABLED")
+    daily_quiz_scheduler_enabled: bool | None = Field(
+        default=None,
+        alias="SUPERASSIST_DAILY_QUIZ_SCHEDULER_ENABLED",
+    )
+    daily_quiz_context_enabled: bool = Field(
+        default=True,
+        alias="SUPERASSIST_DAILY_QUIZ_CONTEXT_ENABLED",
+    )
     daily_quiz_time: str = Field(default="17:00", alias="SUPERASSIST_DAILY_QUIZ_TIME")
     daily_quiz_question_count: int = Field(
         default=10,
@@ -277,6 +304,12 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
+    @model_validator(mode="after")
+    def validate_rag_chunk_sizes(self) -> Settings:
+        if not 0 <= self.rag_chunk_overlap_tokens < self.rag_chunk_target_tokens <= self.rag_chunk_max_tokens:
+            raise ValueError("RAG chunk sizes must satisfy overlap < target <= max")
+        return self
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "superassist.sqlite3"
@@ -312,6 +345,10 @@ class Settings(BaseSettings):
     @property
     def model_input_log_path(self) -> Path:
         return self.data_dir / "logs" / "model-input.jsonl"
+
+    @property
+    def memory_retrieval_log_path(self) -> Path:
+        return self.data_dir / "logs" / "memory-retrieval.jsonl"
 
     @property
     def resolved_agents_dir(self) -> Path:
@@ -351,6 +388,12 @@ class Settings(BaseSettings):
     @property
     def daily_quiz_data_dir(self) -> Path:
         return self.data_dir / "study" / "shenlun"
+
+    @property
+    def resolved_daily_quiz_scheduler_enabled(self) -> bool:
+        if self.daily_quiz_scheduler_enabled is not None:
+            return self.daily_quiz_scheduler_enabled
+        return self.daily_quiz_enabled
 
     @property
     def daily_quiz_scheduler_state_path(self) -> Path:

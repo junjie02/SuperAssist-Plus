@@ -1,5 +1,5 @@
-from pathlib import Path
 import json
+from pathlib import Path
 
 import pytest
 
@@ -157,6 +157,54 @@ def test_recall_uses_dense_vector_index(tmp_path: Path) -> None:
     recall = service.recall("u", "concise direct answer preference", limit=1)
 
     assert recall.immediate[0].id == concise.id
+
+
+def test_memory_retrieval_timing_log_records_stages_without_query_text(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        SUPERASSIST_DATA_DIR=tmp_path,
+        SUPERASSIST_EMBEDDING_PROVIDER="hash",
+        SUPERASSIST_MEMORY_RETRIEVAL_LOG_ENABLED=True,
+    )
+    service = MemoryService(settings=settings)
+    service.store.add_node(
+        user_id="private-user-id",
+        node_type=NodeType.CONCEPT,
+        title="Concise answers",
+        description="User prefers concise direct answers",
+        embedding=service.embed("User prefers concise direct answers"),
+    )
+
+    service.recall("private-user-id", "private retrieval query", limit=1)
+
+    log_text = settings.memory_retrieval_log_path.read_text(encoding="utf-8")
+    record = json.loads(log_text)
+    assert record["operation"] == "recall"
+    assert record["status"] == "success"
+    assert record["cache_hit"] is False
+    assert record["indexed_node_count"] == 1
+    assert record["entry_match_count"] == 1
+    assert record["read_selected_count"] == 1
+    assert record["total_ms"] >= 0
+    assert record["faiss_rebuild_ms"] >= 0
+    assert record["faiss_search_ms"] >= 0
+    assert record["read_context_ms"] >= 0
+    assert "private retrieval query" not in log_text
+    assert "private-user-id" not in log_text
+
+
+def test_memory_retrieval_timing_log_can_be_disabled(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        SUPERASSIST_DATA_DIR=tmp_path,
+        SUPERASSIST_EMBEDDING_PROVIDER="hash",
+        SUPERASSIST_MEMORY_RETRIEVAL_LOG_ENABLED=False,
+    )
+    service = MemoryService(settings=settings)
+
+    service.recall("u", "query", limit=1)
+
+    assert not settings.memory_retrieval_log_path.exists()
 
 
 def test_faiss_index_is_persisted_with_node_mapping(tmp_path: Path) -> None:

@@ -38,6 +38,9 @@ def test_directory_subagents_expose_expected_prompts_and_default() -> None:
     assert "/mnt/skills/public/huasheng13/SKILL.md" in configs["shenlun-quiz"].system_prompt
     assert "中高难度" in configs["shenlun-quiz"].system_prompt
     assert "唯一答案审计" in configs["shenlun-quiz"].system_prompt
+    assert "命题人审计" in configs["shenlun-quiz"].system_prompt
+    assert "绝对化措辞审计结果" in configs["shenlun-quiz"].system_prompt
+    assert "只改变一个核心维度" in configs["shenlun-quiz"].system_prompt
     assert "近几日日报" in registry.available_agents_text()
 
 

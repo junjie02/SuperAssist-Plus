@@ -16,6 +16,8 @@ def _workspace_root() -> Path:
 
 
 def _resolve_workspace_path(path: str) -> Path:
+    if path.startswith("quiz://"):
+        raise PermissionError(f"Quiz resources are read-only: {path}")
     root = _workspace_root()
     raw_path = Path(path)
     candidate = raw_path if raw_path.is_absolute() else root / raw_path
@@ -28,6 +30,10 @@ def _resolve_workspace_path(path: str) -> Path:
 
 
 def _resolve_read_path(path: str) -> Path:
+    if path.startswith("quiz://"):
+        from superassist.channels.daily_quiz import resolve_daily_quiz_virtual_path
+
+        return resolve_daily_quiz_virtual_path(get_settings(), path)
     skill_path = resolve_skill_virtual_path(path)
     if skill_path is not None:
         return skill_path
@@ -66,10 +72,10 @@ def list_files(path: str = ".", max_depth: int = 2) -> str:
 
 @tool("read_file")
 def read_file(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
-    """Read a UTF-8 text file from the tool workspace.
+    """Read a UTF-8 text file from the tool workspace or a listed read-only virtual resource.
 
     Args:
-        path: Relative path inside the tool workspace.
+        path: Relative path inside the tool workspace, a skill path, or a listed quiz:// resource.
         start_line: Optional 1-based starting line.
         end_line: Optional 1-based ending line, inclusive.
     """

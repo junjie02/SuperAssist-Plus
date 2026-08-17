@@ -12,7 +12,7 @@ from superassist.rag.context import current_rag_session
 
 
 class RagRetrievalMiddleware(AgentMiddleware[SuperAssistState]):
-    """Seed an Agentic RAG turn with one LightRAG ``mix`` retrieval."""
+    """Seed an Agentic RAG turn with one hybrid retrieval."""
 
     state_schema = SuperAssistState
 
@@ -26,7 +26,7 @@ class RagRetrievalMiddleware(AgentMiddleware[SuperAssistState]):
                 "rag_sources": [],
                 "rag_retrieval": {"success": False, "message": "RAG session is unavailable"},
             }
-        result = session.search(str(state.get("input") or ""), "mix")
+        result = session.search(str(state.get("input") or ""), "hybrid")
         return {
             "rag_context": result.context,
             "rag_sources": result.sources,
@@ -36,7 +36,9 @@ class RagRetrievalMiddleware(AgentMiddleware[SuperAssistState]):
                 "query": result.query,
                 "mode": result.mode,
                 "attempt": session.attempts,
-                "max_attempts": session.max_attempts,
+                "new_chunks": result.new_hits,
+                "evidence_tokens": session.evidence_tokens,
+                "evidence_max_tokens": session.evidence_max_tokens,
             },
         }
 

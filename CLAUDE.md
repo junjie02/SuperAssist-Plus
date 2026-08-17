@@ -72,9 +72,9 @@ Important test behavior:
 ```text
 React/Vite browser
   -> Go/Gin :8080 (JWT, users, threads, WebSocket, static assets, proxy)
-      -> Python/FastAPI :8765 (SSE chat, memory graph, settings, LightRAG)
+      -> Python/FastAPI :8765 (SSE chat, memory graph, settings, Hybrid RAG)
           -> LangChain create_agent
-          -> SQLite/MySQL + FAISS + local LightRAG stores
+          -> SQLite/MySQL + FAISS + SQLite FTS5 hybrid indexes
 ```
 
 The browser must never call Python `/internal/*` routes directly. Go derives `user_id` from JWT and adds it to proxied graph, settings, document, and chat calls. Python should remain bound to `127.0.0.1` unless a separate trusted network boundary is added.
@@ -84,7 +84,7 @@ The browser must never call Python `/internal/*` routes directly. Go derives `us
 [go-server/main.go](go-server/main.go) owns the public HTTP surface:
 
 - unauthenticated `/api/auth/register` and `/api/auth/login`;
-- authenticated threads, memory graph, settings, LightRAG documents, and LightRAG graph APIs;
+- authenticated threads, memory graph, settings, Hybrid RAG documents, and index-stat APIs;
 - `/ws/chat?token=...`, which validates JWT before upgrading;
 - React assets from `frontend/dist`, including SPA fallback routes.
 
@@ -106,7 +106,7 @@ Base chain:
 8. `MemoryWriterMiddleware`
 9. `FinalTextMiddleware`
 
-RAG mode inserts `RagRetrievalMiddleware` and `RagRetryMiddleware` after memory recall, and registers `RagAttributionMiddleware` after `FinalTextMiddleware`; reverse `after_agent` dispatch makes attribution run first so final-text extraction captures the attributed answer. Keep [src/CLAUDE.md](src/CLAUDE.md) synchronized when changing this order.
+RAG mode inserts `RagRetrievalMiddleware` after memory recall and registers `RagAttributionMiddleware` after `FinalTextMiddleware`; reverse `after_agent` dispatch makes attribution run first so final-text extraction captures the attributed answer. Keep [src/CLAUDE.md](src/CLAUDE.md) synchronized when changing this order.
 
 ### Long-Term Memory
 
@@ -121,16 +121,17 @@ RAG mode inserts `RagRetrievalMiddleware` and `RagRetryMiddleware` after memory 
 
 The ontology is fixed: `event|concept|intent|time` and `GROUNDS|CAUSES|TRIGGERS|REINFORCES|PART_OF|DERIVED_FROM|DEADLINE_FOR|RELATED_TO|USER_FEEDBACK`. Update `tests/test_smoke.py` if this contract intentionally changes.
 
-### LightRAG Knowledge Base
+### Hybrid RAG Knowledge Base
 
-[src/superassist/rag/](src/superassist/rag/) is separate from long-term memory. It stores uploaded-document content under a SHA-256-derived per-user directory and uses `lightrag-hku` local JSON KV, NanoVectorDB, GraphML, and document-status stores.
+[src/superassist/rag/](src/superassist/rag/) is separate from long-term memory. It stores uploaded-document content under a SHA-256-derived per-user directory. SQLite is authoritative for original chunks and FTS5 BM25 data; FAISS indexes the same chunk IDs for Dense retrieval.
 
-- Upload returns 202 and indexes in the service's dedicated asyncio loop.
+- Upload returns 202 and indexes in a bounded background executor.
 - Supported formats are declared in `rag/documents.py`.
-- `LightRAGService.retrieve` uses structured `aquery_data` and does not ask LightRAG to generate the final answer.
-- `mix` is the automatic first attempt. The agent may call `rag_search`; retry middleware guarantees up to the configured attempt limit when no usable evidence is found.
+- `chunking.py` performs offline structure-aware 384/480-token chunks with 64-token overlap.
+- `HybridRAGService.retrieve` supports `hybrid|dense|bm25`; hybrid uses weighted RRF over two candidate lists.
+- `hybrid` is the automatic first query. The Agent may rewrite and call `rag_search` again; the Session deduplicates chunk IDs and stops on evidence budget or consecutive no-new-evidence searches, not a fixed call count.
 - Attribution middleware deterministically appends uploaded/web/model provenance.
-- RAG graph and document manifests are isolated from CogniFold memory data.
+- Only original chunks included in model context count as evidence. Document manifests and indexes are isolated from CogniFold memory data.
 
 The complete storage, extraction, chunking, graph, update, retrieval, and deletion contract is in [src/superassist/rag/README.md](src/superassist/rag/README.md).
 
@@ -150,7 +151,7 @@ The authenticated shell keeps Chat mounted while switching pages so WebSocket an
 
 ### WeCom
 
-[src/superassist/channels/wecom.py](src/superassist/channels/wecom.py) uses the official WeCom intelligent-robot WebSocket SDK, but delegates Agent execution to the existing Python `/internal/chat` SSE endpoint through [ai_engine_client.py](src/superassist/channels/ai_engine_client.py). Keep this process boundary: constructing another runtime in the channel would create unsafe concurrent writers for local LightRAG files. Private chats are isolated by sender; every member of a group chat shares the group thread, Memory identity, and RAG state. Explicit sender/group-to-browser mappings can attach either scope to uploaded knowledge. See [WECOM.md](src/superassist/channels/WECOM.md) for setup and operations.
+[src/superassist/channels/wecom.py](src/superassist/channels/wecom.py) uses the official WeCom intelligent-robot WebSocket SDK, but delegates Agent execution to the existing Python `/internal/chat` SSE endpoint through [ai_engine_client.py](src/superassist/channels/ai_engine_client.py). Keep this process boundary: constructing another runtime in the channel would create unsafe concurrent writers for local Hybrid RAG indexes. Private chats are isolated by sender; every member of a group chat shares the group thread, Memory identity, and RAG state. Explicit sender/group-to-browser mappings can attach either scope to uploaded knowledge. See [WECOM.md](src/superassist/channels/WECOM.md) for setup and operations.
 
 [src/superassist/channels/wecom_rpa.py](src/superassist/channels/wecom_rpa.py) is a separate Windows-only visual adapter for ordinary-WeChat external groups opened in WeCom 5.x. It must keep the hard gates in this order: recognized `外部群` header, exact configured group allowlist, configured leading wake prefix, replay claim, then AI Engine call. It only monitors the active visible group and rechecks the group before every send. Never relax these gates to support private chats or background coordinate clicking.
 
@@ -160,30 +161,35 @@ The authenticated shell keeps Chat mounted while switching pages so WebSocket an
 
 ```text
 superassist.sqlite3              relational data and typed memory graph
+logs/memory-retrieval.jsonl     long-term memory retrieval timings
 logs/model-input.jsonl          final provider payloads when input logging is enabled
 faiss/<safe-user-id>.index      memory vector index
 faiss/<safe-user-id>.mapping.json
 rag/<user-hash>/documents.json  uploaded-document manifest
 rag/<user-hash>/files/          original uploaded files
-rag/<user-hash>/index/default/  LightRAG KV/vector/GraphML stores
+rag/<user-hash>/hybrid.sqlite3  original chunks + FTS5 BM25
+rag/<user-hash>/chunks.faiss    Dense chunk index
+rag/<user-hash>/chunks.mapping.json
 threads/<thread-id>/             messages.jsonl + thread_meta.json
-teams/<thread-id>/ledger.jsonl  audited ACP team communication
+teams/default/threads/<thread-id>/ audited ACP team communication and side channels
 channels/feishu_threads.json    Feishu-to-thread mapping
 channels/feishu_messages.sqlite3 durable Feishu inbox, image payloads, and consumption cursors
 channels/wecom_threads.json     WeCom chat/sender-to-thread and RAG mapping
 channels/wecom_rpa_state.json   desktop RPA visible-message replay guard
+study/shenlun/sessions/         authoritative latest quiz session per thread
+study/shenlun/current/          read-only public/private current-quiz resources exposed as quiz://current/*
 huggingface/                    embedding model cache
 workspace/                      file/shell tool sandbox
 ```
 
-Do not manually merge the CogniFold graph with the LightRAG graph. They have different ownership, lifecycle, deletion, and recall semantics.
+Do not merge CogniFold memory with Hybrid RAG chunks. They have different ownership, lifecycle, deletion, and recall semantics.
 
 ## Documentation Ownership
 
 - [README.md](README.md): user-facing setup, architecture, configuration, and operations.
 - [src/CLAUDE.md](src/CLAUDE.md): detailed Python contracts down to fields and call ordering.
-- [src/superassist/rag/README.md](src/superassist/rag/README.md): complete LightRAG technical design.
+- [src/superassist/rag/README.md](src/superassist/rag/README.md): complete Hybrid Agentic RAG technical design.
 - [frontend/CLAUDE.md](frontend/CLAUDE.md): frontend contracts and interaction invariants.
-- [.rag-eval-stage/README.md](.rag-eval-stage/README.md): reproducible Vector RAG versus LightRAG evaluation.
+- [.rag-eval-stage/README.md](.rag-eval-stage/README.md): legacy Vector RAG versus LightRAG evaluation snapshot; its provenance-based metric is not the current Hybrid RAG evaluation contract.
 
 Generated dataset examples and `skills/**/SKILL.md` are content/protocol assets, not general project documentation. Change them only when their own behavior changes.

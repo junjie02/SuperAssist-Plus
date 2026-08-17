@@ -24,6 +24,8 @@ from superassist.teams.context import current_team_thread_id
 logger = logging.getLogger(__name__)
 
 QUIZ_OPTIONS = ("A", "B", "C", "D")
+QUIZ_PUBLIC_RESOURCE = "quiz://current/public"
+QUIZ_PRIVATE_RESOURCE = "quiz://current/private"
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -165,6 +167,52 @@ class DailyQuizStore:
         questions = session.get("questions") if session else None
         return self._render_question_set(questions) if isinstance(questions, list) and questions else ""
 
+    def current_context(self, thread_id: str) -> dict[str, Any]:
+        session = self._load_session(thread_id)
+        if not session.get("session_id"):
+            return {}
+        questions = list(session.get("questions") or [])
+        submitted_answers = list(session.get("submitted_answers") or [])
+        private_available = bool(questions) and (
+            session.get("status") == "completed" or len(submitted_answers) == len(questions)
+        )
+        return {
+            "status": str(session.get("status") or "unknown"),
+            "session_id": str(session.get("session_id") or ""),
+            "question_count": int(session.get("question_count") or len(questions)),
+            "public_resource": QUIZ_PUBLIC_RESOURCE,
+            "private_resource": QUIZ_PRIVATE_RESOURCE,
+            "private_available": private_available,
+        }
+
+    def resolve_current_resource(self, thread_id: str, resource: str) -> Path:
+        session = self._load_session(thread_id)
+        if not session.get("session_id"):
+            raise FileNotFoundError("No quiz has been saved for the current conversation")
+        if resource == QUIZ_PUBLIC_RESOURCE:
+            path = self._current_public_path(thread_id)
+            if not path.exists():
+                with self._lock:
+                    self._write_current_resources(session)
+            return path
+        if resource != QUIZ_PRIVATE_RESOURCE:
+            raise FileNotFoundError(f"Unknown quiz resource: {resource}")
+
+        questions = list(session.get("questions") or [])
+        submitted_answers = list(session.get("submitted_answers") or [])
+        private_available = bool(questions) and (
+            session.get("status") == "completed" or len(submitted_answers) == len(questions)
+        )
+        if not private_available:
+            raise PermissionError(
+                "The private quiz resource is available only after a complete answer sheet has been submitted"
+            )
+        path = self._current_private_path(thread_id)
+        if not path.exists():
+            with self._lock:
+                self._write_current_resources(session)
+        return path
+
     def prepare_generation(
         self,
         chat_id: str,
@@ -241,19 +289,23 @@ class DailyQuizStore:
             session["updated_at"] = datetime.now(UTC).isoformat()
             self._save_session(session)
             grading_items = [
-                {**question, "selected_option": selected}
+                {
+                    **question,
+                    "selected_option": selected,
+                    "is_correct": selected == question.get("correct_option"),
+                }
                 for question, selected in zip(questions, answers, strict=True)
             ]
             return f"""<DailyPoliticalQuizGrading>
-你是当前主 Agent，必须亲自批改用户一次提交的整套政治理论测验。程序不会比较答案，也不会替你判分。
+你是当前主 Agent，负责解释用户一次提交的整套政治理论测验。程序已经按保存的标准答案确定正误和分数；你不得修改 is_correct。
 
 题目、内部标准答案、解析、材料依据和用户答案如下：
 {json.dumps(grading_items, ensure_ascii=False, indent=2)}
 
 批改流程：
-1. 逐题查看 selected_option、correct_option、explanation 和 evidence，由你判断用户答案是否正确。
-2. 为每题形成结果对象：number、is_correct、feedback、weakness。feedback 要解释正确依据及主要干扰项；答错时 weakness 要指出具体薄弱点，答对时可为空。
-3. 调用 `daily_quiz_update`，action=`grade`，一次提交全部 results，并填写 overall_feedback。工具只保存你的判断并据此更新错题本，不会重新比较答案。
+1. 逐题查看 selected_option、correct_option、is_correct、explanation 和 evidence，不得重新判定或更改 is_correct。
+2. 为每题形成结果对象：number、feedback、weakness。feedback 要解释正确依据及主要干扰项；答错时 weakness 要指出具体薄弱点，答对时可为空。
+3. 调用 `daily_quiz_update`，action=`grade`，一次提交全部 results，并填写 overall_feedback。工具会按保存的答案确定最终正误、分数并更新错题本。
 4. 工具保存成功后，由你输出完整批改报告：总分、逐题用户答案、标准答案、正误、解析，最后总结薄弱点和复习建议。
 5. 不得跳过工具调用，不得只给答案表，也不得生成下一组题。
 </DailyPoliticalQuizGrading>"""
@@ -277,13 +329,10 @@ class DailyQuizStore:
                     return "Error: every grading result requires a valid question number"
                 if number in by_number or number < 1 or number > len(questions):
                     return f"Error: invalid or duplicate grading result number {number}"
-                if not isinstance(item.get("is_correct"), bool):
-                    return f"Error: result {number} requires Agent judgement is_correct=true/false"
                 feedback = str(item.get("feedback") or "").strip()
                 if not feedback:
                     return f"Error: result {number} requires explanatory feedback"
                 by_number[number] = {
-                    "is_correct": item["is_correct"],
                     "feedback": feedback,
                     "weakness": str(item.get("weakness") or "").strip(),
                 }
@@ -296,22 +345,23 @@ class DailyQuizStore:
             for question, selected in zip(questions, answers, strict=True):
                 number = int(question.get("number") or 0)
                 judgement = by_number[number]
+                is_correct = selected == question.get("correct_option")
                 result = {
                     "number": number,
                     "question": question.get("question"),
                     "selected_option": selected,
                     "correct_option": question.get("correct_option"),
-                    "is_correct": judgement["is_correct"],
+                    "is_correct": is_correct,
                     "feedback": judgement["feedback"],
                     "weakness": judgement["weakness"],
                     "answered_at": now,
-                    "graded_by": "main_agent",
+                    "graded_by": "deterministic_answer_key",
                 }
                 saved_results.append(result)
                 self._update_wrongbook(
                     str(session.get("chat_id") or ""),
                     question,
-                    judgement["is_correct"],
+                    is_correct,
                     selected,
                     judgement["feedback"],
                     judgement["weakness"],
@@ -605,11 +655,45 @@ class DailyQuizStore:
         key = hashlib.sha256(str(thread_id).encode("utf-8")).hexdigest()[:20]
         return self._sessions_dir() / f"{key}.json"
 
+    def _current_public_path(self, thread_id: str) -> Path:
+        key = hashlib.sha256(str(thread_id).encode("utf-8")).hexdigest()[:20]
+        return self.root / "current" / f"{key}.public.md"
+
+    def _current_private_path(self, thread_id: str) -> Path:
+        key = hashlib.sha256(str(thread_id).encode("utf-8")).hexdigest()[:20]
+        return self.root / "current" / f"{key}.private.json"
+
     def _load_session(self, thread_id: str) -> dict[str, Any]:
         return _read_json(self._session_path(thread_id), {})
 
     def _save_session(self, session: dict[str, Any]) -> None:
-        _atomic_json(self._session_path(str(session.get("thread_id") or "")), session)
+        thread_id = str(session.get("thread_id") or "")
+        _atomic_json(self._session_path(thread_id), session)
+        self._write_current_resources(session)
+
+    def _write_current_resources(self, session: dict[str, Any]) -> None:
+        thread_id = str(session.get("thread_id") or "")
+        questions = list(session.get("questions") or [])
+        if questions and session.get("status") in {"active", "completed"}:
+            public_text = self._render_question_set(questions)
+        else:
+            public_text = "# 当前政治理论测验\n\n题组正在生成，尚无可作答的公开题面。\n"
+        _atomic_text(self._current_public_path(thread_id), public_text)
+        _atomic_json(
+            self._current_private_path(thread_id),
+            {
+                "version": session.get("version"),
+                "session_id": session.get("session_id"),
+                "status": session.get("status"),
+                "question_count": session.get("question_count"),
+                "questions": questions,
+                "submitted_answers": list(session.get("submitted_answers") or []),
+                "results": list(session.get("results") or []),
+                "review_summary": session.get("review_summary") or "",
+                "grading_summary": session.get("grading_summary") or "",
+                "updated_at": session.get("updated_at"),
+            },
+        )
 
 
 _STORE_LOCK = threading.Lock()
@@ -624,6 +708,15 @@ def get_daily_quiz_store(settings: Settings) -> DailyQuizStore:
             store = DailyQuizStore(settings)
             _STORES[key] = store
         return store
+
+
+def resolve_daily_quiz_virtual_path(settings: Settings, resource: str) -> Path:
+    if resource not in {QUIZ_PUBLIC_RESOURCE, QUIZ_PRIVATE_RESOURCE}:
+        raise FileNotFoundError(f"Unknown quiz resource: {resource}")
+    thread_id = current_team_thread_id()
+    if not thread_id:
+        raise PermissionError("Quiz resources require an active conversation thread")
+    return get_daily_quiz_store(settings).resolve_current_resource(thread_id, resource)
 
 
 def make_daily_quiz_tool(
@@ -658,9 +751,9 @@ def make_daily_quiz_tool(
         to retrieve only the answer-free question set. When the user answers
         in ordinary conversation, use action=grading_context with the complete ordered
         answers to load the saved questions, answer key, explanations, and evidence. Then
-        use action=grade with one result per question containing number, is_correct,
-        feedback, and weakness, plus overall_feedback. The tool persists the Agent's
-        judgement without re-grading it.
+        use action=grade with one result per question containing number, feedback,
+        and weakness, plus overall_feedback. The tool compares every submitted option
+        with the saved answer key and persists the deterministic result.
         """
 
         thread_id = current_team_thread_id()
@@ -712,7 +805,7 @@ class DailyQuizScheduler:
         self._lock = asyncio.Lock()
 
     async def start(self) -> None:
-        if not self.settings.daily_quiz_enabled or not self.settings.daily_brief_feishu_chat_id_list:
+        if not self.settings.resolved_daily_quiz_scheduler_enabled or not self.settings.daily_brief_feishu_chat_id_list:
             return
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run_loop(), name="shenlun-daily-quiz")
@@ -788,6 +881,9 @@ def _next_quiz_at(now: datetime, quiz_time: time, timezone: ZoneInfo) -> datetim
 __all__ = [
     "DailyQuizScheduler",
     "DailyQuizStore",
+    "QUIZ_PRIVATE_RESOURCE",
+    "QUIZ_PUBLIC_RESOURCE",
     "get_daily_quiz_store",
     "make_daily_quiz_tool",
+    "resolve_daily_quiz_virtual_path",
 ]

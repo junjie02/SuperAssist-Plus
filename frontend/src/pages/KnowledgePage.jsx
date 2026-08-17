@@ -11,15 +11,13 @@ import {
   X,
 } from 'lucide-react'
 import { api } from '../lib/api'
-import GraphCanvas from '../components/GraphCanvas'
 
 const PENDING_STATUSES = new Set(['queued', 'parsing', 'indexing', 'deleting'])
-const EMPTY_GRAPH = { nodes: [], edges: [], stats: { nodes: 0, edges: 0, documents: 0 }, updated_at: '' }
+const EMPTY_INDEX_STATUS = { stats: { documents: 0, chunks: 0 }, updated_at: '' }
 
 export default function KnowledgePage() {
   const [documents, setDocuments] = useState([])
-  const [graph, setGraph] = useState(EMPTY_GRAPH)
-  const [graphLimit, setGraphLimit] = useState(80)
+  const [indexStatus, setIndexStatus] = useState(EMPTY_INDEX_STATUS)
   const [selected, setSelected] = useState([])
   const [limits, setLimits] = useState({ max_file_size_mb: 25, max_files_per_batch: 20 })
   const [extensions, setExtensions] = useState([])
@@ -32,14 +30,14 @@ export default function KnowledgePage() {
   const loadDocuments = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true)
     try {
-      const [data, graphData] = await Promise.all([
+      const [data, indexData] = await Promise.all([
         api.get('/rag/documents'),
         api.get('/rag/graph'),
       ])
       setDocuments(data.documents || [])
       setLimits(data.limits || { max_file_size_mb: 25, max_files_per_batch: 20 })
       setExtensions(data.supported_extensions || [])
-      setGraph({ ...EMPTY_GRAPH, ...graphData })
+      setIndexStatus({ ...EMPTY_INDEX_STATUS, ...indexData })
       setError('')
     } catch (err) {
       setError(err.message || 'Unable to load the knowledge base.')
@@ -58,16 +56,6 @@ export default function KnowledgePage() {
   }, [hasPending, loadDocuments])
 
   const accept = useMemo(() => extensions.join(','), [extensions])
-  const visibleGraph = useMemo(() => {
-    const sorted = [...(graph.nodes || [])].sort((a, b) =>
-      (Number(b.importance) || 0) - (Number(a.importance) || 0)
-    )
-    const nodes = graphLimit === 'all' ? sorted : sorted.slice(0, graphLimit)
-    const ids = new Set(nodes.map(node => node.id))
-    const edges = (graph.edges || []).filter(edge => ids.has(edge.source_id) && ids.has(edge.target_id))
-    return { nodes, edges }
-  }, [graph, graphLimit])
-
   const addFiles = useCallback((fileList) => {
     const incoming = Array.from(fileList || [])
     setSelected(current => {
@@ -122,7 +110,7 @@ export default function KnowledgePage() {
       <header className="knowledge-header">
         <div>
           <h1>Knowledge Base</h1>
-          <p>LightRAG document index</p>
+          <p>Hybrid document index</p>
         </div>
         <button className="icon-btn" onClick={() => loadDocuments()} disabled={loading} title="Refresh documents">
           <RefreshCw size={17} className={loading ? 'spin' : ''} aria-hidden="true" />
@@ -223,36 +211,18 @@ export default function KnowledgePage() {
           <section className="knowledge-graph-section">
             <div className="knowledge-graph-head">
               <div>
-                <h2>Knowledge Graph</h2>
-                <span>{graph.stats?.nodes || 0} entities - {graph.stats?.edges || 0} relationships</span>
-              </div>
-              <div className="graph-limit-control" aria-label="Visible knowledge graph nodes">
-                {[80, 160, 'all'].map(limit => (
-                  <button
-                    key={limit}
-                    className={graphLimit === limit ? 'active' : ''}
-                    onClick={() => setGraphLimit(limit)}
-                  >
-                    {limit === 'all' ? 'All' : `Top ${limit}`}
-                  </button>
-                ))}
+                <h2>Search Index</h2>
+                <span>{indexStatus.stats?.documents || 0} documents - {indexStatus.stats?.chunks || 0} original chunks</span>
               </div>
             </div>
-            <div className="knowledge-graph-canvas">
-              <GraphCanvas
-                nodes={visibleGraph.nodes}
-                edges={visibleGraph.edges}
-                showEdgeLabels={false}
-                emptyMessage={hasPending
-                  ? 'The knowledge graph will appear when indexing finishes.'
-                  : 'Upload and index a document to build the knowledge graph.'}
-              />
+            <div className="knowledge-empty">
+              {hasPending ? <LoaderCircle className="spin" size={22} /> : <CheckCircle2 size={22} />}
+              {hasPending
+                ? 'Building the search index'
+                : indexStatus.stats?.documents
+                  ? 'Dense and BM25 indexes ready'
+                  : 'Upload a document to build the search index'}
             </div>
-            {visibleGraph.nodes.length > 0 && (
-              <div className="knowledge-graph-foot">
-                Showing {visibleGraph.nodes.length} nodes and {visibleGraph.edges.length} connecting relationships.
-              </div>
-            )}
           </section>
         </div>
       </div>

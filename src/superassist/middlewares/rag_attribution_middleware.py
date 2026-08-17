@@ -32,7 +32,6 @@ class RagAttributionMiddleware(AgentMiddleware[SuperAssistState]):
         trace = session.trace() if session is not None else {
             "enabled": True,
             "attempts": 0,
-            "max_attempts": 0,
             "queries": [],
             "sources": list(state.get("rag_sources") or []),
             "uploaded_evidence_found": bool(state.get("rag_context")),

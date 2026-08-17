@@ -40,7 +40,6 @@ from superassist.middlewares import (
     MemoryWriterMiddleware,
     RagAttributionMiddleware,
     RagRetrievalMiddleware,
-    RagRetryMiddleware,
     ShortMemoryMiddleware,
     SubagentLimitMiddleware,
     ToolCallLimitMiddleware,
@@ -48,7 +47,7 @@ from superassist.middlewares import (
     ToolEventMiddleware,
 )
 from superassist.models import AgentRunEvent
-from superassist.rag.service import LightRAGService
+from superassist.rag.service import HybridRAGService
 from superassist.rag.tools import rag_search
 from superassist.teams import AgentTeamConfig, TeamSupervisor, set_team_supervisor
 from superassist.teams.config import AgentTeamConfigError
@@ -70,7 +69,7 @@ class AgentBundle:
         memory_queue: MemoryWriteQueue,
         team_supervisor: TeamSupervisor | None,
         team_config_error: str | None,
-        rag_service: LightRAGService | None,
+        rag_service: HybridRAGService | None,
     ) -> None:
         self.agent = agent
         self.settings = settings
@@ -90,7 +89,7 @@ def build_agent(
     tool_event_reporter: Callable[[dict[str, Any]], None] | None = None,
     run_event_reporter: Callable[[AgentRunEvent], None] | None = None,
     rag_mode: bool = False,
-    rag_service: LightRAGService | None = None,
+    rag_service: HybridRAGService | None = None,
 ) -> AgentBundle:
     settings = settings or get_settings()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -117,7 +116,7 @@ def build_agent(
         if settings.enable_tools
         else []
     )
-    if settings.enable_tools and settings.daily_quiz_enabled:
+    if settings.enable_tools and settings.daily_quiz_context_enabled:
         from superassist.channels.daily_quiz import make_daily_quiz_tool
 
         tools.append(make_daily_quiz_tool(settings))
@@ -177,6 +176,11 @@ def _build_middleware_chain(
     tool_event_reporter: Callable[[dict[str, Any]], None] | None,
     rag_mode: bool,
 ) -> list[AgentMiddleware]:
+    quiz_context_provider = None
+    if settings.daily_quiz_context_enabled:
+        from superassist.channels.daily_quiz import get_daily_quiz_store
+
+        quiz_context_provider = get_daily_quiz_store(settings).current_context
     chain: list[AgentMiddleware] = [
         ToolErrorMiddleware(),
         ToolCallLimitMiddleware(settings.max_tool_calls),
@@ -184,7 +188,6 @@ def _build_middleware_chain(
     ]
     if rag_mode:
         chain.append(RagRetrievalMiddleware())
-        chain.append(RagRetryMiddleware())
     chain.extend(
         [
             DynamicContextMiddleware(
@@ -194,6 +197,7 @@ def _build_middleware_chain(
                     settings.prompt_cache_explicit_enabled
                     and is_gpt_5_6_model(settings.model)
                 ),
+                quiz_context_provider=quiz_context_provider,
             ),
             ShortMemoryMiddleware(settings, short_memory_model),
             ToolEventMiddleware(tool_event_reporter),

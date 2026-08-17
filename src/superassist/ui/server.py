@@ -19,7 +19,7 @@ from superassist.agent.runtime import AgentRuntime
 from superassist.config import PROJECT_ROOT, Settings, get_settings
 from superassist.memory.service import MemoryService
 from superassist.models import AgentRunEvent, AgentRunResult, MemoryEdge, MemoryNode, NodeType
-from superassist.rag.service import LightRAGService
+from superassist.rag.service import HybridRAGService
 from superassist.redis_store import get_redis_store
 from superassist.subagents import TASK_STORE
 from superassist.ui.rag import register_rag_routes
@@ -58,7 +58,7 @@ class ChatRequest(BaseModel):
 async def _sse_chat_stream(
     request: ChatRequest,
     settings: Settings,
-    rag_service: LightRAGService | None = None,
+    rag_service: HybridRAGService | None = None,
 ) -> StreamingResponse:
     """Handle POST /internal/chat — return a truly-streaming SSE response.
 
@@ -199,7 +199,7 @@ def create_ai_engine_app(settings: Settings | None = None, settings_env_path: Pa
     logger.info("Preloading embedding model (%s)...", resolved.embedding_model)
     service.preload_embedder()
     logger.info("Embedding model ready.")
-    rag_service = LightRAGService(resolved)
+    rag_service = HybridRAGService(resolved)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):

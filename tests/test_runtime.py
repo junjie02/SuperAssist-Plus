@@ -97,6 +97,33 @@ def test_dynamic_context_injects_runtime_section() -> None:
     assert captured["model_settings"]["prompt_cache_key"].startswith("superassist-thread-")
 
 
+def test_dynamic_context_injects_current_quiz_resources() -> None:
+    middleware = DynamicContextMiddleware(
+        quiz_context_provider=lambda thread_id: {
+            "status": "active",
+            "session_id": f"quiz-{thread_id}",
+            "question_count": 10,
+            "public_resource": "quiz://current/public",
+            "private_resource": "quiz://current/private",
+            "private_available": False,
+        }
+    )
+
+    class Request:
+        state = {"user_id": "u", "thread_id": "thread-1", "memory_recall": {}}
+        messages = [SystemMessage(content="Base system"), HumanMessage(content="answers")]
+
+        def override(self, **kwargs):
+            return kwargs["messages"]
+
+    merged = middleware.wrap_model_call(Request(), lambda value: value)
+    context = str(merged[-2].content)
+    assert '<CurrentQuiz format="json">' in context
+    assert '"session_id":"quiz-thread-1"' in context
+    assert '"public_resource":"quiz://current/public"' in context
+    assert '"private_available":false' in context
+
+
 def test_dynamic_context_preserves_legacy_system_order_when_cache_mode_is_disabled() -> None:
     middleware = DynamicContextMiddleware(preserve_static_prefix=False, explicit_prompt_cache=False)
     base_messages = [SystemMessage(content="Base system"), HumanMessage(content="Hi")]

@@ -27,7 +27,7 @@ npm run build
 | --- | --- | --- |
 | `/` | Chat | Always mounted after login; hidden with CSS on other pages |
 | `/graph` | Memory Graph | Always mounted; reloads on turn-completed events |
-| `/knowledge` | Uploaded documents and LightRAG graph | Mounted while selected |
+| `/knowledge` | Uploaded documents and hybrid search-index status | Mounted while selected |
 | `/users` | Admin-only user directory, conversations, transcript, and per-user memory graph | Mounted while selected |
 | `/settings` | Memory, Feishu, and WeCom configuration | Mounted while selected |
 | `/login` | Login/register | Public route |
@@ -38,7 +38,7 @@ Keeping Chat mounted is intentional: WebSocket, selected thread, draft state, an
 
 - `src/pages/ChatPage.jsx`: thread list, history, streaming chat, RAG toggle, and autosizing composer.
 - `src/pages/GraphPage.jsx`: CogniFold memory graph/list modes and refresh behavior.
-- `src/pages/KnowledgePage.jsx`: multipart upload, document state polling, deletion, and LightRAG graph.
+- `src/pages/KnowledgePage.jsx`: multipart upload, document state polling, deletion, and hybrid-index statistics.
 - `src/pages/UsersPage.jsx`: admin user directory, per-user thread list, Markdown transcript, and memory graph viewer.
 - `src/pages/SettingsPage.jsx`: validated Memory, Feishu, and WeCom settings editor.
 - `src/components/GraphCanvas.jsx`: shared canvas renderer for both graph domains.
@@ -82,9 +82,9 @@ Active recall fields are `active_recall`, `recall_tier`, `recall_score`, `recall
 - `GET /api/rag/documents`: per-user documents, supported extensions, and upload limits.
 - `POST /api/rag/documents`: multipart `files`; returns 202 with queued documents.
 - `DELETE /api/rag/documents/:id`: returns 202 and starts asynchronous deletion.
-- `GET /api/rag/graph`: current user's LightRAG nodes, edges, stats, and `updated_at`.
+- `GET /api/rag/graph`: compatibility endpoint returning empty nodes/edges plus current user's ready-document and original-Chunk counts.
 
-Document states are `queued`, `parsing`, `indexing`, `ready`, `failed`, and `deleting`. Poll while any document is in a transient state. Do not infer LightRAG internal progress percentages from these states.
+Document states are `queued`, `parsing`, `indexing`, `ready`, `failed`, and `deleting`. Poll while any document is in a transient state. Do not infer internal indexing progress percentages from these states.
 
 ### Settings
 
@@ -106,7 +106,7 @@ The Users navigation and route are rendered only when `/api/auth/me` returns `is
 
 - A completed chat turn reloads the conversation list and dispatches `superassist:turn-completed`.
 - Memory Graph listens for that event and reloads graph/list data after the Python chat path flushes memory writes.
-- Knowledge polls documents while indexing/deleting and reloads the LightRAG graph after state changes.
+- Knowledge polls documents while indexing/deleting and reloads hybrid-index statistics after state changes.
 - `api.js` checks content type before JSON parsing. An HTML SPA/error response must surface as an HTTP/API error, not `Unexpected token '<'`.
 - A chat transport error must leave the current thread and composer usable for retry.
 

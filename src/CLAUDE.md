@@ -30,7 +30,7 @@
 14. [`ui/server.py` — FastAPI 记忆图查看器后端](#14-uiserverpy)
 15. [`cli.py` — `superassist` 命令入口](#15-clipy)
 16. [跨模块时序：一条用户消息从进入到落库](#16-cross-module-sequence)
-17. [`rag/` — LightRAG 文档知识库与 Agentic RAG](#17-rag)
+17. [`rag/` — Hybrid 文档知识库与 Agentic RAG](#17-rag)
 
 ---
 
@@ -200,6 +200,8 @@
 | `memory_read_max_depth` | `3` | BFS 最大跳数。 |
 | `memory_read_bfs_weight` / `memory_read_ppr_weight` | `0.6` / `0.4` | 二者归一化后混合 BFS 与 PPR。 |
 | `memory_read_bfs_decay` | `0.7` | BFS 每跳衰减系数。 |
+| `memory_retrieval_log_enabled` | `True` | 记录长期记忆召回阶段耗时，不记录查询或记忆正文。 |
+| `memory_retrieval_log_max_bytes` | `20971520` | `<data_dir>/logs/memory-retrieval.jsonl` 单文件轮转阈值，保留 3 份。 |
 
 **Embedding**
 
@@ -209,16 +211,21 @@
 | `embedding_model` | `BAAI/bge-base-zh-v1.5` | 仅 BGE 使用。 |
 | `embedding_device` | `cpu` | sentence-transformers `device` 参数。 |
 
-**LightRAG 知识库**
+**Hybrid RAG 知识库**
 
 | 字段 | 默认 | 备注 |
 | --- | --- | --- |
 | `rag_max_file_size_mb` | `25` | Python 单文件大小上限；Go 代理还会按批次数量计算请求体上限。 |
 | `rag_max_files_per_batch` | `20` | 单次 multipart 上传文件数上限。 |
-| `rag_max_attempts` | `3` | 一轮 Agentic RAG 中 `RagTurnSession` 允许的检索次数。 |
-| `rag_top_k` | `20` | LightRAG 实体/关系向量候选数。 |
-| `rag_chunk_top_k` | `10` | 原文 chunk 向量候选数。 |
-| `rag_context_max_chars` | `24000` | 结构化检索结果注入 Agent 前的字符硬上限。 |
+| `rag_chunk_target_tokens` | `384` | 结构切片的目标 Token 数。 |
+| `rag_chunk_max_tokens` | `480` | 单个原文 Chunk 的最大 Token 数。 |
+| `rag_chunk_overlap_tokens` | `64` | 相邻 Chunk 的重叠 Token 数，必须小于目标值。 |
+| `rag_candidate_top_k` | `50` | Dense 和 BM25 各自进入 RRF 的候选数。 |
+| `rag_chunk_top_k` | `10` | 每次检索最多返回的原文 Chunk 数。 |
+| `rag_rrf_k` | `60` | Weighted RRF 的排名平滑常数。 |
+| `rag_context_max_tokens` | `5000` | 单次检索可注入的证据 Token 上限。 |
+| `rag_accumulated_evidence_max_tokens` | `8000` | 一轮 Agentic RAG 累计新证据 Token 上限。 |
+| `rag_stagnant_search_limit` | `2` | 连续没有新增 Chunk 时停止继续检索的阈值。 |
 
 **飞书**
 
@@ -241,7 +248,7 @@
 | --- | --- | --- |
 | `wecom_bot_id` / `wecom_bot_secret` | `""` | 官方智能机器人长连接凭据；任意为空时通道拒绝启动。 |
 | `wecom_allowed_user_ids` | `""` | 逗号分隔 userid 白名单；留空允许机器人可见范围内所有成员。 |
-| `wecom_user_id_map` | `{}` | JSON 对象；单聊键为 userid，群聊键为 `chat:<chatid>`，映射到 Go/JWT user_id 以共享 Memory 与 LightRAG。 |
+| `wecom_user_id_map` | `{}` | JSON 对象；单聊键为 userid，群聊键为 `chat:<chatid>`，映射到 Go/JWT user_id 以共享 Memory 与 Hybrid RAG。 |
 | `wecom_rag_mode_default` | `False` | 新会话的知识库检索默认值，后续可通过 `/rag on/off` 覆盖。 |
 | `wecom_max_concurrent` | `3` | 企业微信通道全局 Agent 并发上限。 |
 | `wecom_stream_interval_ms` | `300` | 向企业微信合并发送流式更新的最小间隔。 |
@@ -256,6 +263,7 @@
 | `huggingface_cache_dir` | `data_dir / "huggingface"` |
 | `faiss_dir` | `data_dir / "faiss"` |
 | `rag_dir` | `data_dir / "rag"` |
+| `memory_retrieval_log_path` | `data_dir / "logs" / "memory-retrieval.jsonl"` |
 | `feishu_thread_store_path` | `data_dir / "channels" / "feishu_threads.json"` |
 | `feishu_message_store_path` | `data_dir / "channels" / "feishu_messages.sqlite3"` |
 | `wecom_thread_store_path` | `data_dir / "channels" / "wecom_threads.json"` |
@@ -601,7 +609,7 @@ TIME 节点的语义边不自动推断：事件实际发生时间必须显式添
 | `memory_recall` | `NotRequired[dict]` | `MemoryRecallMiddleware` (read 桶) | `DynamicContextMiddleware` |
 | `memory_write_context` | `NotRequired[dict]` | `MemoryRecallMiddleware` (write 桶) | `MemoryWriterMiddleware` |
 | `rag_mode` | `NotRequired[bool]` | `AgentRuntime._initial_state` | 三条 RAG middleware 与动态提示 |
-| `rag_context` | `NotRequired[str]` | `RagRetrievalMiddleware` / `RagRetryMiddleware` | `DynamicContextMiddleware` |
+| `rag_context` | `NotRequired[str]` | `RagRetrievalMiddleware` | `DynamicContextMiddleware` |
 | `rag_sources` | `NotRequired[list[str]]` | 同上 | `RagAttributionMiddleware` |
 | `rag_retrieval` | `NotRequired[dict]` | `RagRetrievalMiddleware` | 调试首轮 mode/query/attempt/message |
 | `tool_events` | `NotRequired[list[dict]]` | `ToolEventMiddleware`、`SubagentLimitMiddleware` | `MemoryWriterMiddleware`、`ToolCallLimitMiddleware`（计数）|
@@ -645,7 +653,7 @@ TIME 节点的语义边不自动推断：事件实际发生时间必须显式添
   - `_load_thread_metadata` 读 `data_dir/threads/<thread_id>/thread_meta.json`，失败返回 `{}`。
   - `_load_history` 调 `load_short_memory(messages_path, metadata, ...)`，读取摘要检查点后的完整活动段。
   - 初始消息按 `<ShortMemory>` SystemMessage、活动段、最新 `HumanMessage(message)` 排列，并初始化 `rag_mode` / `rag_context` / `rag_sources`。
-- `run` 与 `run_streaming` 都用 `rag_turn_context(rag_service, user_id, rag_mode, max_attempts)` 包住整个 Agent 循环，使 `rag_search` 工具和 middleware 共享同一个并发安全的尝试计数器。
+- `run` 与 `run_streaming` 都用 `rag_turn_context(rag_service, user_id, rag_mode)` 包住整个 Agent 循环，使 `rag_search` 工具和 middleware 共享同一个并发安全的 Chunk 去重集合、证据预算和停止状态。
 - `_stream_agent`: 用 `agent.stream(state, ..., stream_mode=["messages","values"])` 同时收文本块和 state 快照；`accumulate_stream_text` 处理多种 chunk 形态；最终 state 取最后一个 `values` 模式 chunk 或退回初始 state。
 - `_report_agent_text`: 用 `_active_agent_text_seen: set[str]` 与 `startswith` 判定避免重复推送同一段渐进文本。
 - `_report_tool_event`: 把工具事件透传给 caller 提供的 reporter；同时把 `agent_tool_call` 事件里的 content（即模型在调用工具前的进度说明）当作 `agent_text` 也推一份。
@@ -774,15 +782,13 @@ LangChain 1.x middleware 的钩子分类：`before_agent` / `after_agent`（agen
 ### 7.10 `RagRetrievalMiddleware`
 
 - 仅在 `rag_mode=True` 时注册，钩子为 `before_agent`，注册在 `MemoryRecallMiddleware` 之后，因此每轮只执行一次首检。
-- 使用原始 `state.input` 执行 `mix` 检索；没有活动 session 时写入明确的 unavailable 状态。
-- 成功时把结构化实体、关系和原文证据写入 `rag_context`，来源文件写入 `rag_sources`，并把首轮结果摘要写入 `rag_retrieval`；失败不会抛出到整轮聊天，而是保留 session trace 给重试链。
+- 使用原始 `state.input` 执行 `hybrid` 检索；没有活动 session 时写入明确的 unavailable 状态。
+- 成功时把实际召回的原文 Chunk 写入 `rag_context`，来源文件写入 `rag_sources`，并把首轮结果摘要写入 `rag_retrieval`；失败不会抛出到整轮聊天，而是保留 session trace 供 Agent 判断是否改写查询。
 
-### 7.11 `RagRetryMiddleware`
+### 7.11 Agentic RAG 继续检索
 
-- 仅在 RAG 模式注册，钩子为 `after_model`。
-- 当模型准备直接结束、当前 session 尚无成功证据且未耗尽次数时，把最后一条 AIMessage 改为强制 `rag_search` 工具调用。
-- attempt 2 使用 `naive` 和面向关键术语/直接证据的确定性改写；attempt 3 使用 `global` 和面向实体/别名/关系的改写。模型主动调用 `rag_search` 也消耗同一额度。
-- 达到 `SUPERASSIST_RAG_MAX_ATTEMPTS` 后不再注入调用，允许模型按动态提示执行联网或保守知识降级。
+- 不再注册强制重试 middleware，也没有 RAG 专用的固定三次上限。
+- `DynamicContextMiddleware` 告知模型在证据不足时使用 `rag_search` 做聚焦改写；`RagTurnSession` 跨调用过滤已见 Chunk，并在累计证据预算耗尽或连续检索没有新证据时停止。
 
 ### 7.12 `RagAttributionMiddleware`
 
@@ -886,6 +892,9 @@ LangChain 1.x middleware 的钩子分类：`before_agent` / `after_agent`（agen
 - `task(description, prompt, subagent_type="", parameters=None)`：空类型动态解析为清单中唯一的 `default=true` Agent；`parameters` 是结构化 JSON，会注入子 Agent 首轮上下文。subagents 关闭返回错误串；type 不存在时返回 `available` 列表；信号量 acquire 走 `timeout = config.timeout_seconds`，超时返回 `"Task timed out. Error: No subagent slot available after Xs"`。
 - 命中槽位后构造 `SubagentExecutor`：`tools=default_tools(include_task=False, include_images=False)`（再次保险禁用嵌套 task，并确保图片展示决策只属于 lead agent），`run_event_reporter` 优先用绑定时传入的，其次 fallback 到 `current_run_event_reporter()`。
 - `shenlun-quiz` 的 `parameters.question_count` 还会直接绑定为 `daily_quiz_update` 的委派题量；`prepare_generation` 把 1–30 写入 session，后续 draft/finalize 只认 session 题量。参数缺失时使用 `SUPERASSIST_DAILY_QUIZ_QUESTION_COUNT`。
+- 每次 session 原子保存时同步刷新 `study/shenlun/current/<thread-hash>.public.md` 与 `.private.json`。主 Agent 的动态 `<CurrentQuiz>` 只注入状态和稳定资源名：`quiz://current/public` 可随时只读，`quiz://current/private` 仅在完整答案表已保存或 session 已完成后可读；通用文件写入/删除工具拒绝 `quiz://`。
+- `SUPERASSIST_DAILY_QUIZ_SCHEDULER_ENABLED` 只控制定时生成；缺省时兼容旧 `SUPERASSIST_DAILY_QUIZ_ENABLED`。`SUPERASSIST_DAILY_QUIZ_CONTEXT_ENABLED` 独立控制主 Agent 的 `daily_quiz_update` 工具和 `<CurrentQuiz>` 注入。
+- `grading_context` 保存完整答案表并按 `selected_option == correct_option` 形成确定性 `is_correct`；主 Agent 只生成 feedback / weakness，`grade` 再次按答案键计算并落库，模型传入的 `is_correct` 不参与最终分数。
 - 返回字符串格式：`Task Succeeded. Result: ...` / `Task timed out. Error: ...` / `Task failed. Error: ...`，由 lead agent 自然地拼回回答。
 
 `make_task_tool(reporter)` 是带闭包的工厂版本——`AgentRuntime` 在拿到 `tool_event_reporter` 后用它替换全局 `task` 实例，让流式 reporter 能贯穿父子层。
@@ -1127,7 +1136,7 @@ LangChain `@tool("team_task")`：
 
 ### 11.7 `rag/tools.py`
 
-`rag_search(query, mode="mix")` 从当前 `ContextVar` 获取 `RagTurnSession`，不接受调用方传入 `user_id`，因此模型无法越权检索其他用户目录。模式白名单最终由 `LightRAGService.retrieve` 校验为 `mix|hybrid|local|global|naive`，非法值回退到 `mix`。成功返回 `RAG_RETRIEVAL_SUCCESS + Sources + context`，失败返回 `RAG_RETRIEVAL_FAILED + attempts`，不抛出工具异常。
+`rag_search(query, mode="hybrid")` 从当前 `ContextVar` 获取 `RagTurnSession`，不接受调用方传入 `user_id`，因此模型无法越权检索其他用户目录。模式白名单最终由 `HybridRAGService.retrieve` 校验为 `hybrid|dense|bm25`，非法值回退到 `hybrid`。成功返回新增原文 Chunk、来源和累计证据量；失败或停止返回明确原因，不抛出工具异常。
 
 ---
 
@@ -1247,7 +1256,7 @@ JSON 文件，路径来自 `Settings.feishu_thread_store_path`。
 
 ### 13.5 `WeComChannel` / `AIEngineClient`
 
-`channels/wecom.py` 使用官方 `wecom-aibot-python-sdk` 的 `WSClient` 接收 `text/voice/mixed` 消息和进入会话事件。它不直接构建 `AgentRuntime`，而由 `channels/ai_engine_client.py` 调用 `/internal/chat` 并解析 SSE，从而复用 AI Engine 内唯一的 Memory/LightRAG 生命周期。
+`channels/wecom.py` 使用官方 `wecom-aibot-python-sdk` 的 `WSClient` 接收 `text/voice/mixed` 消息和进入会话事件。它不直接构建 `AgentRuntime`，而由 `channels/ai_engine_client.py` 调用 `/internal/chat` 并解析 SSE，从而复用 AI Engine 内唯一的 Memory/Hybrid RAG 生命周期。
 
 - 单聊用户键：`wecom:<bot_id>:<sender_userid>`，thread scope 为 sender userid。
 - 群聊用户键：`wecom-group:<bot_id>:<chat_id>`，thread scope 固定为 `__group__`，所有群成员共享上下文、Memory 和 RAG 状态。
@@ -1296,8 +1305,8 @@ AI Engine 内部路由：
 | `POST /internal/chat` | 接收 `user_id/message/thread_id/rag_mode`，返回 SSE 事件流。 |
 | `GET /internal/graph` | 按 Go 注入的 `user_id` 返回长期记忆图。 |
 | `GET/PUT /internal/settings` | 读取、校验并写回 Memory/飞书/企业微信配置；secret 只写不回显。 |
-| `GET/POST/DELETE /internal/rag/documents...` | LightRAG 文档列表、上传和删除。 |
-| `GET /internal/rag/graph` | 当前用户知识图。 |
+| `GET/POST/DELETE /internal/rag/documents...` | Hybrid RAG 文档列表、上传和删除。 |
+| `GET /internal/rag/graph` | 兼容接口；返回空图与 ready 文档、原文 Chunk 索引统计。 |
 
 `_sse_chat_stream` 在线程中运行同步 `AgentRuntime.run_streaming`，通过 `asyncio.Queue` 把回调事件桥接回 FastAPI 事件循环；`finally` 中 flush Memory queue、关闭 runtime，并发送 sentinel，保证每个请求只有一个终止事件。
 
@@ -1340,16 +1349,16 @@ AI Engine 内部路由：
 2. **`team_thread_context(thread_id)`** 写入 `ContextVar`，使 `team_task` 后续可拿到 thread。
 3. **`agent.invoke(state, ...)`** 进入 LangChain 内核：
    - `before_agent`：`MemoryRecallMiddleware` 调 `MemoryService.prepare_turn_contexts(...)`：embed 用户消息 → 重建 FAISS → 算 read/write 桶 → 写 recall snapshot → touch 节点 → **预分配**本 turn EVENT ID（实际节点由 writer 创建）→ 把 read/write recall 写回 state。
-   - RAG 模式第二个 `before_agent`：`RagRetrievalMiddleware` 用原问题执行 `mix`，把结构化证据和来源写入 state/session。
+   - RAG 模式第二个 `before_agent`：`RagRetrievalMiddleware` 用原问题执行 `hybrid`，把原文 Chunk 证据和来源写入 state/session。
 4. 模型循环（每次模型调用前后会触发 wrap_*/before_*/after_*）：
    - `wrap_model_call`（`DynamicContextMiddleware`）拼 system prompt 前缀（recall + skills + time + 可选 RAG 证据/规则）；`ToolEventMiddleware` 在 model 返回后扫 `tool_calls` 并报 `agent_tool_call` 事件。
    - 模型若提出工具调用：`wrap_tool_call` 链由外向内 `ToolErrorMiddleware → ToolCallLimitMiddleware → ToolEventMiddleware` 包裹真正的工具实现。
-   - `after_model`：`SubagentLimitMiddleware` 修剪超过 `max_concurrent` 的 `task` 调用；RAG 模式下 `RagRetryMiddleware` 在无证据且模型准备结束时注入下一次 `rag_search`。
+   - `after_model`：`SubagentLimitMiddleware` 修剪超过 `max_concurrent` 的 `task` 调用；RAG 是否继续检索由模型根据动态证据规则决定。
 5. **工具实现**：
    - `task` → `SubagentExecutor` 起 graph → 内部 `create_agent`（无 middleware）流式跑 → reporter 透传 `subagent_text`。
    - `team_task` → `TeamSupervisor.invoke` → `TeamLedger` 写 task 记录（hash + sig 链验证）→ `TeamMember` 在自己的 `AsyncLoopThread` 上拿/建 `ACPSession` → 收到响应 → 写 outbox + result 链。
    - `read_file(path="/mnt/skills/...")` → `ToolEventMiddleware` 自动把 skill name 加入 `loaded_skills`。
-   - `rag_search` → 当前 `RagTurnSession` → `LightRAGService.retrieve`，共享最多 N 次尝试额度。
+   - `rag_search` → 当前 `RagTurnSession` → `HybridRAGService.retrieve`，共享已见 Chunk 集合、累计证据预算和停滞状态。
    - 网络/文件/shell 工具走各自的 sandbox 与开关。
 6. **`after_agent`**（反向）：
    - `RagAttributionMiddleware`（仅 RAG）：根据 session 和工具事件生成来源尾注与 provenance metadata。
@@ -1361,7 +1370,7 @@ AI Engine 内部路由：
 9. **UI / 飞书**：
    - 飞书每收到 `agent_text` / `subagent_text` 事件就 patch 卡片；最终 `final=True` 时清缓存。
    - React 通过 Go `/api/graph` 拉 `nodes/edges/updates/stats`；聊天完成事件触发会话和记忆图自动刷新。
-   - Knowledge 页面轮询文档状态，并通过 `/api/rag/graph` 单独显示 LightRAG 实体关系图。
+   - Knowledge 页面轮询文档状态，并通过 `/api/rag/graph` 兼容接口显示 ready 文档数和原文 Chunk 数。
 
 各模块不互相调用对方的内部细节——所有跨边界数据都经过本文档列出的 Pydantic / dataclass 契约。修改任一字段时，按"持有者 → 中间件 → 入口"的顺序回放本时序，是判断"会不会破坏哪一段"的最快方法。
 
@@ -1370,26 +1379,26 @@ AI Engine 内部路由：
 <a id="17-rag"></a>
 ## 17. `rag/`
 
-本节只记录与其它 Python 模块交界的合同；切片、抽取、同名实体聚合、五种检索模式、删除语义和上游 LightRAG 默认值见 [`superassist/rag/README.md`](superassist/rag/README.md)。
+本节只记录与其它 Python 模块交界的合同；切片、索引、三种检索模式、证据预算与删除语义见 [`superassist/rag/README.md`](superassist/rag/README.md)。
 
 ### 17.1 `documents.py`
 
 `SUPPORTED_EXTENSIONS` 为 `.txt/.md/.json/.csv/.html/.htm/.pdf/.docx/.pptx/.xlsx`。`extract_document(path)` 统一返回纯文本：PDF 用 pypdf，Office 文件用各自解析库，HTML 丢弃 script/style/noscript，CSV/XLSX 用 ` | ` 保留表格列。`safe_filename` 去掉路径并替换 Windows 非法字符，原始客户端文件名不能直接作为磁盘路径。
 
-### 17.2 `service.LightRAGService`
+### 17.2 `chunking.py` 与 `service.HybridRAGService`
 
-- 构造时创建专用 asyncio loop/thread，普通同步 Agent 通过 `run_coroutine_threadsafe` 调用 LightRAG，避免同一个异步锁跨 loop。
-- `base_dir=settings.rag_dir`；用户目录是 `sha256(user_id)[:24]`，所有 public 方法都要求 user_id。
-- `upload` 先写随机 `doc-<uuid>` 文件和 `documents.json` manifest，再后台执行 `extract_document → rag.ainsert`。
-- 每用户只缓存一个 `LightRAG` 实例；embedding 复用 SuperAssist embedder，LLM 复用 `create_chat_model(settings)`。
-- `retrieve` 只调用 `aquery_data` 并转换成 `RagRetrievalResult`，最终回答仍由 lead Agent 生成。
-- `delete` 调 `adelete_by_doc_id` 后才删除原文件和 manifest；失败状态保留错误便于 UI 展示。
-- `graph` 读取上游 graph storage 的全部节点/边，过滤悬空边并按 degree/weight 归一化给前端。
-- `close` 停止 LightRAG worker、finalize storages、停止专用 loop；AI Engine lifespan 必须调用它。
+- `chunking.py` 先做 NFKC/空白规范化，再按 Markdown/章节标题、段落和句子边界切片；默认目标 384、最大 480、重叠 64 个本地估算 Token。
+- `base_dir=settings.rag_dir`；用户目录是 `sha256(user_id)[:24]`，所有 public 方法都要求 `user_id`。
+- 上传先校验扩展名、大小和 SHA-256，写随机 `doc-<uuid>` 原文件与 `documents.json`，再由有界线程池执行解析、切片、批量 embedding 和索引。
+- SQLite `chunks` 保存原文、结构元数据和 embedding；FTS5 保存经过英文词元/中文 bigram 预处理的 BM25 文本；FAISS 保存归一化 Dense 向量。
+- `retrieve` 支持 `hybrid|dense|bm25`。Hybrid 对两路 Top-N 使用 0.55/0.45 Weighted RRF，再按内容 Hash 去重、Top-K 和单次 Token 预算组装原文证据。
+- 原文 Chunk 是唯一证据单元；实体、关系、摘要和文件级来源不会作为命中证据。
+- 删除会清理 SQLite、FTS5、FAISS、原文件和 manifest；新增或删除后按用户全量重建 FAISS。`close` 等待索引线程池结束。
+- `graph_payload` 仅保留 HTTP 兼容性，返回空 `nodes/edges` 和文档、Chunk 数量统计。
 
 ### 17.3 `context.RagTurnSession`
 
-每轮通过 `rag_turn_context` 写入 `ContextVar`。Session 保存 `user_id/enabled/max_attempts/attempts/queries/sources/successful` 并用锁保护 `search`。工具只从 ContextVar 取 session，因此没有模型可控的 user_id 参数。检索异常转换成 `RagRetrievalResult(success=False)`，不让知识库故障终止整个 Agent。
+每轮通过 `rag_turn_context` 写入 `ContextVar`。Session 保存 `user_id/enabled/attempts/queries/sources`、已见 Chunk ID、累计证据 Token、连续无新增次数和停止原因，并用锁保护 `search`。工具只从 ContextVar 取 session，因此没有模型可控的 `user_id` 参数。检索异常转换成 `RagRetrievalResult(success=False)`，不让知识库故障终止整个 Agent。没有固定检索次数上限；停止条件是证据预算耗尽或连续检索没有新增 Chunk。
 
 ### 17.4 HTTP 与 Go 边界
 

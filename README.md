@@ -1,8 +1,8 @@
 # SuperAssist
 
-SuperAssist 是一个面向长期协作场景的多智能体个人助理。系统使用 CogniFold 风格类型图维护跨会话长期记忆，使用 LightRAG 对用户上传的资料进行图检索与原文检索，并提供流式聊天、工具调用、Subagent、ACP Agent Teams、飞书/企业微信接入和运行时配置界面。
+SuperAssist 是一个面向长期协作场景的多智能体个人助理。系统使用 CogniFold 风格类型图维护跨会话长期记忆，使用 Dense + BM25 混合检索处理用户上传资料，并提供流式聊天、工具调用、Subagent、ACP Agent Teams、飞书/企业微信接入和运行时配置界面。
 
-当前技术栈：**React + Vite、Go + Gin、Python + FastAPI、LangChain/LangGraph、SQLite/MySQL、FAISS、LightRAG、WebSocket/SSE**。
+当前技术栈：**React + Vite、Go + Gin、Python + FastAPI、LangChain/LangGraph、SQLite/MySQL、FAISS、FTS5、WebSocket/SSE**。
 
 ## 系统架构
 
@@ -19,7 +19,7 @@ Go Gateway :8080
        Python AI Engine :8765
           ├── LangChain Agent + middleware
           ├── CogniFold Memory
-          ├── LightRAG Knowledge Base
+          ├── Hybrid RAG Knowledge Base
           ├── Tools / Subagents / ACP Teams
           ├── Feishu channel
           └── WeCom channel -> AI Engine SSE
@@ -27,7 +27,7 @@ Go Gateway :8080
 持久化：
   .superassist/superassist.sqlite3   业务数据与长期记忆图
   .superassist/faiss/                长期记忆向量入口索引
-  .superassist/rag/<user-hash>/      每用户 LightRAG 文件、图和向量数据
+  .superassist/rag/<user-hash>/      每用户原文件、Chunk、FTS5 和 FAISS 索引
   .superassist/threads/              对话 JSONL 与短记忆摘要
 ```
 
@@ -37,8 +37,8 @@ Go 是面向浏览器的产品入口：负责认证、WebSocket 生命周期、�
 
 - **流式聊天**：WebSocket 连接浏览器与 Go，Go 消费 Python SSE，并实时转发思考、工具和回答事件。
 - **长期记忆**：`event/concept/intent/time` 四类节点、九类边，结合向量入口、BFS、Personalized PageRank、时间和访问频次召回。
-- **LightRAG 知识库**：批量上传 PDF、DOCX、PPTX、XLSX、TXT、Markdown、JSON、CSV 和 HTML，异步完成切片、实体关系抽取和建图。
-- **Agentic RAG**：首轮默认 `mix` 检索；证据不足时允许模型改写查询，并由中间件保证最多完成三轮检索。失败后可按工具配置联网，最终回答明确标注上传资料、网页或模型知识来源。
+- **Hybrid RAG 知识库**：批量上传 PDF、DOCX、PPTX、XLSX、TXT、Markdown、JSON、CSV 和 HTML，按标题、段落和句子边界切片，以 FAISS Dense 与 SQLite FTS5 BM25 两路召回并用 RRF 融合。
+- **Agentic RAG**：首轮自动执行混合检索；证据不足时允许模型改写查询并选择 `hybrid/dense/bm25`。Session 跨调用去重，以累计证据 Token 和连续无新增结果作为停止条件，最终回答明确标注上传资料、网页或模型知识来源。
 - **工具与 Subagent**：支持文件、网页、主 Agent 图片搜索、`gpt-image-2` 生图和可选 Shell 工具；运行时扫描 `config/agents/*/agent.toml`，把 Agent 名称和描述注入主 Agent，再通过 `task` 动态调用对应模块。搜索图片候选只作为本轮临时视觉上下文，主 Agent 明确选择后才会发送到飞书；生成图片会自动进入当前飞书回复。
 - **ACP Agent Teams**：通过 `agent_team.toml` 接入 Claude Code 等外部 Agent，使用带文件锁、hash chain 和 HMAC 的 JSONL ledger 记录协作过程。
 - **可视化与管理**：导航栏提供 Chat、Memory Graph、Knowledge、Settings；管理员额外拥有 Users 页面，可查看各 Web/飞书/企业微信身份的会话、消息记录与长期记忆图，并可删除选中的未压缩短记忆记录。
@@ -140,11 +140,12 @@ superassist-wecom-rpa
 3 天。专用申论出题 Agent 默认在每天 `17:00` 基于近几日日报和未掌握错题一次生成 10 道行测政治理论四选一题，
 先把整套草稿交给工具做结构校验，再逐题检查材料依据、唯一答案、干扰项和重复度后确认保存。题目、答案、
 解析和复核记录同时归档到同目录的 `quizzes/`；飞书只发送不含答案的整套题面。用户一次回复完整答案表，
-例如 `1A 2B ... 10D`；主 Agent一次读取整套题、标准答案、材料依据和用户答案，逐题判分并输出全部解析，
-评分工具只保存主 Agent 的判断并据此更新 `错题本.md`，不再由程序比较选项，也不再逐题重复调用主 Agent。
+例如 `1A 2B ... 10D`；程序按保存的标准答案确定正误和分数，主 Agent 一次读取整套题、材料依据和判分结果，
+输出全部解析、薄弱点和复习建议，评分工具据此更新 `错题本.md`，不再逐题重复调用主 Agent。
 不再提供 `/quiz` 等独立命令或答题模式。每天定时出题，用户也可以直接在普通对话中要求主 Agent 出题；
-主 Agent 会根据动态加载的 Agent 描述调用专用申论出题 Agent。出题后用户直接回复整套答案，主 Agent
-主动读取已保存的答案和材料并完成批改。测验时间、题数和窗口天数通过
+主 Agent 会根据动态加载的 Agent 描述调用专用申论出题 Agent。每个会话的最新题组同时暴露为只读的
+`quiz://current/public` 和受控的 `quiz://current/private` 资源；动态上下文始终携带题组状态和资源路径，
+因此短期记忆压缩不会丢失题组入口。出题后用户直接回复整套答案，程序判分，主 Agent 读取保存内容并完成解析。测验时间、题数和窗口天数通过
 `SUPERASSIST_DAILY_QUIZ_*` 配置。日报全文、错题状态、标准答案和内部复核提示不写入主线程短期历史；
 短期历史只保留用户看到的整套题面、完整答案表和判分解析。
 
@@ -154,11 +155,11 @@ superassist-wecom-rpa
 
 1. 打开 **Knowledge** 页面并批量选择文件。
 2. 上传接口立即返回 `202`；页面会轮询 `queued → parsing → indexing → ready/failed`。
-3. 文档变为 `ready` 后，可在 Knowledge 页面查看知识图。
+3. 文档变为 `ready` 后，可在 Knowledge 页面查看文档和原文 Chunk 数量。
 4. 在 Chat 输入框旁开启 RAG 模式后提问。
-5. 删除文档会异步删除 LightRAG 中对应的原文、chunk、向量以及只由该文档支持的图数据。
+5. 删除文档会异步删除对应的原文件、SQLite Chunk、FTS5 记录和 FAISS 向量。
 
-当前 LightRAG 使用固定 Token 切片，默认约为 `1200 tokens + 100 overlap`；默认查询模式为 `mix`，将实体图、关系图和原文向量召回合并。完整实现说明见 [LightRAG 技术设计](src/superassist/rag/README.md)。
+当前使用结构感知切片，默认目标 `384 tokens`、最大 `480 tokens`、重叠 `64 tokens`；默认查询模式为 `hybrid`。实体和关系不作为证据，只有实际注入上下文的原文 Chunk 可以被引用。完整实现说明见 [Hybrid Agentic RAG 技术设计](src/superassist/rag/README.md)。
 
 ## 配置
 
@@ -168,13 +169,15 @@ Python 配置集中在 `src/superassist/config.py`，示例见 [.env.example](.e
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `SUPERASSIST_MODEL` | `gpt-4o-mini` | 主 Agent 与 LightRAG 使用的模型 |
+| `SUPERASSIST_MODEL` | `gpt-4o-mini` | 主 Agent 使用的模型 |
 | `SUPERASSIST_REASONING_EFFORT` | `medium` | GPT-5.6 推理强度；飞书可用 `/effort` 按会话覆盖 |
 | `SUPERASSIST_USE_RESPONSES_API` | `true` | 所有文本模型是否使用 `/responses`；不支持该接口的兼容网关可设为 `false`，整体改走 `/chat/completions` |
 | `SUPERASSIST_CLAUDE_FALLBACK_*` | `claude-opus-5` / 空密钥 | GPT 失败后的 OpenAI 兼容 Claude Responses 路由 |
 | `SUPERASSIST_DEEPSEEK_FALLBACK_*` | `deepseek-v4-flash` / 空密钥 | Claude 失败后的最终文本路由；使用独立密钥和地址 |
 | `SUPERASSIST_MODEL_INPUT_LOG_ENABLED` | `false` | 将最终模型请求 payload 追加到 `logs/model-input.jsonl` |
 | `SUPERASSIST_MODEL_INPUT_LOG_MAX_BYTES` | `52428800` | 模型输入日志单文件轮转阈值，保留 3 个备份 |
+| `SUPERASSIST_MEMORY_RETRIEVAL_LOG_ENABLED` | `true` | 记录长期记忆召回各阶段耗时到 `logs/memory-retrieval.jsonl` |
+| `SUPERASSIST_MEMORY_RETRIEVAL_LOG_MAX_BYTES` | `20971520` | 记忆召回日志单文件轮转阈值，保留 3 个备份 |
 | `SUPERASSIST_AGENTS_DIR` | `config/agents` | 模块化 Subagent 定义目录；每个子目录包含 `agent.toml` 和提示文件 |
 | `SUPERASSIST_FEISHU_IMAGE_OCR_ENABLED` | `true` | 飞书图片启用本地 RapidOCR 辅助；原图无论 OCR 是否成功都会直接交给主模型 |
 | `SUPERASSIST_FEISHU_IMAGE_OCR_MAX_CHARS` | `12000` | 单条飞书多图 OCR 写入当前轮文本历史的字符上限 |
@@ -186,7 +189,9 @@ Python 配置集中在 `src/superassist/config.py`，示例见 [.env.example](.e
 | `SUPERASSIST_FEISHU_ACTIVATION_DEBOUNCE_SECONDS` | `1.5` | 群聊艾特后的全消息静默收集窗口 |
 | `SUPERASSIST_FEISHU_ACTIVATION_MAX_WAIT_SECONDS` | `6.0` | 活跃群聊批次的最长等待时间 |
 | `SUPERASSIST_FEISHU_MAX_IMAGES_PER_ACTIVATION` | `12` | 一次激活直接提交给视觉模型的图片上限；超出会显式标记 |
-| `SUPERASSIST_DAILY_QUIZ_ENABLED` | `true` | 启用近三日日报政治理论选择题测验 |
+| `SUPERASSIST_DAILY_QUIZ_ENABLED` | `true` | 旧版兼容开关；未配置新的调度开关时控制定时出题 |
+| `SUPERASSIST_DAILY_QUIZ_SCHEDULER_ENABLED` | 继承旧开关 | 单独控制定时生成测验，不影响主 Agent 读取已有题组 |
+| `SUPERASSIST_DAILY_QUIZ_CONTEXT_ENABLED` | `true` | 向主 Agent 注入当前题组资源并绑定批改工具 |
 | `SUPERASSIST_DAILY_QUIZ_TIME` | `17:00` | 每天自动生成整套测验的本地时间 |
 | `SUPERASSIST_DAILY_QUIZ_QUESTION_COUNT` | `10` | 每组测验题数 |
 | `SUPERASSIST_DAILY_QUIZ_NOTEBOOK_DAYS` | `3` | 日报笔记本滑动窗口的自然日数 |
@@ -200,7 +205,7 @@ Python 配置集中在 `src/superassist/config.py`，示例见 [.env.example](.e
 | `SUPERASSIST_REDIS_REQUIRED` | `false` | Redis 不可用时是否阻止启动；多实例生产环境应设为 `true` |
 | `SUPERASSIST_API_RATE_LIMIT_PER_MINUTE` | `0` | Redis 按用户统计的每分钟请求上限；`0` 表示关闭 |
 | `SUPERASSIST_EMBEDDING_PROVIDER` | `bge` | `bge` 或测试用 `hash` |
-| `SUPERASSIST_EMBEDDING_MODEL` | `BAAI/bge-base-zh-v1.5` | Memory 与 LightRAG 共用的向量模型 |
+| `SUPERASSIST_EMBEDDING_MODEL` | `BAAI/bge-base-zh-v1.5` | Memory 与 Hybrid RAG 共用的向量模型 |
 | `SUPERASSIST_ENABLE_TOOLS` | `false` | 常规工具总开关 |
 | `SUPERASSIST_TOOL_NETWORK_ENABLED` | `true` | 是否允许 web search/fetch |
 | `SUPERASSIST_TOOL_SHELL_ENABLED` | `false` | 是否允许 Shell |
@@ -209,9 +214,14 @@ Python 配置集中在 `src/superassist/config.py`，示例见 [.env.example](.e
 | `SUPERASSIST_MEMORY_API_KEY` | 空 | 独立模型密钥；为空时复用主模型密钥 |
 | `SUPERASSIST_MEMORY_BASE_URL` | 空 | 独立模型 OpenAI 兼容地址；为空时复用主模型地址 |
 | `SUPERASSIST_MEMORY_TOP_K` | `12` | 注入模型的长期记忆节点总数 |
-| `SUPERASSIST_RAG_MAX_ATTEMPTS` | `3` | 每轮聊天最多上传资料检索次数 |
-| `SUPERASSIST_RAG_TOP_K` | `20` | LightRAG 实体/关系候选数 |
-| `SUPERASSIST_RAG_CHUNK_TOP_K` | `10` | LightRAG 原文 chunk 候选数 |
+| `SUPERASSIST_RAG_CHUNK_TARGET_TOKENS` | `384` | 结构切片目标 Token |
+| `SUPERASSIST_RAG_CHUNK_MAX_TOKENS` | `480` | 单个 Chunk 最大 Token |
+| `SUPERASSIST_RAG_CHUNK_OVERLAP_TOKENS` | `64` | 同 section 相邻 Chunk 重叠 Token |
+| `SUPERASSIST_RAG_CANDIDATE_TOP_K` | `50` | Dense 与 BM25 各自候选数 |
+| `SUPERASSIST_RAG_CHUNK_TOP_K` | `10` | 每次最终返回的原文 Chunk 上限 |
+| `SUPERASSIST_RAG_CONTEXT_MAX_TOKENS` | `5000` | 单次检索上下文预算 |
+| `SUPERASSIST_RAG_ACCUMULATED_EVIDENCE_MAX_TOKENS` | `8000` | 一轮 Agent 的累计唯一证据预算 |
+| `SUPERASSIST_RAG_STAGNANT_SEARCH_LIMIT` | `2` | 连续无新增 Chunk 后停止检索 |
 
 ### 模块化 Agent
 
@@ -250,19 +260,29 @@ MySQL URL 在 Python/SQLAlchemy 中使用 `mysql+pymysql://...`，Go/GORM 使用
 ├── rag/<sha256(user-id)[:24]>/
 │   ├── documents.json
 │   ├── files/
-│   └── index/default/
+│   ├── hybrid.sqlite3
+│   ├── chunks.faiss
+│   └── chunks.mapping.json
 ├── threads/<thread-id>/
 │   ├── messages.jsonl
 │   └── thread_meta.json
-├── teams/<thread-id>/ledger.jsonl
+├── teams/default/threads/<thread-id>/
+│   ├── ledger.jsonl
+│   ├── inbox/<agent>.jsonl
+│   └── outbox/<agent>.raw.jsonl
 ├── channels/feishu_threads.json
 ├── channels/feishu_messages.sqlite3
 ├── channels/wecom_threads.json
+├── logs/
+│   ├── memory-retrieval.jsonl
+│   └── model-input.jsonl        # 仅在显式开启模型输入日志时创建
 ├── huggingface/
 └── workspace/
 ```
 
-长期记忆图和 LightRAG 知识图是两套独立数据：前者记录对话事件、概念、意图和时间关系；后者只记录用户上传资料的实体、关系与原文来源。
+长期记忆图和 Hybrid RAG 是两套独立数据：前者记录对话事件、概念、意图和时间关系；后者只保存和检索用户上传资料的原文 Chunk。
+
+`memory-retrieval.jsonl` 默认开启，每次 `prepare_turn_contexts` 或直接 `recall` 写一行 JSON，包含缓存命中、Embedding、FAISS 重建/查询、Read/Write Context 排名、快照持久化和总耗时，以及索引/召回节点数量。日志只保存 `user_id` 的 SHA-256 短哈希，不保存查询文本或记忆正文。达到阈值后轮转为 `.1`、`.2`、`.3`。
 
 ## Skill 渐进加载
 
@@ -284,7 +304,7 @@ SuperAssist/
 ├── src/superassist/
 │   ├── agent/                Agent 工厂、状态、运行时和短记忆
 │   ├── memory/               CogniFold 图、向量入口和 PPR/BFS 排名
-│   ├── rag/                  LightRAG 文档、索引、检索和技术文档
+│   ├── rag/                  Hybrid RAG 切片、索引、检索和技术文档
 │   ├── middlewares/          Memory、RAG、工具和最终文本中间件
 │   ├── subagents/            Agent 清单加载、执行与任务状态
 │   ├── acp_client/           ACP 客户端
@@ -306,7 +326,7 @@ SuperAssist/
 - `/api/threads/*`：会话列表、历史和删除。
 - `/api/admin/users/*`：管理员查看所有身份、会话、消息历史和长期记忆图；普通用户访问返回 `403`。
 - `/api/graph`：长期记忆图。
-- `/api/rag/documents`、`/api/rag/graph`：知识库和 LightRAG 图。
+- `/api/rag/documents`、`/api/rag/graph`：知识库文档和检索索引统计。
 - `/api/settings`：Memory、Skills、飞书与企业微信设置。
 - `/ws/chat?token=...`：流式聊天。
 
@@ -346,7 +366,7 @@ Copy-Item -Recurse "$sourceDir\teams" "$targetDir\teams"
 Copy-Item -Recurse "$sourceDir\channels" "$targetDir\channels"
 ```
 
-LightRAG 是当前项目新增的数据域，需要通过 Knowledge 页面重新上传资料建立索引。
+Hybrid RAG 使用新的 Chunk、FTS5 和 FAISS 数据域；旧 LightRAG 数据不会自动迁移，需要通过 Knowledge 页面重新上传资料建立索引。
 
 ## License
 

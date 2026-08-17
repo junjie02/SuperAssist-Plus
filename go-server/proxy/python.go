@@ -89,7 +89,7 @@ func (p *PythonClient) UploadRAGDocuments(
 	return p.doRAGRequest(http.MethodPost, endpoint, contentType, body)
 }
 
-// DeleteRAGDocument removes one document from the current user's LightRAG index.
+// DeleteRAGDocument removes one document from the current user's hybrid RAG index.
 func (p *PythonClient) DeleteRAGDocument(userID, documentID string) (json.RawMessage, int, error) {
 	endpoint := fmt.Sprintf(
 		"%s/internal/rag/documents/%s?user_id=%s",

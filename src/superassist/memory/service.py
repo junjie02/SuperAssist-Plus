@@ -15,7 +15,9 @@ this module no longer hand-rolls the per-op dispatch logic.
 
 from __future__ import annotations
 
+import hashlib
 import math
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -26,6 +28,7 @@ from superassist.config import Settings, get_settings
 from superassist.memory.embedding import Embedder, cosine_similarity, get_embedder
 from superassist.memory.operations import ApplyContext, ApplyResult, apply_plan
 from superassist.memory.plans import UpdatePlan
+from superassist.memory.retrieval_log import append_memory_retrieval_log
 from superassist.memory.scoring import EventProbe, MemoryContextRanker
 from superassist.memory.storage import MemoryGraphStore, create_engine_from_settings, new_id
 from superassist.memory.vector_index import PersistentFaissIndex
@@ -72,88 +75,175 @@ class MemoryService:
         return contexts.event_id, contexts.write_recall
 
     def prepare_turn_contexts(self, user_id: str, thread_id: str, message: str) -> TurnMemoryContexts:
-        cached = self._redis.load_recall(user_id, message)
-        if cached is not None:
-            try:
-                read_recall = MemoryRecall.model_validate(cached.get("read_recall") or {})
-                write_recall = MemoryRecall.model_validate(cached.get("write_recall") or {})
-                snapshot = list(cached.get("snapshot") or [])
-            except (TypeError, ValueError):
-                cached = None
-            else:
-                self.store.replace_recall_snapshot(user_id, snapshot)
-                self.store.touch_nodes(
-                    user_id,
-                    [
-                        node.id
-                        for recall in (read_recall, write_recall)
-                        for tier in (recall.immediate, recall.working, recall.background, recall.buffer)
-                        for node in tier
-                    ],
-                )
-                return TurnMemoryContexts(
-                    event_id=new_id("event"),
-                    read_recall=read_recall,
-                    write_recall=write_recall,
-                )
-        probe = EventProbe(user_id=user_id, text=message, embedding=self.embed(message))
-        self.rebuild_vector_index(user_id)
-        entry_matches = self.vector_index(user_id).search(probe.embedding, self.settings.memory_read_entry_points)
-        read_context = self._ranker.assemble_read_context(probe, entry_matches, limit=self.settings.memory_top_k)
-        write_context = self._ranker.assemble_context(probe, limit=self.settings.memory_top_k)
-        self.store.replace_recall_snapshot(user_id, _recall_snapshot_items(read_context))
-        selected_ids = [*read_context.ordered_node_ids(), *write_context.ordered_node_ids()]
-        self.store.touch_nodes(user_id, selected_ids)
+        started = time.perf_counter_ns()
+        timing = _retrieval_record("prepare_turn_contexts", user_id)
+        try:
+            phase = time.perf_counter_ns()
+            cached = self._redis.load_recall(user_id, message)
+            timing["cache_lookup_ms"] = _elapsed_ms(phase)
+            timing["cache_entry_found"] = cached is not None
+            if cached is not None:
+                phase = time.perf_counter_ns()
+                try:
+                    read_recall = MemoryRecall.model_validate(cached.get("read_recall") or {})
+                    write_recall = MemoryRecall.model_validate(cached.get("write_recall") or {})
+                    snapshot = list(cached.get("snapshot") or [])
+                except (TypeError, ValueError):
+                    timing["cache_entry_valid"] = False
+                    timing["cache_restore_ms"] = _elapsed_ms(phase)
+                    cached = None
+                else:
+                    timing["cache_entry_valid"] = True
+                    self.store.replace_recall_snapshot(user_id, snapshot)
+                    self.store.touch_nodes(
+                        user_id,
+                        [
+                            node.id
+                            for recall in (read_recall, write_recall)
+                            for tier in (recall.immediate, recall.working, recall.background, recall.buffer)
+                            for node in tier
+                        ],
+                    )
+                    timing["cache_restore_ms"] = _elapsed_ms(phase)
+                    timing["cache_hit"] = True
+                    timing["read_selected_count"] = _recall_count(read_recall)
+                    timing["write_selected_count"] = _recall_count(write_recall)
+                    return TurnMemoryContexts(
+                        event_id=new_id("event"),
+                        read_recall=read_recall,
+                        write_recall=write_recall,
+                    )
 
-        # Pre-allocate an event id — the actual event node is created later
-        # by the LLM memory writer (or fallback writer) with a proper summary.
-        event_id = new_id("event")
-        result = TurnMemoryContexts(
-            event_id=event_id,
-            read_recall=_to_recall(read_context),
-            write_recall=_to_recall(write_context),
-        )
-        self._redis.save_recall(
-            user_id,
-            message,
-            {
-                "read_recall": result.read_recall.model_dump(mode="json"),
-                "write_recall": result.write_recall.model_dump(mode="json"),
-                "snapshot": _recall_snapshot_items(read_context),
-            },
-        )
-        return result
+            timing["cache_hit"] = False
+            phase = time.perf_counter_ns()
+            probe = EventProbe(user_id=user_id, text=message, embedding=self.embed(message))
+            timing["embedding_ms"] = _elapsed_ms(phase)
+
+            phase = time.perf_counter_ns()
+            timing["indexed_node_count"] = self.rebuild_vector_index(user_id)
+            timing["faiss_rebuild_ms"] = _elapsed_ms(phase)
+
+            phase = time.perf_counter_ns()
+            entry_matches = self.vector_index(user_id).search(probe.embedding, self.settings.memory_read_entry_points)
+            timing["faiss_search_ms"] = _elapsed_ms(phase)
+            timing["entry_match_count"] = len(entry_matches)
+
+            phase = time.perf_counter_ns()
+            read_context = self._ranker.assemble_read_context(probe, entry_matches, limit=self.settings.memory_top_k)
+            timing["read_context_ms"] = _elapsed_ms(phase)
+            timing["read_selected_count"] = len(read_context.ordered_node_ids())
+
+            phase = time.perf_counter_ns()
+            write_context = self._ranker.assemble_context(probe, limit=self.settings.memory_top_k)
+            timing["write_context_ms"] = _elapsed_ms(phase)
+            timing["write_selected_count"] = len(write_context.ordered_node_ids())
+
+            phase = time.perf_counter_ns()
+            snapshot = _recall_snapshot_items(read_context)
+            self.store.replace_recall_snapshot(user_id, snapshot)
+            selected_ids = [*read_context.ordered_node_ids(), *write_context.ordered_node_ids()]
+            self.store.touch_nodes(user_id, selected_ids)
+            timing["snapshot_persistence_ms"] = _elapsed_ms(phase)
+
+            # Pre-allocate an event id — the actual event node is created later
+            # by the LLM memory writer (or fallback writer) with a proper summary.
+            result = TurnMemoryContexts(
+                event_id=new_id("event"),
+                read_recall=_to_recall(read_context),
+                write_recall=_to_recall(write_context),
+            )
+            phase = time.perf_counter_ns()
+            self._redis.save_recall(
+                user_id,
+                message,
+                {
+                    "read_recall": result.read_recall.model_dump(mode="json"),
+                    "write_recall": result.write_recall.model_dump(mode="json"),
+                    "snapshot": snapshot,
+                },
+            )
+            timing["cache_store_ms"] = _elapsed_ms(phase)
+            return result
+        except Exception as exc:
+            timing["status"] = "error"
+            timing["error_type"] = type(exc).__name__
+            raise
+        finally:
+            timing["total_ms"] = _elapsed_ms(started)
+            self._write_retrieval_timing(timing)
 
     def recall(self, user_id: str, query: str, limit: int = 12) -> MemoryRecall:
-        cache_query = f"direct:{limit}:{query}"
-        cached = self._redis.load_recall(user_id, cache_query)
-        if cached is not None:
-            try:
-                recall = MemoryRecall.model_validate(cached.get("recall") or {})
-            except (TypeError, ValueError):
-                cached = None
-            else:
-                self.store.touch_nodes(
-                    user_id,
-                    [
-                        node.id
-                        for tier in (recall.immediate, recall.working, recall.background, recall.buffer)
-                        for node in tier
-                    ],
-                )
-                return recall
-        probe = EventProbe(user_id=user_id, text=query, embedding=self.embed(query))
-        self.rebuild_vector_index(user_id)
-        entry_matches = self.vector_index(user_id).search(probe.embedding, self.settings.memory_read_entry_points)
-        context = self._ranker.assemble_read_context(probe, entry_matches, limit=limit)
-        self.store.touch_nodes(user_id, [node.id for node in context.ordered_nodes()])
-        recall = _to_recall(context)
-        self._redis.save_recall(
-            user_id,
-            cache_query,
-            {"recall": recall.model_dump(mode="json")},
-        )
-        return recall
+        started = time.perf_counter_ns()
+        timing = _retrieval_record("recall", user_id)
+        timing["limit"] = limit
+        try:
+            cache_query = f"direct:{limit}:{query}"
+            phase = time.perf_counter_ns()
+            cached = self._redis.load_recall(user_id, cache_query)
+            timing["cache_lookup_ms"] = _elapsed_ms(phase)
+            timing["cache_entry_found"] = cached is not None
+            if cached is not None:
+                phase = time.perf_counter_ns()
+                try:
+                    recall = MemoryRecall.model_validate(cached.get("recall") or {})
+                except (TypeError, ValueError):
+                    timing["cache_entry_valid"] = False
+                    timing["cache_restore_ms"] = _elapsed_ms(phase)
+                    cached = None
+                else:
+                    timing["cache_entry_valid"] = True
+                    self.store.touch_nodes(
+                        user_id,
+                        [
+                            node.id
+                            for tier in (recall.immediate, recall.working, recall.background, recall.buffer)
+                            for node in tier
+                        ],
+                    )
+                    timing["cache_restore_ms"] = _elapsed_ms(phase)
+                    timing["cache_hit"] = True
+                    timing["read_selected_count"] = _recall_count(recall)
+                    return recall
+
+            timing["cache_hit"] = False
+            phase = time.perf_counter_ns()
+            probe = EventProbe(user_id=user_id, text=query, embedding=self.embed(query))
+            timing["embedding_ms"] = _elapsed_ms(phase)
+
+            phase = time.perf_counter_ns()
+            timing["indexed_node_count"] = self.rebuild_vector_index(user_id)
+            timing["faiss_rebuild_ms"] = _elapsed_ms(phase)
+
+            phase = time.perf_counter_ns()
+            entry_matches = self.vector_index(user_id).search(probe.embedding, self.settings.memory_read_entry_points)
+            timing["faiss_search_ms"] = _elapsed_ms(phase)
+            timing["entry_match_count"] = len(entry_matches)
+
+            phase = time.perf_counter_ns()
+            context = self._ranker.assemble_read_context(probe, entry_matches, limit=limit)
+            timing["read_context_ms"] = _elapsed_ms(phase)
+            timing["read_selected_count"] = len(context.ordered_node_ids())
+
+            phase = time.perf_counter_ns()
+            self.store.touch_nodes(user_id, [node.id for node in context.ordered_nodes()])
+            timing["snapshot_persistence_ms"] = _elapsed_ms(phase)
+            recall = _to_recall(context)
+
+            phase = time.perf_counter_ns()
+            self._redis.save_recall(
+                user_id,
+                cache_query,
+                {"recall": recall.model_dump(mode="json")},
+            )
+            timing["cache_store_ms"] = _elapsed_ms(phase)
+            return recall
+        except Exception as exc:
+            timing["status"] = "error"
+            timing["error_type"] = type(exc).__name__
+            raise
+        finally:
+            timing["total_ms"] = _elapsed_ms(started)
+            self._write_retrieval_timing(timing)
 
     def best_concept_match(self, user_id: str, text: str) -> tuple[MemoryNode | None, float]:
         query_embedding = self.embed(text)
@@ -201,8 +291,19 @@ class MemoryService:
             )
         return self._faiss_indexes[user_id]
 
-    def rebuild_vector_index(self, user_id: str) -> None:
-        self.vector_index(user_id).rebuild(self.store.list_nodes(user_id))
+    def rebuild_vector_index(self, user_id: str) -> int:
+        nodes = self.store.list_nodes(user_id)
+        self.vector_index(user_id).rebuild(nodes)
+        return len(nodes)
+
+    def _write_retrieval_timing(self, timing: dict[str, Any]) -> None:
+        if not self.settings.memory_retrieval_log_enabled:
+            return
+        append_memory_retrieval_log(
+            self.settings.memory_retrieval_log_path,
+            timing,
+            max_bytes=self.settings.memory_retrieval_log_max_bytes,
+        )
 
     # -- Consolidation -----------------------------------------------------
 
@@ -377,6 +478,23 @@ def _recall_snapshot_items(context: Any) -> list[dict[str, Any]]:
                 }
             )
     return items
+
+
+def _retrieval_record(operation: str, user_id: str) -> dict[str, Any]:
+    return {
+        "operation": operation,
+        "status": "success",
+        "user_hash": hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:16],
+        "cache_hit": False,
+    }
+
+
+def _elapsed_ms(started_ns: int) -> float:
+    return round((time.perf_counter_ns() - started_ns) / 1_000_000, 3)
+
+
+def _recall_count(recall: MemoryRecall) -> int:
+    return sum(len(tier) for tier in (recall.immediate, recall.working, recall.background, recall.buffer))
 
 
 def _title_from_text(text: str, fallback: str) -> str:

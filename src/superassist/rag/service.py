@@ -1,46 +1,44 @@
+"""Local hybrid RAG service backed by SQLite FTS5 and FAISS."""
+
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import logging
+import sqlite3
 import threading
-from concurrent.futures import Future
+from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 import numpy as np
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from lightrag import LightRAG, QueryParam
-from lightrag.utils import EmbeddingFunc
 
 from superassist.config import Settings
-from superassist.llm import create_chat_model
 from superassist.memory.embedding import Embedder, get_embedder
+from superassist.rag.chunking import chunk_document, lexical_terms, lexical_text, truncate_tokens
 from superassist.rag.context import RagRetrievalResult
 from superassist.rag.documents import SUPPORTED_EXTENSIONS, extract_document, safe_filename
 
 logger = logging.getLogger(__name__)
 
 
-class LightRAGService:
+class HybridRAGService:
+    """Index uploaded files as original chunks and retrieve them with Dense + BM25 RRF."""
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.base_dir = settings.rag_dir.resolve()
         self.base_dir.mkdir(parents=True, exist_ok=True)
-        self._model = create_chat_model(settings)
         self._embedder: Embedder = get_embedder(settings)
-        self._embedding_dim = len(self._embedder.embed("LightRAG embedding dimension probe"))
+        self._embedder.embed("Hybrid RAG embedding dimension probe")
         self._manifest_lock = threading.RLock()
-        self._loop = asyncio.new_event_loop()
-        self._loop_ready = threading.Event()
-        self._thread = threading.Thread(target=self._run_loop, name="superassist-lightrag", daemon=True)
-        self._thread.start()
-        self._loop_ready.wait(timeout=10)
-        self._rags: dict[str, LightRAG] = {}
-        self._rag_locks: dict[str, asyncio.Lock] = {}
+        self._user_locks_guard = threading.Lock()
+        self._user_locks: dict[str, threading.RLock] = {}
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="superassist-rag-index")
 
     @property
     def supported_extensions(self) -> list[str]:
@@ -55,9 +53,20 @@ class LightRAGService:
         if not content:
             raise ValueError("File is empty")
 
+        content_hash = hashlib.sha256(content).hexdigest()
+        duplicate = next(
+            (
+                item
+                for item in self._read_manifest(user_id)
+                if item.get("content_hash") == content_hash and item.get("status") != "failed"
+            ),
+            None,
+        )
+        if duplicate is not None:
+            raise ValueError(f"The same file content is already indexed as {duplicate.get('name') or duplicate['id']}")
+
         document_id = f"doc-{uuid4().hex}"
-        user_dir = self._user_dir(user_id)
-        raw_dir = user_dir / "files"
+        raw_dir = self._user_dir(user_id) / "files"
         raw_dir.mkdir(parents=True, exist_ok=True)
         storage_name = f"{document_id}{Path(filename).suffix.lower()}"
         (raw_dir / storage_name).write_bytes(content)
@@ -66,15 +75,17 @@ class LightRAGService:
             "id": document_id,
             "name": filename,
             "storage_name": storage_name,
+            "content_hash": content_hash,
             "size": len(content),
             "status": "queued",
             "error": None,
             "characters": None,
+            "chunks": None,
             "created_at": now,
             "updated_at": now,
         }
         self._put_document(user_id, document)
-        future = self._submit(self._index_document(user_id, document_id))
+        future = self._executor.submit(self._index_document, user_id, document_id)
         future.add_done_callback(lambda completed: self._log_background_error(completed, document_id))
         return self._public_document(document)
 
@@ -83,11 +94,18 @@ class LightRAGService:
         return [self._public_document(item) for item in sorted(documents, key=lambda item: item["created_at"], reverse=True)]
 
     def graph_payload(self, user_id: str) -> dict[str, Any]:
-        ready_documents = [item for item in self._read_manifest(user_id) if item.get("status") == "ready"]
-        if not ready_documents:
-            return _empty_graph_payload()
-        timeout = max(30, min(self.settings.subagent_timeout_seconds, 300))
-        return self._submit(self._graph_payload(user_id, ready_documents)).result(timeout=timeout)
+        documents = [item for item in self._read_manifest(user_id) if item.get("status") == "ready"]
+        chunks = 0
+        database = self._database_path(user_id)
+        if database.exists():
+            with self._connect(user_id) as connection:
+                chunks = int(connection.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+        return {
+            "nodes": [],
+            "edges": [],
+            "stats": {"nodes": 0, "edges": 0, "documents": len(documents), "chunks": chunks},
+            "updated_at": max((item.get("updated_at") or "" for item in documents), default=""),
+        }
 
     def delete_document(self, user_id: str, document_id: str) -> dict[str, Any]:
         document = self._get_document(user_id, document_id)
@@ -96,229 +114,308 @@ class LightRAGService:
         if document["status"] in {"queued", "parsing", "indexing", "deleting"}:
             raise ValueError("Document is still being processed")
         self._update_document(user_id, document_id, status="deleting", error=None)
-        future = self._submit(self._delete_document(user_id, document_id))
+        future = self._executor.submit(self._delete_document, user_id, document_id)
         future.add_done_callback(lambda completed: self._log_background_error(completed, document_id))
         return {"id": document_id, "status": "deleting"}
 
-    def retrieve(self, user_id: str, query: str, mode: str = "mix") -> RagRetrievalResult:
-        timeout = max(30, min(self.settings.subagent_timeout_seconds, 900))
-        return self._submit(self._retrieve(user_id, query, mode)).result(timeout=timeout)
+    def retrieve(self, user_id: str, query: str, mode: str = "hybrid") -> RagRetrievalResult:
+        mode = mode if mode in {"hybrid", "dense", "bm25"} else "hybrid"
+        query = str(query or "").strip()
+        if not query:
+            return RagRetrievalResult(query, mode, "", [], False, "Search query is empty")
+        if not any(item.get("status") == "ready" for item in self._read_manifest(user_id)):
+            return RagRetrievalResult(query, mode, "", [], False, "No indexed documents are ready")
+
+        with self._user_lock(user_id):
+            self._ensure_store(user_id)
+            dense = self._dense_search(user_id, query, self.settings.rag_candidate_top_k) if mode != "bm25" else []
+            sparse = self._bm25_search(user_id, query, self.settings.rag_candidate_top_k) if mode != "dense" else []
+            fused = _rrf_fuse(dense, sparse, self.settings.rag_rrf_k, mode)
+            candidate_ids = [chunk_id for chunk_id, _score, _dense_rank, _bm25_rank in fused]
+            rows = self._load_chunks(user_id, candidate_ids)
+
+        by_id = {str(row["id"]): row for row in rows}
+        hits: list[dict[str, Any]] = []
+        seen_hashes: set[str] = set()
+        context_parts: list[str] = []
+        remaining = self.settings.rag_context_max_tokens
+        for chunk_id, score, dense_rank, bm25_rank in fused:
+            if len(hits) >= self.settings.rag_chunk_top_k:
+                break
+            row = by_id.get(chunk_id)
+            if row is None or row["content_hash"] in seen_hashes:
+                continue
+            header = f"[上传资料:{row['document_name']} | chunk:{chunk_id}"
+            if row["heading"]:
+                header += f" | section:{row['heading']}"
+            header += "]"
+            header_tokens = _token_count(header) + 1
+            if remaining <= header_tokens + 16:
+                break
+            text = truncate_tokens(str(row["text"]), remaining - header_tokens)
+            if not text:
+                continue
+            used = header_tokens + _token_count(text)
+            context_parts.append(f"{header}\n{text}")
+            remaining -= used
+            seen_hashes.add(str(row["content_hash"]))
+            hits.append(
+                {
+                    "chunk_id": chunk_id,
+                    "document_id": row["document_id"],
+                    "document_name": row["document_name"],
+                    "ordinal": int(row["ordinal"]),
+                    "heading": row["heading"],
+                    "text": text,
+                    "token_count": used,
+                    "dense_rank": dense_rank,
+                    "bm25_rank": bm25_rank,
+                    "rrf_score": score,
+                }
+            )
+
+        context = "\n\n".join(context_parts)
+        sources = sorted({str(item["document_name"]) for item in hits}, key=str.casefold)
+        return RagRetrievalResult(
+            query=query,
+            mode=mode,
+            context=context,
+            sources=sources,
+            success=bool(hits),
+            message=f"Retrieved {len(hits)} original chunks" if hits else "No relevant uploaded evidence found",
+            hits=hits,
+            evidence_tokens=self.settings.rag_context_max_tokens - remaining,
+        )
 
     def close(self) -> None:
-        if not self._loop.is_running():
-            return
-        try:
-            self._submit(self._finalize()).result(timeout=30)
-        except Exception:
-            logger.exception("Failed to finalize LightRAG storages")
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        self._thread.join(timeout=5)
+        self._executor.shutdown(wait=True, cancel_futures=False)
 
-    async def _get_rag(self, user_id: str) -> LightRAG:
-        key = self._user_key(user_id)
-        if key in self._rags:
-            return self._rags[key]
-        lock = self._rag_locks.setdefault(key, asyncio.Lock())
-        async with lock:
-            if key in self._rags:
-                return self._rags[key]
-            index_dir = self._user_dir(user_id) / "index"
-            index_dir.mkdir(parents=True, exist_ok=True)
-
-            # LightRAG snapshots its dataclass config with ``asdict``. Plain
-            # closures avoid deepcopying this service's thread locks through
-            # bound-method ``__self__`` references.
-            async def llm_model_func(*args: Any, **kwargs: Any) -> str:
-                return await self._llm_model_func(*args, **kwargs)
-
-            async def embedding_func(texts: list[str]) -> np.ndarray:
-                return await self._embedding_func(texts)
-
-            rag = LightRAG(
-                working_dir=str(index_dir),
-                workspace="default",
-                llm_model_func=llm_model_func,
-                llm_model_name=self.settings.model,
-                embedding_func=EmbeddingFunc(
-                    embedding_dim=self._embedding_dim,
-                    max_token_size=8192,
-                    model_name=self.settings.embedding_model,
-                    func=embedding_func,
-                ),
-                top_k=self.settings.rag_top_k,
-                chunk_top_k=self.settings.rag_chunk_top_k,
-                addon_params={"language": "Chinese"},
-                enable_llm_cache=True,
-                enable_llm_cache_for_entity_extract=True,
-            )
-            await rag.initialize_storages()
-            self._rags[key] = rag
-            return rag
-
-    async def _index_document(self, user_id: str, document_id: str) -> None:
+    def _index_document(self, user_id: str, document_id: str) -> None:
         try:
             document = self._get_document(user_id, document_id)
             if document is None:
                 return
             self._update_document(user_id, document_id, status="parsing", error=None)
             path = self._user_dir(user_id) / "files" / document["storage_name"]
-            text = (await asyncio.to_thread(extract_document, path)).strip()
+            text = extract_document(path).strip()
             if len(text) < 10:
                 raise ValueError("No usable text could be extracted from this file")
-            self._update_document(user_id, document_id, status="indexing", characters=len(text))
-            rag = await self._get_rag(user_id)
-            await rag.ainsert(text, ids=[document_id], file_paths=[document["name"]])
-            self._update_document(user_id, document_id, status="ready", error=None, characters=len(text))
+            chunks = chunk_document(
+                text,
+                document_id=document_id,
+                document_name=str(document["name"]),
+                target_tokens=self.settings.rag_chunk_target_tokens,
+                max_tokens=self.settings.rag_chunk_max_tokens,
+                overlap_tokens=self.settings.rag_chunk_overlap_tokens,
+            )
+            if not chunks:
+                raise ValueError("No usable chunks could be produced from this file")
+            self._update_document(user_id, document_id, status="indexing", characters=len(text), chunks=len(chunks))
+            vectors = self._embedder.embed_many([item.searchable_text for item in chunks])
+            if len(vectors) != len(chunks):
+                raise RuntimeError("Embedding provider returned an unexpected vector count")
+
+            with self._user_lock(user_id):
+                self._ensure_store(user_id)
+                with self._connect(user_id) as connection:
+                    old_ids = [
+                        str(row[0])
+                        for row in connection.execute("SELECT id FROM chunks WHERE document_id = ?", (document_id,))
+                    ]
+                    connection.executemany("DELETE FROM chunk_fts WHERE chunk_id = ?", [(item,) for item in old_ids])
+                    connection.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
+                    for chunk, vector in zip(chunks, vectors, strict=True):
+                        array = np.asarray(vector, dtype="float32")
+                        connection.execute(
+                            """
+                            INSERT INTO chunks (
+                                id, document_id, document_name, ordinal, parent_id, heading,
+                                text, token_count, content_hash, embedding, embedding_dim
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                chunk.id,
+                                chunk.document_id,
+                                chunk.document_name,
+                                chunk.ordinal,
+                                chunk.parent_id,
+                                chunk.heading,
+                                chunk.text,
+                                chunk.token_count,
+                                chunk.content_hash,
+                                array.tobytes(),
+                                len(array),
+                            ),
+                        )
+                        connection.execute(
+                            "INSERT INTO chunk_fts (chunk_id, document_name, heading, body) VALUES (?, ?, ?, ?)",
+                            (
+                                chunk.id,
+                                lexical_text(chunk.document_name),
+                                lexical_text(chunk.heading),
+                                lexical_text(chunk.text),
+                            ),
+                        )
+                    connection.commit()
+                    self._rebuild_dense_index(user_id, connection)
+            self._update_document(
+                user_id,
+                document_id,
+                status="ready",
+                error=None,
+                characters=len(text),
+                chunks=len(chunks),
+            )
         except Exception as exc:
-            logger.exception("LightRAG indexing failed for %s", document_id)
+            logger.exception("Hybrid RAG indexing failed for %s", document_id)
             self._update_document(user_id, document_id, status="failed", error=f"{type(exc).__name__}: {exc}")
 
-    async def _delete_document(self, user_id: str, document_id: str) -> None:
+    def _delete_document(self, user_id: str, document_id: str) -> None:
         document = self._get_document(user_id, document_id)
         if document is None:
             return
         try:
-            if document.get("status") != "failed":
-                rag = await self._get_rag(user_id)
-                result = await rag.adelete_by_doc_id(document_id)
-                if result.status not in {"success", "not_found"}:
-                    raise RuntimeError(result.message)
-            path = self._user_dir(user_id) / "files" / document["storage_name"]
-            path.unlink(missing_ok=True)
-            self._remove_document(user_id, document_id)
+            with self._user_lock(user_id):
+                self._ensure_store(user_id)
+                with self._connect(user_id) as connection:
+                    chunk_ids = [
+                        str(row[0])
+                        for row in connection.execute("SELECT id FROM chunks WHERE document_id = ?", (document_id,))
+                    ]
+                    connection.executemany("DELETE FROM chunk_fts WHERE chunk_id = ?", [(item,) for item in chunk_ids])
+                    connection.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
+                    connection.commit()
+                    self._rebuild_dense_index(user_id, connection)
+                (self._user_dir(user_id) / "files" / document["storage_name"]).unlink(missing_ok=True)
+                self._remove_document(user_id, document_id)
         except Exception as exc:
-            logger.exception("LightRAG deletion failed for %s", document_id)
+            logger.exception("Hybrid RAG deletion failed for %s", document_id)
             self._update_document(user_id, document_id, status="failed", error=f"{type(exc).__name__}: {exc}")
 
-    async def _retrieve(self, user_id: str, query: str, mode: str) -> RagRetrievalResult:
-        if mode not in {"mix", "hybrid", "local", "global", "naive"}:
-            mode = "mix"
-        ready_documents = [item for item in self._read_manifest(user_id) if item.get("status") == "ready"]
-        if not ready_documents:
-            return RagRetrievalResult(query=query, mode=mode, context="", sources=[], success=False, message="No indexed documents are ready")
-        rag = await self._get_rag(user_id)
-        raw = await rag.aquery_data(
-            query,
-            QueryParam(
-                mode=mode,
-                top_k=self.settings.rag_top_k,
-                chunk_top_k=self.settings.rag_chunk_top_k,
-                max_total_tokens=12000,
-                enable_rerank=False,
-                include_references=True,
-            ),
-        )
-        return _retrieval_result(query, mode, raw, self.settings.rag_context_max_chars)
+    def _ensure_store(self, user_id: str) -> None:
+        with self._connect(user_id) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS chunks (
+                    id TEXT PRIMARY KEY,
+                    document_id TEXT NOT NULL,
+                    document_name TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    parent_id TEXT NOT NULL,
+                    heading TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    token_count INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    embedding BLOB NOT NULL,
+                    embedding_dim INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id, ordinal);
+                CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(
+                    chunk_id UNINDEXED,
+                    document_name,
+                    heading,
+                    body,
+                    tokenize='unicode61'
+                );
+                """
+            )
 
-    async def _graph_payload(
-        self,
-        user_id: str,
-        ready_documents: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        rag = await self._get_rag(user_id)
-        raw_nodes, raw_edges = await asyncio.gather(
-            rag.chunk_entity_relation_graph.get_all_nodes(),
-            rag.chunk_entity_relation_graph.get_all_edges(),
-        )
+    def _dense_search(self, user_id: str, query: str, limit: int) -> list[tuple[str, float]]:
+        index_path, mapping_path = self._dense_paths(user_id)
+        if not index_path.exists() or not mapping_path.exists():
+            return []
+        try:
+            mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        chunk_ids = list(mapping.get("ids") or [])
+        dimension = int(mapping.get("dimension") or 0)
+        vector = self._embedder.embed(query)
+        if not chunk_ids or len(vector) != dimension:
+            return []
+        import faiss
 
-        node_ids = {str(item.get("id") or "").strip() for item in raw_nodes}
-        node_ids.discard("")
-        valid_edges = [
-            item
-            for item in raw_edges
-            if str(item.get("source") or "").strip() in node_ids
-            and str(item.get("target") or "").strip() in node_ids
+        index = faiss.read_index(str(index_path))
+        query_matrix = np.asarray([vector], dtype="float32")
+        faiss.normalize_L2(query_matrix)
+        scores, ids = index.search(query_matrix, max(1, min(limit, len(chunk_ids))))
+        return [
+            (str(chunk_ids[int(index_id)]), float(score))
+            for score, index_id in zip(scores[0], ids[0], strict=True)
+            if 0 <= index_id < len(chunk_ids)
         ]
-        degree = {node_id: 0 for node_id in node_ids}
-        for edge in valid_edges:
-            degree[str(edge["source"]).strip()] += 1
-            degree[str(edge["target"]).strip()] += 1
-        max_degree = max(degree.values(), default=1) or 1
-        max_weight = max((_as_float(item.get("weight"), 1.0) for item in valid_edges), default=1.0) or 1.0
 
-        nodes = []
-        for item in raw_nodes:
-            node_id = str(item.get("id") or "").strip()
-            if not node_id:
-                continue
-            nodes.append(
-                {
-                    "id": node_id,
-                    "type": "entity",
-                    "title": str(item.get("entity_id") or node_id),
-                    "description": _clean_lightrag_text(item.get("description")),
-                    "entity_type": str(item.get("entity_type") or "unknown"),
-                    "file_path": _clean_lightrag_text(item.get("file_path")),
-                    "degree": degree[node_id],
-                    "importance": degree[node_id] / max_degree,
-                }
-            )
-        nodes.sort(key=lambda item: (-item["degree"], item["title"].casefold()))
+    def _bm25_search(self, user_id: str, query: str, limit: int) -> list[tuple[str, float]]:
+        terms = list(dict.fromkeys(lexical_terms(query)))
+        if not terms:
+            return []
+        match = " OR ".join(f'"{term}"' for term in terms[:64])
+        with self._connect(user_id) as connection:
+            rows = connection.execute(
+                """
+                SELECT chunk_id, bm25(chunk_fts, 0.0, 2.5, 1.8, 1.0) AS score
+                FROM chunk_fts
+                WHERE chunk_fts MATCH ?
+                ORDER BY score
+                LIMIT ?
+                """,
+                (match, limit),
+            ).fetchall()
+        return [(str(row["chunk_id"]), -float(row["score"])) for row in rows]
 
-        edges = []
-        for item in valid_edges:
-            source = str(item["source"]).strip()
-            target = str(item["target"]).strip()
-            raw_weight = _as_float(item.get("weight"), 1.0)
-            edge_key = hashlib.sha1(f"{source}\0{target}".encode("utf-8")).hexdigest()[:16]
-            edges.append(
-                {
-                    "id": f"rag-edge-{edge_key}",
-                    "source_id": source,
-                    "target_id": target,
-                    "edge_type": _clean_lightrag_text(item.get("keywords")) or "related",
-                    "description": _clean_lightrag_text(item.get("description")),
-                    "file_path": _clean_lightrag_text(item.get("file_path")),
-                    "raw_weight": raw_weight,
-                    "weight": raw_weight / max_weight,
-                }
-            )
+    def _load_chunks(self, user_id: str, chunk_ids: list[str]) -> list[sqlite3.Row]:
+        if not chunk_ids:
+            return []
+        placeholders = ",".join("?" for _ in chunk_ids)
+        with self._connect(user_id) as connection:
+            return list(connection.execute(f"SELECT * FROM chunks WHERE id IN ({placeholders})", chunk_ids))
 
-        return {
-            "nodes": nodes,
-            "edges": edges,
-            "stats": {
-                "nodes": len(nodes),
-                "edges": len(edges),
-                "documents": len(ready_documents),
-            },
-            "updated_at": max((item.get("updated_at") or "" for item in ready_documents), default=""),
-        }
+    def _rebuild_dense_index(self, user_id: str, connection: sqlite3.Connection) -> None:
+        rows = connection.execute("SELECT id, embedding, embedding_dim FROM chunks ORDER BY document_id, ordinal").fetchall()
+        index_path, mapping_path = self._dense_paths(user_id)
+        if not rows:
+            index_path.unlink(missing_ok=True)
+            mapping_path.unlink(missing_ok=True)
+            return
+        dimension = int(rows[0]["embedding_dim"])
+        valid = [row for row in rows if int(row["embedding_dim"]) == dimension]
+        matrix = np.vstack([np.frombuffer(row["embedding"], dtype="float32", count=dimension) for row in valid])
+        import faiss
 
-    async def _embedding_func(self, texts: list[str]) -> np.ndarray:
-        vectors = await asyncio.to_thread(self._embedder.embed_many, list(texts))
-        return np.asarray(vectors, dtype=np.float32)
+        faiss.normalize_L2(matrix)
+        index = faiss.IndexIDMap2(faiss.IndexFlatIP(dimension))
+        index.add_with_ids(matrix, np.arange(len(valid), dtype="int64"))
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        faiss.write_index(index, str(index_path))
+        temporary = mapping_path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps({"dimension": dimension, "ids": [str(row["id"]) for row in valid]}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        temporary.replace(mapping_path)
 
-    async def _llm_model_func(
-        self,
-        prompt: str,
-        system_prompt: str | None = None,
-        history_messages: list[dict[str, str]] | None = None,
-        **_kwargs: Any,
-    ) -> str:
-        messages = []
-        if system_prompt:
-            messages.append(SystemMessage(content=system_prompt))
-        for item in history_messages or []:
-            content = str(item.get("content") or "")
-            messages.append(AIMessage(content=content) if item.get("role") == "assistant" else HumanMessage(content=content))
-        messages.append(HumanMessage(content=prompt))
-        response = await self._model.ainvoke(messages)
-        return _message_text(response.content)
+    @contextmanager
+    def _connect(self, user_id: str) -> Iterator[sqlite3.Connection]:
+        connection = sqlite3.connect(self._database_path(user_id), timeout=30)
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA foreign_keys=ON")
+            yield connection
+        finally:
+            connection.close()
 
-    async def _finalize(self) -> None:
-        for rag in list(self._rags.values()):
-            await _shutdown_lightrag_workers(rag)
-            await rag.finalize_storages()
-        self._rags.clear()
+    def _database_path(self, user_id: str) -> Path:
+        return self._user_dir(user_id) / "hybrid.sqlite3"
 
-    def _run_loop(self) -> None:
-        asyncio.set_event_loop(self._loop)
-        self._loop_ready.set()
-        self._loop.run_forever()
+    def _dense_paths(self, user_id: str) -> tuple[Path, Path]:
+        user_dir = self._user_dir(user_id)
+        return user_dir / "chunks.faiss", user_dir / "chunks.mapping.json"
 
-    def _submit(self, coroutine) -> Future:
-        return asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+    def _user_lock(self, user_id: str) -> threading.RLock:
+        key = self._user_key(user_id)
+        with self._user_locks_guard:
+            return self._user_locks.setdefault(key, threading.RLock())
 
     def _user_key(self, user_id: str) -> str:
         return hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:24]
@@ -375,104 +472,48 @@ class LightRAGService:
 
     @staticmethod
     def _public_document(document: dict[str, Any]) -> dict[str, Any]:
-        return {key: value for key, value in document.items() if key != "storage_name"}
+        return {key: value for key, value in document.items() if key not in {"storage_name", "content_hash"}}
 
     @staticmethod
     def _log_background_error(future: Future, document_id: str) -> None:
         try:
             future.result()
         except Exception:
-            logger.exception("Unhandled LightRAG background error for %s", document_id)
+            logger.exception("Unhandled Hybrid RAG background error for %s", document_id)
 
 
-def _retrieval_result(query: str, mode: str, raw: dict[str, Any], max_chars: int) -> RagRetrievalResult:
-    data = raw.get("data") if isinstance(raw, dict) else None
-    data = data if isinstance(data, dict) else {}
-    chunks = list(data.get("chunks") or [])
-    entities = list(data.get("entities") or [])
-    relationships = list(data.get("relationships") or [])
-    references = list(data.get("references") or [])
-    sources = sorted(
-        {
-            str(item.get("file_path") or "").strip()
-            for item in [*references, *chunks, *entities, *relationships]
-            if str(item.get("file_path") or "").strip()
-        }
-    )
-    parts: list[str] = []
-    for chunk in chunks:
-        parts.append(f"[上传资料:{chunk.get('file_path') or 'unknown'}]\n{chunk.get('content') or ''}")
-    if entities:
-        parts.append("实体证据:\n" + "\n".join(f"- {item.get('entity_name')}: {item.get('description')}" for item in entities))
-    if relationships:
-        parts.append(
-            "关系证据:\n"
-            + "\n".join(
-                f"- {item.get('src_id')} -> {item.get('tgt_id')}: {item.get('description')}" for item in relationships
-            )
-        )
-    context = "\n\n".join(parts).strip()[:max_chars]
-    success = bool(context and (chunks or entities or relationships)) and raw.get("status") != "failure"
-    return RagRetrievalResult(
-        query=query,
-        mode=mode,
-        context=context,
-        sources=sources,
-        success=success,
-        message=str(raw.get("message") or ("Evidence found" if success else "No relevant uploaded evidence found")),
-    )
+def _rrf_fuse(
+    dense: list[tuple[str, float]],
+    sparse: list[tuple[str, float]],
+    rank_constant: int,
+    mode: str,
+) -> list[tuple[str, float, int | None, int | None]]:
+    candidates: dict[str, dict[str, float | int | None]] = {}
+    dense_weight = 1.0 if mode == "dense" else 0.55
+    sparse_weight = 1.0 if mode == "bm25" else 0.45
+    for rank, (chunk_id, _score) in enumerate(dense, start=1):
+        item = candidates.setdefault(chunk_id, {"score": 0.0, "dense_rank": None, "bm25_rank": None})
+        item["score"] = float(item["score"] or 0.0) + dense_weight / (rank_constant + rank)
+        item["dense_rank"] = rank
+    for rank, (chunk_id, _score) in enumerate(sparse, start=1):
+        item = candidates.setdefault(chunk_id, {"score": 0.0, "dense_rank": None, "bm25_rank": None})
+        item["score"] = float(item["score"] or 0.0) + sparse_weight / (rank_constant + rank)
+        item["bm25_rank"] = rank
+    ranked = sorted(candidates.items(), key=lambda item: (-float(item[1]["score"] or 0.0), item[0]))
+    return [
+        (chunk_id, float(value["score"] or 0.0), value["dense_rank"], value["bm25_rank"])
+        for chunk_id, value in ranked
+    ]
+
+
+def _token_count(text: str) -> int:
+    from superassist.rag.chunking import count_tokens
+
+    return count_tokens(text)
 
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _empty_graph_payload() -> dict[str, Any]:
-    return {
-        "nodes": [],
-        "edges": [],
-        "stats": {"nodes": 0, "edges": 0, "documents": 0},
-        "updated_at": "",
-    }
-
-
-def _as_float(value: Any, default: float) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _clean_lightrag_text(value: Any) -> str:
-    return str(value or "").replace("<SEP>", " | ").strip()
-
-
-def _message_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict) and isinstance(item.get("text"), str):
-                parts.append(item["text"])
-        return "\n".join(part for part in parts if part)
-    return str(content) if content else ""
-
-
-async def _shutdown_lightrag_workers(rag: LightRAG) -> None:
-    candidates = list(getattr(rag, "role_llm_funcs", {}).values())
-    embedding_func = getattr(getattr(rag, "embedding_func", None), "func", None)
-    candidates.extend([embedding_func, getattr(rag, "rerank_model_func", None)])
-    seen: set[int] = set()
-    for function in candidates:
-        if function is None or id(function) in seen:
-            continue
-        seen.add(id(function))
-        shutdown = getattr(function, "shutdown", None)
-        if callable(shutdown):
-            try:
-                await shutdown(graceful=True)
-            except Exception:
-                logger.exception("Failed to stop a LightRAG worker queue")
+__all__ = ["HybridRAGService"]

@@ -36,7 +36,7 @@ from superassist.llm import is_minimax_model
 from superassist.models import AgentRunEvent, AgentRunResult
 from superassist.observability import runnable_trace_config, traceable, without_self
 from superassist.rag.context import rag_turn_context
-from superassist.rag.service import LightRAGService
+from superassist.rag.service import HybridRAGService
 from superassist.redis_store import get_redis_store
 from superassist.run_events import run_event_reporter_context
 from superassist.skills import active_skill_activations, active_skill_names
@@ -56,7 +56,7 @@ class AgentRuntime:
         tool_event_reporter: Callable[[dict[str, Any]], None] | None = None,
         run_event_reporter: Callable[[AgentRunEvent], None] | None = None,
         rag_mode: bool = False,
-        rag_service: LightRAGService | None = None,
+        rag_service: HybridRAGService | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.rag_mode = rag_mode
@@ -161,19 +161,17 @@ class AgentRuntime:
                     self._bundle.rag_service,
                     user_id,
                     self.rag_mode,
-                    self.settings.rag_max_attempts,
-                ):
-                    with team_thread_context(state["thread_id"]):
-                        final_state = self.agent.invoke(
-                            state,
-                            runnable_trace_config(
-                                run_name="superassist.lead_agent",
-                                user_id=user_id,
-                                thread_id=state["thread_id"],
-                                tags=["agent", "lead"],
-                                metadata={"streaming": False, **self._tool_compatibility_metadata()},
-                            ),
-                        )
+                ), team_thread_context(state["thread_id"]):
+                    final_state = self.agent.invoke(
+                        state,
+                        runnable_trace_config(
+                            run_name="superassist.lead_agent",
+                            user_id=user_id,
+                            thread_id=state["thread_id"],
+                            tags=["agent", "lead"],
+                            metadata={"streaming": False, **self._tool_compatibility_metadata()},
+                        ),
+                    )
             except Exception as exc:
                 return self._error_result(state["thread_id"], exc)
         return self._result_from(state["thread_id"], final_state)
@@ -251,36 +249,34 @@ class AgentRuntime:
                 self._bundle.rag_service,
                 user_id,
                 self.rag_mode,
-                self.settings.rag_max_attempts,
-            ):
-                with team_thread_context(thread_id):
-                    for item in self.agent.stream(
-                        state,
-                        runnable_trace_config(
-                            run_name="superassist.lead_agent.streaming",
-                            user_id=user_id,
-                            thread_id=thread_id,
-                            tags=["agent", "lead", "streaming"],
-                            metadata={"streaming": True, **self._tool_compatibility_metadata()},
-                        ),
-                        stream_mode=["messages", "values"],
-                    ):
-                        if isinstance(item, tuple) and len(item) == 2:
-                            mode, chunk = str(item[0]), item[1]
-                        else:
-                            mode, chunk = "values", item
-                        if mode == "messages":
-                            _accumulate_stream_usage(usage_totals, seen_usage, chunk)
-                            reasoning, text, current_message_id = accumulate_stream_parts(
-                                stream_buffers, current_message_id, chunk
-                            )
-                            if reasoning:
-                                self._report_run_event("agent_reasoning", reasoning, thread_id=thread_id)
-                            if text:
-                                self._report_agent_text(text, thread_id=thread_id)
-                            continue
-                        if mode == "values" and isinstance(chunk, dict):
-                            last_values = chunk
+            ), team_thread_context(thread_id):
+                for item in self.agent.stream(
+                    state,
+                    runnable_trace_config(
+                        run_name="superassist.lead_agent.streaming",
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        tags=["agent", "lead", "streaming"],
+                        metadata={"streaming": True, **self._tool_compatibility_metadata()},
+                    ),
+                    stream_mode=["messages", "values"],
+                ):
+                    if isinstance(item, tuple) and len(item) == 2:
+                        mode, chunk = str(item[0]), item[1]
+                    else:
+                        mode, chunk = "values", item
+                    if mode == "messages":
+                        _accumulate_stream_usage(usage_totals, seen_usage, chunk)
+                        reasoning, text, current_message_id = accumulate_stream_parts(
+                            stream_buffers, current_message_id, chunk
+                        )
+                        if reasoning:
+                            self._report_run_event("agent_reasoning", reasoning, thread_id=thread_id)
+                        if text:
+                            self._report_agent_text(text, thread_id=thread_id)
+                        continue
+                    if mode == "values" and isinstance(chunk, dict):
+                        last_values = chunk
         finally:
             self._active_agent_text_seen = previous_seen
         result = last_values or dict(state)

@@ -1,4 +1,4 @@
-"""Internal FastAPI routes for per-user LightRAG document management."""
+"""Internal FastAPI routes for per-user hybrid RAG document management."""
 
 from __future__ import annotations
 
@@ -7,10 +7,10 @@ from typing import Any
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
 
 from superassist.config import Settings
-from superassist.rag.service import LightRAGService
+from superassist.rag.service import HybridRAGService
 
 
-def register_rag_routes(app: FastAPI, service: LightRAGService, settings: Settings) -> None:
+def register_rag_routes(app: FastAPI, service: HybridRAGService, settings: Settings) -> None:
     @app.get("/internal/rag/graph")
     def get_rag_graph(user_id: str = Query(...)) -> dict[str, Any]:
         return service.graph_payload(user_id)

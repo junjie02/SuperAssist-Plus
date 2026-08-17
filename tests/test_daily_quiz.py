@@ -5,10 +5,13 @@ import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from superassist.channels.daily_quiz import DailyQuizScheduler, DailyQuizStore, make_daily_quiz_tool
 from superassist.channels.store import FeishuThreadStore
 from superassist.config import Settings
 from superassist.teams.context import team_thread_context
+from superassist.tools.files import read_file, write_file
 
 
 def _settings(tmp_path, **values) -> Settings:
@@ -101,23 +104,24 @@ def test_batch_grading_updates_wrongbook_and_correct_review_marks_mastered(tmp_p
     store.archive_brief("chat_1", now, "今日政策部署")
     _prepare(store, now)
 
-    prompt = store.build_grading_prompt("thread_1", ["B", "C"])
+    prompt = store.build_grading_prompt("thread_1", ["A", "C"])
     assert "<DailyPoliticalQuizGrading>" in prompt
-    assert '"selected_option": "B"' in prompt
+    assert '"selected_option": "A"' in prompt
     assert '"correct_option": "B"' in prompt
-    assert "程序不会比较答案" in prompt
+    assert '"is_correct": false' in prompt
+    assert "程序已经按保存的标准答案确定正误和分数" in prompt
     result = store.save_grading(
         "thread_1",
         [
             {
                 "number": 1,
-                "is_correct": False,
+                "is_correct": True,
                 "feedback": "主 Agent 判断该题理解不完整，应结合系统治理的完整含义作答。",
                 "weakness": "系统治理概念掌握不完整",
             },
             {
                 "number": 2,
-                "is_correct": True,
+                "is_correct": False,
                 "feedback": "主 Agent 判断该题作答正确，能够识别多主体和全过程统筹。",
                 "weakness": "",
             },
@@ -131,9 +135,11 @@ def test_batch_grading_updates_wrongbook_and_correct_review_marks_mastered(tmp_p
     assert wrong_data["items"][0]["wrong_count"] == 1
     session_path = next((settings.daily_quiz_data_dir / "sessions").glob("*.json"))
     completed = json.loads(session_path.read_text(encoding="utf-8"))
-    assert completed["results"][0]["selected_option"] == completed["results"][0]["correct_option"] == "B"
+    assert completed["results"][0]["selected_option"] == "A"
+    assert completed["results"][0]["correct_option"] == "B"
     assert completed["results"][0]["is_correct"] is False
-    assert completed["results"][0]["graded_by"] == "main_agent"
+    assert completed["results"][1]["is_correct"] is True
+    assert completed["results"][0]["graded_by"] == "deterministic_answer_key"
 
     _prepare(store, now + timedelta(days=1), wrong_id=wrong_id)
     assert store.build_grading_prompt("thread_1", ["B", "C"])
@@ -253,6 +259,38 @@ def test_main_agent_tool_loads_grading_context_from_an_ordinary_answer_turn(tmp_
     assert "grading_context" in schema["properties"]["action"]["enum"]
 
 
+def test_current_quiz_resources_are_thread_scoped_read_only_and_private_after_submission(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = _settings(tmp_path)
+    store = DailyQuizStore(settings)
+    _prepare(store, datetime.now(ZoneInfo("Asia/Shanghai")))
+    monkeypatch.setattr("superassist.tools.files.get_settings", lambda: settings)
+    current_dir = settings.daily_quiz_data_dir / "current"
+    for path in current_dir.glob("*"):
+        path.unlink()
+
+    with team_thread_context("thread_1"):
+        public = read_file.invoke({"path": "quiz://current/public"})
+        assert "第 1 题" in public
+        assert "正确答案" not in public
+        assert list(current_dir.glob("*.public.md"))
+        with pytest.raises(PermissionError, match="complete answer sheet"):
+            read_file.invoke({"path": "quiz://current/private"})
+        with pytest.raises(PermissionError, match="read-only"):
+            write_file.invoke({"path": "quiz://current/public", "content": "replace"})
+
+        assert store.build_grading_prompt("thread_1", ["A", "C"])
+        private = json.loads(read_file.invoke({"path": "quiz://current/private"}))
+        assert private["questions"][0]["correct_option"] == "B"
+        assert private["submitted_answers"] == ["A", "C"]
+
+    with team_thread_context("thread_2"):
+        with pytest.raises(FileNotFoundError, match="No quiz"):
+            read_file.invoke({"path": "quiz://current/public"})
+
+
 def test_ten_question_set_requires_exact_count_and_review_before_activation(tmp_path) -> None:
     settings = _settings(tmp_path, SUPERASSIST_DAILY_QUIZ_QUESTION_COUNT=10)
     store = DailyQuizStore(settings)
@@ -300,3 +338,15 @@ def test_scheduler_deduplicates_1700_slot(tmp_path) -> None:
     assert first == ["started"]
     assert second == []
     assert calls == [("chat_1", scheduled)]
+
+
+def test_quiz_scheduler_and_main_agent_context_have_independent_switches(tmp_path) -> None:
+    settings = _settings(
+        tmp_path,
+        SUPERASSIST_DAILY_QUIZ_ENABLED=False,
+        SUPERASSIST_DAILY_QUIZ_SCHEDULER_ENABLED=False,
+        SUPERASSIST_DAILY_QUIZ_CONTEXT_ENABLED=True,
+    )
+
+    assert settings.resolved_daily_quiz_scheduler_enabled is False
+    assert settings.daily_quiz_context_enabled is True

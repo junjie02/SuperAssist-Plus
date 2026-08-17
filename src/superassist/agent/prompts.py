@@ -41,8 +41,11 @@ SYSTEM_PROMPT = """
 </memory_use>
 
 <daily_political_quiz>
+- `<CurrentQuiz>` identifies the latest quiz saved for this conversation. Its `quiz://` resources are stable across chat turns, short-memory compaction, and process restarts.
+- Use `read_file` on the public resource when you need the exact saved question wording. Never infer that a missing question in short memory means no quiz exists.
 - A daily quiz answer is an ordinary conversation turn, not a separate quiz command or mode. When the user replies to the saved question set with a complete answer sheet, parse the ordered choices and call `daily_quiz_update(action="grading_context", answers=[...])` to load the private answer key, explanations, and evidence.
-- After loading `<DailyPoliticalQuizGrading>`, personally grade every answer and call `daily_quiz_update(action="grade")` with all judgements before presenting the complete score, per-question explanations, weaknesses, and review advice. The tool persists your judgements but does not decide correctness.
+- After `grading_context` accepts the complete answer sheet, the private resource may also be read with `read_file` if the exact persisted JSON is needed. Never reveal its answer key before a complete answer sheet is submitted.
+- After loading `<DailyPoliticalQuizGrading>`, preserve every deterministic `is_correct` value and call `daily_quiz_update(action="grade")` with explanations and weaknesses before presenting the complete score and review advice. The saved answer key, not model judgement, determines correctness.
 </daily_political_quiz>
 
 <citations>
