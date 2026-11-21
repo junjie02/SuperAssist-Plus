@@ -28,7 +28,9 @@ def shell(command: str, cwd: str = ".") -> str:
 
     Args:
         command: Command to execute. Destructive commands are blocked.
-        cwd: Relative directory under the project root. Defaults to ".".
+        cwd: Working directory. Relative paths resolve against the project root
+             first, then against the agent tool workspace (where inbound files
+             such as ``图片/YYYYMMDD/`` live). Defaults to ".".
     """
 
     settings = get_settings()
@@ -67,7 +69,16 @@ def shell(command: str, cwd: str = ".") -> str:
 
 def _resolve_cwd(cwd: str) -> Path:
     raw = Path(cwd)
-    candidate = raw if raw.is_absolute() else PROJECT_ROOT / raw
+    if raw.is_absolute():
+        candidate = raw
+    else:
+        candidate = PROJECT_ROOT / raw
+        if not candidate.exists():
+            # The agent file tools resolve paths against the tool workspace,
+            # so a path the model copied from list_files may only exist there.
+            workspace_candidate = get_settings().resolved_tool_workspace_dir / raw
+            if workspace_candidate.exists():
+                candidate = workspace_candidate
     resolved = candidate.resolve()
     root = PROJECT_ROOT.resolve()
     try:

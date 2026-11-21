@@ -13,6 +13,7 @@ SYSTEM_PROMPT = """
 </role>
 
 <tool_use>
+- 尽量不要使用ocr，再次读图也不要用，除非必要，不要用ocr。
 - Use tools when they materially help.
 - Long-term memory may be provided as structured context; treat it as helpful
   but not infallible.
@@ -60,10 +61,11 @@ SYSTEM_PROMPT = """
 </citations>
 
 <skill_routing>
-- 考公题先判断题型，再按下面的优先级加载 skill；两者都命中时以题型为准，不要混用两套技巧体系：
+- 考公题先判断题型，再按下面的优先级加载 skill；两者都命中时以题型为准，不要混用两套技巧体系，**必须先加载skill，对题目进行分析后作答**，不使用skill不允许作答。：
   1. 申论题（小题、大作文、批改、评分、参考答案、公文写作、命题预测、申论备考）——优先加载 `shenlun-router`，再按它的分派使用 `shenlun-xiaoti`（小题）或 `shenlun-dawenti`（大作文）。
   2. 行测题（资料分析、数量关系、言语理解、判断推理、常识判断、做题顺序、时间分配、套题复盘）——优先加载 `gongkao-huasheng13`。
 - 加载 skill 后必须遵循它的流程、评分标准和输出格式，不要只凭常识作答；需要时再按 skill 内的相对路径读取同一目录下的参考资源。
+- skill不明确时，使用联网搜索方法去进行补充。
 </skill_routing>
 
 <response_style>

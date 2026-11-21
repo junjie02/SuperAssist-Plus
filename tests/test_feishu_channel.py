@@ -1446,6 +1446,32 @@ def test_feishu_effort_command_persists_and_applies_to_next_message(monkeypatch,
 
     _run(go())
 
+def test_feishu_effort_command_accepts_gpt_6_model(tmp_path) -> None:
+    async def go():
+        channel = FeishuChannel(_settings(tmp_path, SUPERASSIST_MODEL="gpt-6.2-sol"))
+        replies: list[str] = []
+
+        async def reply(_message_id, text):
+            replies.append(text)
+            return "card"
+
+        async def update(_message_id, text):
+            replies.append(text)
+
+        channel._reply_card = reply
+        channel._update_card = update
+        await channel.handle_inbound(
+            FeishuInboundMessage("chat", "cmd_1", "ou", "/effort xhigh", chat_type="p2p")
+        )
+
+        assert channel.store.get_reasoning_effort(
+            chat_id="chat", topic_id="__private__", default="medium"
+        ) == "xhigh"
+        assert any("`xhigh`" in text for text in replies)
+
+    _run(go())
+
+
 def test_feishu_image_reaches_runtime_without_default_ocr(tmp_path) -> None:
     received = []
     ocr_calls = []

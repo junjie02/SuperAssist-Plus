@@ -36,7 +36,7 @@ from superassist.conversation_state import (
     conversation_state_lock,
     parse_clear_command,
 )
-from superassist.llm import is_gpt_5_6_model
+from superassist.llm import supports_reasoning_effort
 from superassist.memory.embedding import get_embedder
 from superassist.models import AgentRunEvent
 from superassist.redis_store import get_redis_store
@@ -79,9 +79,10 @@ SUPPORTED_MODEL_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/gif", "ima
 MULTIMODAL_RESPONSE_INSTRUCTIONS = """<MultimodalResponseInstructions>
 Inspect the original image(s) in this message and answer the user's request using the visual evidence directly.
 The original pixels are supplied to you; do not claim the image was lost or that you only saw transcribed text.
-If the text is too small, the page is rotated, or you need exact wording, call the `ocr_image` tool with a
-workspace-relative path (inbound images are saved under 图片/YYYYMMDD/; use list_files to discover them) and
-verify the returned text against the image.
+If the text is too small to read reliably, or you must quote exact wording, call the `ocr_image` tool with the
+workspace-relative path printed next to that image (inbound images live under 图片/YYYYMMDD/) and verify the returned
+text against the image. Only OCR images attached to this message; never OCR other files found on disk, and skip the
+tool entirely when you can already read the question, options and labels yourself.
 Images may carry EXIF orientation metadata; trust what you actually see rather than assuming a rotation.
 When the answer depends on an option letter, number, or ordering, verify the reasoning first and then separately
 map it back to the exact visible label in the image.
@@ -897,8 +898,11 @@ class FeishuChannel:
                 )
             elif requested_effort not in REASONING_EFFORTS:
                 response = f"不支持 `{requested_effort}`。可选值：`{'`, `'.join(REASONING_EFFORTS)}`。"
-            elif not is_gpt_5_6_model(self.settings.model):
-                response = f"当前模型 `{self.settings.model}` 不支持此处的 GPT-5.6 推理强度设置。"
+            elif not supports_reasoning_effort(self.settings.model, self.settings.reasoning_model_prefixes):
+                response = (
+                    f"当前模型 `{self.settings.model}` 未列入可调思考强度的模型清单"
+                    f"（`SUPERASSIST_REASONING_MODELS`）。"
+                )
             else:
                 self.store.set_reasoning_effort(
                     chat_id=inbound.chat_id,

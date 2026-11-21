@@ -146,7 +146,8 @@
 | `api_key` | `SUPERASSIST_API_KEY` | `""` | **空字符串** → `FallbackChatModel`（确定性本地回声）。 |
 | `base_url` | `SUPERASSIST_BASE_URL` | `https://api.openai.com/v1` | 可指向兼容 OpenAI 协议的网关。 |
 | `temperature` | `SUPERASSIST_TEMPERATURE` | `None` | 模型名含 `minimax` 且未显式设置时强制为 `1.0`。 |
-| `reasoning_effort` | `SUPERASSIST_REASONING_EFFORT` | `medium` | GPT-5.6 支持 `none/low/medium/high/xhigh/max`；飞书 `/effort` 可按会话覆盖。 |
+| `reasoning_effort` | `SUPERASSIST_REASONING_EFFORT` | `medium` | 支持 `none/low/medium/high/xhigh/max`；仅对 `reasoning_models` 命中的模型下发，飞书 `/effort` 可按会话覆盖。 |
+| `reasoning_models` | `SUPERASSIST_REASONING_MODELS` | `gpt-5.6,gpt-6` | 逗号分隔的模型名前缀白名单；命中时按 `reasoning_effort` 下发 `reasoning`（Responses）或 `reasoning_effort`（Chat Completions），未命中不下发思考参数。 |
 | `max_tokens` | `SUPERASSIST_MAX_TOKENS` | `None` | 仅当非 None 才透传。 |
 | `claude_fallback_*` | `SUPERASSIST_CLAUDE_FALLBACK_*` | `claude-opus-5` / 空 key | 配置 key 与 OpenAI-compatible `/v1` 地址后成为第二 lead route，并遵循全局 Responses 开关。 |
 | `deepseek_fallback_*` | `SUPERASSIST_DEEPSEEK_FALLBACK_*` | `deepseek-v4-flash` / 空 key | 配置独立 key/base URL 后成为第三 lead route；不隐式复用 Memory 凭据。 |

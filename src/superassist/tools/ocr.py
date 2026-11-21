@@ -12,9 +12,10 @@ tool is actually called, never on every inbound image.
 
 from __future__ import annotations
 
-import asyncio
 import io
+import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,7 @@ class OCRCandidate:
 
 _thread_local = threading.local()
 _initialization_lock = threading.Lock()
+_orientation_pool: ThreadPoolExecutor | None = None
 
 
 def _get_engine() -> Any:
@@ -60,9 +62,16 @@ def _get_engine() -> Any:
     with _initialization_lock:
         from rapidocr_onnxruntime import RapidOCR
 
-        engine = RapidOCR()
+        # One session per rotation runs at the same time; cap each session so
+        # four concurrent sessions do not oversubscribe the CPU.
+        engine = RapidOCR(intra_op_num_threads=_session_threads())
     _thread_local.engine = engine
     return engine
+
+
+def _session_threads() -> int:
+    cpus = os.cpu_count() or 4
+    return max(1, cpus // len(OCR_ORIENTATION_ANGLES))
 
 
 def _safe_confidence(value: Any) -> float:
@@ -149,16 +158,39 @@ def select_orientation(candidates: list[OCRCandidate]) -> OCRCandidate | None:
     return best
 
 
+def _candidate_with_local_engine(image: Image.Image, angle: int) -> OCRCandidate:
+    # The RapidOCR engine is thread-local, so each worker builds its own once.
+    return _candidate(_get_engine(), image, angle)
+
+
+def _get_orientation_pool() -> ThreadPoolExecutor:
+    """Long-lived pool so worker threads keep their warm OCR engines."""
+    global _orientation_pool
+    if _orientation_pool is None:
+        with _initialization_lock:
+            if _orientation_pool is None:
+                _orientation_pool = ThreadPoolExecutor(
+                    max_workers=len(OCR_ORIENTATION_ANGLES),
+                    thread_name_prefix="ocr-angle",
+                )
+    return _orientation_pool
+
+
+def orientation_candidates(image: Image.Image) -> list[OCRCandidate]:
+    """OCR all four rotations concurrently; order stays 0/90/180/270."""
+    pool = _get_orientation_pool()
+    return list(
+        pool.map(lambda angle: _candidate_with_local_engine(image, angle), OCR_ORIENTATION_ANGLES)
+    )
+
+
 def _ocr_sync(path: Path, detect_orientation: bool) -> str:
-    engine = _get_engine()
     with Image.open(path) as raw:
         image = ImageOps.exif_transpose(raw).convert("RGB")
     if detect_orientation:
-        candidates = [_candidate(engine, image, angle) for angle in OCR_ORIENTATION_ANGLES]
-        selected = select_orientation(candidates)
+        selected = select_orientation(orientation_candidates(image))
     else:
-        candidates = [_candidate(engine, image, 0)]
-        selected = candidates[0]
+        selected = _candidate(_get_engine(), image, 0)
     text = "\n".join(selected.lines).strip() if selected is not None else ""
     max_chars = get_settings().feishu_image_ocr_max_chars
     if max_chars > 0:
@@ -170,7 +202,7 @@ def _ocr_sync(path: Path, detect_orientation: bool) -> str:
 
 
 @tool("ocr_image")
-async def ocr_image(path: str, detect_orientation: bool = True) -> str:
+def ocr_image(path: str, detect_orientation: bool = True) -> str:
     """Extract text from an image stored in the tool workspace.
 
     Only call this when a transcription is genuinely useful — for example tiny
@@ -179,9 +211,11 @@ async def ocr_image(path: str, detect_orientation: bool = True) -> str:
 
     Args:
         path: Workspace-relative image path, e.g. ``图片/20261121/abc123.jpg``.
-              Use list_files to discover available images.
-        detect_orientation: Try 0/90/180/270 degrees and keep the best reading.
-                            Disable it for a faster pass when the image is upright.
+              The path is printed next to each attached image; do not OCR
+              unrelated files that merely happen to sit in the same folder.
+        detect_orientation: OCR 0/90/180/270 degrees in parallel and keep the
+                            best reading. Disable it for a single fast pass on
+                            an image you know is upright.
     """
     try:
         resolved = _resolve_workspace_path(path)
@@ -190,6 +224,6 @@ async def ocr_image(path: str, detect_orientation: bool = True) -> str:
     if not resolved.is_file():
         return f"OCR failed: image not found in tool workspace: {path}"
     try:
-        return await asyncio.to_thread(_ocr_sync, resolved, bool(detect_orientation))
+        return _ocr_sync(resolved, bool(detect_orientation))
     except Exception as exc:  # noqa: BLE001 - tool must degrade, never crash the turn
         return f"OCR failed: {type(exc).__name__}: {exc}"

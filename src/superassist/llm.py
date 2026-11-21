@@ -336,7 +336,7 @@ def create_chat_model(settings: Settings | None = None) -> BaseChatModel:
     if settings.use_responses_api:
         # Preserve the full multimodal turn across tool-loop requests.
         kwargs["use_previous_response_id"] = False
-    if is_gpt_5_6_model(settings.model) and settings.use_responses_api:
+    if supports_reasoning_effort(settings.model, settings.reasoning_model_prefixes) and settings.use_responses_api:
         reasoning: dict[str, str] = {"effort": settings.reasoning_effort}
         if settings.reasoning_effort != "none":
             reasoning["summary"] = "detailed"
@@ -345,7 +345,7 @@ def create_chat_model(settings: Settings | None = None) -> BaseChatModel:
                 "reasoning": reasoning,
             }
         )
-    elif is_gpt_5_6_model(settings.model):
+    elif supports_reasoning_effort(settings.model, settings.reasoning_model_prefixes):
         kwargs.update(
             {
                 "use_responses_api": False,
@@ -462,7 +462,13 @@ def is_qwen_model(model: str, base_url: str = "") -> bool:
 
 
 def is_gpt_5_6_model(model: str) -> bool:
-    return model.lower().startswith("gpt-5.6")
+    return supports_reasoning_effort(model, ("gpt-5.6",))
+
+
+def supports_reasoning_effort(model: str, prefixes: tuple[str, ...] | list[str]) -> bool:
+    """Whether the model name accepts OpenAI-style reasoning parameters."""
+    name = model.lower()
+    return any(name.startswith(prefix.lower()) for prefix in prefixes if prefix)
 
 
 def _should_failover(exc: Exception) -> bool:

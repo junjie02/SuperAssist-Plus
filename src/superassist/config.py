@@ -31,6 +31,13 @@ class Settings(BaseSettings):
     max_tokens: int | None = Field(default=None, alias="SUPERASSIST_MAX_TOKENS")
     model_timeout_seconds: int = Field(default=60, ge=10, le=600, alias="SUPERASSIST_MODEL_TIMEOUT_SECONDS")
     reasoning_effort: ReasoningEffort = Field(default="medium", alias="SUPERASSIST_REASONING_EFFORT")
+    # Comma-separated model prefixes that accept OpenAI-style reasoning
+    # parameters. Anything else is sent without a reasoning block so gateways
+    # that reject the field keep working.
+    reasoning_models: str = Field(
+        default="gpt-5.6,gpt-6",
+        alias="SUPERASSIST_REASONING_MODELS",
+    )
     use_responses_api: bool = Field(default=True, alias="SUPERASSIST_USE_RESPONSES_API")
     # Qwen-compatible gateways expose thinking through extra_body rather than
     # the OpenAI Responses reasoning field. None preserves provider defaults.
@@ -388,6 +395,15 @@ class Settings(BaseSettings):
     @property
     def db_path(self) -> Path:
         return self.data_dir / "superassist.sqlite3"
+
+    @property
+    def reasoning_model_prefixes(self) -> tuple[str, ...]:
+        """Model-name prefixes allowed to receive reasoning parameters."""
+        return tuple(
+            prefix.strip().lower()
+            for prefix in self.reasoning_models.split(",")
+            if prefix.strip()
+        )
 
     @property
     def resolved_tool_workspace_dir(self) -> Path:

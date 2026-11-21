@@ -6,6 +6,7 @@ from superassist.config import Settings
 from superassist.tools import default_tools
 from superassist.tools import web as web_module
 from superassist.tools.files import delete_path, list_files, read_file, write_file
+from superassist.tools.ocr import ocr_image
 from superassist.tools.shell import shell
 from superassist.tools.web import official_media_web_scope, web_fetch, web_search
 
@@ -220,3 +221,55 @@ def test_shell_tool_blocks_destructive_commands(tmp_path: Path, monkeypatch) -> 
     result = shell.invoke({"command": "Remove-Item . -Recurse -Force"})
 
     assert "blocked" in result
+
+
+def test_ocr_tool_supports_sync_invocation(tmp_path: Path, monkeypatch) -> None:
+    """The agent graph invokes tools synchronously; async tools silently fail."""
+    settings = Settings(
+        SUPERASSIST_DATA_DIR=tmp_path / "data",
+        SUPERASSIST_EMBEDDING_PROVIDER="hash",
+    )
+    monkeypatch.setattr("superassist.tools.files.get_settings", lambda: settings)
+    monkeypatch.setattr("superassist.tools.ocr.get_settings", lambda: settings)
+
+    result = ocr_image.invoke({"path": "图片/20260101/missing.jpg"})
+
+    assert "not found" in result
+
+
+def test_shell_cwd_falls_back_to_tool_workspace(tmp_path: Path, monkeypatch) -> None:
+    settings = Settings(
+        SUPERASSIST_DATA_DIR=tmp_path / "data",
+        SUPERASSIST_TOOL_SHELL_ENABLED=True,
+        SUPERASSIST_EMBEDDING_PROVIDER="hash",
+    )
+    workspace_dir = settings.resolved_tool_workspace_dir / "probe_workspace_dir"
+    workspace_dir.mkdir(parents=True)
+    monkeypatch.setattr("superassist.tools.shell.get_settings", lambda: settings)
+
+    result = shell.invoke({"command": "Write-Output hello", "cwd": "probe_workspace_dir"})
+
+    assert "hello" in result
+    assert "does not exist" not in result
+
+
+def test_orientation_candidates_run_all_angles_in_worker_threads(monkeypatch) -> None:
+    import threading
+
+    from PIL import Image
+
+    from superassist.tools.ocr import OCRCandidate, orientation_candidates
+
+    seen: list[tuple[int, str]] = []
+
+    def fake_candidate(_engine, _image, angle):
+        seen.append((angle, threading.current_thread().name))
+        return OCRCandidate(angle=angle, lines=(f"angle-{angle}",), character_count=8, average_confidence=0.9)
+
+    monkeypatch.setattr("superassist.tools.ocr._candidate", fake_candidate)
+    monkeypatch.setattr("superassist.tools.ocr._get_engine", lambda: object())
+
+    candidates = orientation_candidates(Image.new("RGB", (8, 8)))
+
+    assert [candidate.angle for candidate in candidates] == [0, 90, 180, 270]
+    assert all(name.startswith("ocr-angle") for _, name in seen)

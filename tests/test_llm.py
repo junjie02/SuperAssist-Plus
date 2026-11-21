@@ -19,6 +19,7 @@ from superassist.llm import (
     create_chat_model,
     create_memory_model,
     is_minimax_model,
+    supports_reasoning_effort,
 )
 
 
@@ -275,6 +276,44 @@ def test_gpt_5_6_none_effort_does_not_request_reasoning_summary() -> None:
     payload = model._get_request_payload([HumanMessage(content="hello")])
 
     assert payload["reasoning"] == {"effort": "none"}
+
+
+def test_gpt_6_model_receives_reasoning_from_default_prefix_list() -> None:
+    settings = Settings(
+        SUPERASSIST_MODEL="gpt-6.2-sol",
+        SUPERASSIST_API_KEY="secret",
+        SUPERASSIST_REASONING_EFFORT="high",
+        SUPERASSIST_USE_RESPONSES_API=True,
+    )
+
+    model = create_chat_model(settings)
+    payload = model._get_request_payload([HumanMessage(content="hello")])
+
+    assert payload["reasoning"] == {"effort": "high", "summary": "detailed"}
+
+
+def test_reasoning_prefix_list_is_configurable() -> None:
+    allowed = Settings(SUPERASSIST_REASONING_MODELS="gpt-5.6,gpt-6.2")
+    blocked = Settings(SUPERASSIST_REASONING_MODELS="gpt-5.6")
+
+    assert allowed.reasoning_model_prefixes == ("gpt-5.6", "gpt-6.2")
+    assert supports_reasoning_effort("gpt-6.2-sol", allowed.reasoning_model_prefixes) is True
+    assert supports_reasoning_effort("gpt-6.2-sol", blocked.reasoning_model_prefixes) is False
+
+
+def test_model_outside_reasoning_prefix_list_skips_reasoning() -> None:
+    settings = Settings(
+        SUPERASSIST_MODEL="claude-opus-5",
+        SUPERASSIST_API_KEY="secret",
+        SUPERASSIST_REASONING_EFFORT="high",
+        SUPERASSIST_USE_RESPONSES_API=True,
+    )
+
+    model = create_chat_model(settings)
+    payload = model._get_request_payload([HumanMessage(content="hello")])
+
+    assert "reasoning" not in payload
+    assert "reasoning_effort" not in payload
 
 
 def test_gpt_5_6_can_use_chat_completions_for_compatible_gateways() -> None:
