@@ -87,7 +87,9 @@ class DynamicContextMiddleware(AgentMiddleware[SuperAssistState]):
                     json.dumps(quiz_context, ensure_ascii=False, separators=(",", ":")),
                     "The public resource is always read-only. The private resource contains the answer key and is",
                     "readable only after a complete answer sheet has been submitted for this quiz.",
-                    "Use read_file with the listed resource when the exact saved question set is needed.",
+                    "The wrongbook resource is always read-only and contains prior graded mistakes and mastery status.",
+                    "Use daily_quiz_update action=wrongbook_add to proactively record a clearly established mistake outside the normal quiz grading flow.",
+                    "Use read_file with the listed resource when the exact saved question set or wrongbook is needed.",
                     "</CurrentQuiz>",
                 ]
             )

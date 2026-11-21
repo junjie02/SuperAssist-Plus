@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import ClassVar
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage
@@ -17,7 +18,7 @@ from superassist.middlewares.rag_retrieval_middleware import RagRetrievalMiddlew
 from superassist.rag.chunking import chunk_document, lexical_terms
 from superassist.rag.context import RagRetrievalResult, RagTurnSession, rag_turn_context
 from superassist.rag.documents import extract_document, safe_filename
-from superassist.rag.service import HybridRAGService, _rrf_fuse
+from superassist.rag.service import HybridRAGService, _rerank_fused_candidates, _rrf_fuse
 from superassist.ui.rag import register_rag_routes
 
 _ = AgentRuntime  # Initialize the agent package before importing middleware modules directly.
@@ -89,6 +90,48 @@ def test_rrf_fusion_preserves_dense_and_bm25_ranks() -> None:
     assert fused[0][0] == "both"
     assert fused[0][2:] == (2, 1)
     assert {item[0] for item in fused} == {"dense-only", "both", "bm25-only"}
+
+
+def test_cross_encoder_reranking_reorders_rrf_candidates_and_preserves_scores() -> None:
+    class FakeReranker:
+        def score(self, query: str, documents: list[str]) -> list[float]:
+            assert query == "relevant policy"
+            assert documents == ["doc-a\nA\nfirst", "doc-b\nB\nsecond"]
+            return [0.1, 0.9]
+
+    fused = [("a", 0.02, 1, 2), ("b", 0.01, 2, 1)]
+    rows = {
+        "a": {"document_name": "doc-a", "heading": "A", "text": "first"},
+        "b": {"document_name": "doc-b", "heading": "B", "text": "second"},
+    }
+
+    ranked, scores = _rerank_fused_candidates("relevant policy", fused, rows, FakeReranker())
+
+    assert [item[0] for item in ranked] == ["b", "a"]
+    assert ranked[0][1:] == fused[1][1:]
+    assert scores == {"a": 0.1, "b": 0.9}
+
+
+def test_cross_encoder_input_does_not_duplicate_evaluation_metadata() -> None:
+    class FakeReranker:
+        def score(self, query: str, documents: list[str]) -> list[float]:
+            assert documents == ["SciFact title\nAbstract text"]
+            return [0.5]
+
+    ranked, _scores = _rerank_fused_candidates(
+        "claim",
+        [("31715818", 0.01, 1, 1)],
+        {
+            "31715818": {
+                "document_name": "31715818",
+                "heading": "SciFact title",
+                "text": "SciFact title\nAbstract text",
+            }
+        },
+        FakeReranker(),
+    )
+
+    assert ranked[0][0] == "31715818"
 
 
 def test_rag_turn_session_deduplicates_and_stops_after_stagnation() -> None:
@@ -212,6 +255,108 @@ def test_hybrid_service_indexes_and_returns_only_original_chunks(tmp_path: Path)
         assert result.hits[0]["bm25_rank"] is not None
     finally:
         service.close()
+
+
+def test_hybrid_service_runs_dense_and_bm25_searches_in_parallel(tmp_path: Path, monkeypatch) -> None:
+    settings = Settings(
+        _env_file=None,
+        SUPERASSIST_DATA_DIR=tmp_path,
+        SUPERASSIST_EMBEDDING_PROVIDER="hash",
+        SUPERASSIST_RAG_CHUNK_TOP_K=2,
+    )
+    service = HybridRAGService(settings)
+    user_id = "user-a"
+    service._write_manifest(
+        user_id,
+        [{"id": "doc", "name": "doc", "status": "ready", "created_at": "", "updated_at": ""}],
+    )
+    dense_started = threading.Event()
+    sparse_started = threading.Event()
+    worker_names: set[str] = set()
+
+    def dense_search(*_args):
+        worker_names.add(threading.current_thread().name)
+        dense_started.set()
+        assert sparse_started.wait(1)
+        return [("dense", 0.9)]
+
+    def sparse_search(*_args):
+        worker_names.add(threading.current_thread().name)
+        sparse_started.set()
+        assert dense_started.wait(1)
+        return [("sparse", 1.0)]
+
+    rows = [
+        {
+            "id": chunk_id,
+            "document_id": "doc",
+            "document_name": "doc",
+            "ordinal": 0,
+            "heading": "",
+            "text": chunk_id,
+            "content_hash": chunk_id,
+        }
+        for chunk_id in ("dense", "sparse")
+    ]
+    monkeypatch.setattr(service, "_dense_search", dense_search)
+    monkeypatch.setattr(service, "_bm25_search", sparse_search)
+    monkeypatch.setattr(service, "_load_chunks", lambda *_args: rows)
+
+    try:
+        result = service.retrieve(user_id, "target", "hybrid")
+    finally:
+        service.close()
+
+    assert result.success
+    assert dense_started.is_set() and sparse_started.is_set()
+    assert len(worker_names) == 2
+
+
+def test_hybrid_service_applies_configured_cross_encoder_reranker(tmp_path: Path, monkeypatch) -> None:
+    class FakeReranker:
+        def score(self, query: str, documents: list[str]) -> list[float]:
+            assert query == "target"
+            assert len(documents) == 2
+            return [0.1, 0.9]
+
+    settings = Settings(
+        _env_file=None,
+        SUPERASSIST_DATA_DIR=tmp_path,
+        SUPERASSIST_EMBEDDING_PROVIDER="hash",
+        SUPERASSIST_RAG_CHUNK_TOP_K=2,
+        SUPERASSIST_RAG_RERANKER_ENABLED=True,
+        SUPERASSIST_RAG_RERANKER_CANDIDATE_TOP_K=2,
+    )
+    service = HybridRAGService(settings, reranker=FakeReranker())
+    user_id = "user-a"
+    service._write_manifest(
+        user_id,
+        [{"id": "doc", "name": "doc", "status": "ready", "created_at": "", "updated_at": ""}],
+    )
+    service._ensure_store(user_id)
+    with service._connect(user_id) as connection:
+        for chunk_id, text in (("a", "first"), ("b", "target second")):
+            connection.execute(
+                """
+                INSERT INTO chunks (
+                    id, document_id, document_name, ordinal, parent_id, heading,
+                    text, token_count, content_hash, embedding, embedding_dim
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (chunk_id, "doc", f"doc-{chunk_id}", 0, "", "", text, 2, chunk_id, b"x", 1),
+            )
+        connection.commit()
+    monkeypatch.setattr(service, "_dense_search", lambda *_args: [("a", 0.9), ("b", 0.8)])
+    monkeypatch.setattr(service, "_bm25_search", lambda *_args: [("a", 1.0), ("b", 0.5)])
+
+    try:
+        result = service.retrieve(user_id, "target", "hybrid")
+    finally:
+        service.close()
+
+    assert [hit["chunk_id"] for hit in result.hits] == ["b", "a"]
+    assert result.hits[0]["reranker_score"] == pytest.approx(0.9)
+    assert result.hits[0]["dense_rank"] == 2
 
 
 class FakeDocumentService:

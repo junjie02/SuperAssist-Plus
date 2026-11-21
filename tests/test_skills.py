@@ -197,3 +197,30 @@ def test_newly_loaded_skill_is_not_duplicated_in_same_turn_context() -> None:
 
     assert "<ActiveSkills>" not in content
     assert '<skill name="deep-research">' not in content
+
+
+def test_shenlun_skills_are_discovered_with_multiline_descriptions() -> None:
+    by_name = {skill.name: skill for skill in list_public_skills()}
+
+    for name in ("shenlun-router", "shenlun-xiaoti", "shenlun-dawenti"):
+        skill = by_name[name]
+        assert "申论" in skill.description
+        assert len(skill.description) > 40  # YAML `>` block was parsed, not left as ">"
+        assert skill.virtual_file_path == f"/mnt/skills/public/{name}/SKILL.md"
+
+
+def test_shenlun_shared_reference_is_readable_by_virtual_path() -> None:
+    content = read_file.invoke(
+        {"path": "/mnt/skills/public/shared/references/image-reading-rules.md"}
+    )
+
+    assert content.strip()
+
+
+def test_system_prompt_routes_shenlun_and_xingce() -> None:
+    from superassist.agent.prompts import SYSTEM_PROMPT
+
+    assert "shenlun-router" in SYSTEM_PROMPT
+    assert "gongkao-huasheng13" in SYSTEM_PROMPT
+    assert "申论题" in SYSTEM_PROMPT
+    assert "行测题" in SYSTEM_PROMPT

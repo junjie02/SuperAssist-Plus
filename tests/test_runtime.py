@@ -1,5 +1,7 @@
 import json
+import time
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 from langchain.agents.middleware import ModelRequest
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
@@ -16,7 +18,12 @@ from superassist.agent.short_memory import (
     turn_records,
 )
 from superassist.config import PROJECT_ROOT, Settings
-from superassist.llm import FallbackChatModel, MiniMaxCompatibleChatModel, create_chat_model
+from superassist.llm import (
+    FallbackChatModel,
+    MiniMaxCompatibleChatModel,
+    ModelFailoverRestart,
+    create_chat_model,
+)
 from superassist.memory.service import project_memory_recall, project_memory_write_context
 from superassist.middlewares import (
     DynamicContextMiddleware,
@@ -512,6 +519,70 @@ def test_runtime_reports_coarse_run_events(tmp_path) -> None:
     assert all(event.metadata["thread_id"] == "t" for event in events)
 
 
+def test_runtime_clear_bypasses_agent_and_resets_short_state(tmp_path, monkeypatch) -> None:
+    events = []
+    settings = Settings(
+        SUPERASSIST_DATA_DIR=tmp_path,
+        SUPERASSIST_API_KEY="",
+        SUPERASSIST_EMBEDDING_PROVIDER="hash",
+    )
+    thread_dir = tmp_path / "threads" / "t"
+    thread_dir.mkdir(parents=True)
+    (thread_dir / "messages.jsonl").write_text('{"role":"user","content":"old"}\n', encoding="utf-8")
+    (thread_dir / "thread_meta.json").write_text(
+        json.dumps(
+            {
+                "user_id": "u",
+                "summary": "old summary",
+                "loaded_skills": ["deep-research"],
+                "skill_activations": {"deep-research": time.time()},
+            }
+        ),
+        encoding="utf-8",
+    )
+    runtime = AgentRuntime(settings, run_event_reporter=events.append)
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("agent must not run for /clear")
+
+    monkeypatch.setattr(runtime.agent, "stream", fail_if_called)
+    result = runtime.run_streaming(" /CLEAR ", user_id="u", thread_id="t")
+
+    state = runtime._initial_state("next", user_id="u", thread_id="t")
+    assert result.metadata["cleared"] is True
+    assert result.metadata["cleared_skills"] == ["deep-research"]
+    assert [event.type for event in events] == ["agent_text"]
+    assert state["metadata"]["history_loaded"] is False
+    assert state["loaded_skills"] == []
+    assert (thread_dir / "messages.jsonl").read_text(encoding="utf-8") == ""
+
+
+def test_short_memory_write_from_pre_clear_generation_is_discarded(tmp_path) -> None:
+    from superassist.middlewares.short_memory_middleware import ShortMemoryMiddleware
+
+    settings = Settings(
+        SUPERASSIST_DATA_DIR=tmp_path,
+        SUPERASSIST_API_KEY="",
+        SUPERASSIST_EMBEDDING_PROVIDER="hash",
+    )
+    runtime = AgentRuntime(settings)
+    stale_state = runtime._initial_state("old request", user_id="u", thread_id="t")
+
+    clear_result = runtime.run("/clear", user_id="u", thread_id="t")
+    write_result = ShortMemoryMiddleware(settings).after_agent(
+        {
+            **stale_state,
+            "input": "old request",
+            "messages": [AIMessage(content="late old answer")],
+        },
+        runtime=None,
+    )
+
+    assert clear_result.metadata["conversation_generation"] == 1
+    assert write_result is None
+    assert (tmp_path / "threads" / "t" / "messages.jsonl").read_text(encoding="utf-8") == ""
+
+
 def test_runtime_forwards_agent_text_tool_call_events(tmp_path) -> None:
     events = []
     tool_events = []
@@ -685,6 +756,49 @@ def test_runtime_reports_agent_text_once_across_stream_and_tool_event(tmp_path) 
         "我会并发派三个子任务。",
         "我会并发派三个子任务。稍后整合结果。",
     ]
+
+
+def test_runtime_replays_stream_after_partial_model_failover(tmp_path) -> None:
+    class ReplayAgent:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def stream(self, state, config, stream_mode):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            if self.calls == 1:
+                yield ("messages", (AIMessageChunk(content="GPT partial", id="gpt"), {}))
+                raise ModelFailoverRestart("primary:gpt", "claude:claude-opus-5")
+            yield ("messages", (AIMessageChunk(content="Claude complete", id="claude"), {}))
+            yield ("values", {**state, "messages": [*state["messages"], AIMessage(content="Claude complete")]})
+
+    events = []
+    runtime = object.__new__(AgentRuntime)
+    runtime.settings = Settings(
+        _env_file=None,
+        SUPERASSIST_DATA_DIR=tmp_path,
+        SUPERASSIST_API_KEY="",
+        SUPERASSIST_EMBEDDING_PROVIDER="hash",
+    )
+    runtime.rag_mode = False
+    runtime._run_event_reporter = events.append
+    runtime._tool_event_reporter = None
+    runtime._active_agent_text_seen = None
+    runtime._bundle = SimpleNamespace(agent=ReplayAgent(), rag_service=None)
+    state = {
+        "messages": [HumanMessage(content="hello")],
+        "thread_id": "thread-replay",
+    }
+
+    result = runtime._stream_agent(state, user_id="user-a", thread_id="thread-replay")
+
+    assert runtime.agent.calls == 2
+    assert [event.type for event in events] == [
+        "agent_text",
+        "model_failover_reset",
+        "agent_text",
+    ]
+    assert events[-1].message == "Claude complete"
+    assert result["messages"][-1].content == "Claude complete"
 
 
 def test_runtime_accumulates_ai_message_chunks(tmp_path) -> None:

@@ -7,6 +7,7 @@ from pathlib import Path
 from superassist.config import Settings
 from superassist.memory.scoring import EventProbe, MemoryContextRanker
 from superassist.memory.service import MemoryService
+from superassist.memory.storage import create_sqlite_engine
 from superassist.models import EdgeType, NodeType
 
 
@@ -18,7 +19,8 @@ def _settings(tmp_path: Path) -> Settings:
 
 
 def _service(tmp_path: Path) -> MemoryService:
-    return MemoryService(tmp_path / "memory.sqlite3", settings=_settings(tmp_path))
+    # MemoryService takes a SQLAlchemy Engine; build one bound to this test's file.
+    return MemoryService(create_sqlite_engine(tmp_path / "memory.sqlite3"), settings=_settings(tmp_path))
 
 
 def _probe(service: MemoryService, user_id: str, text: str = "concise direct answers") -> EventProbe:
@@ -152,12 +154,14 @@ def test_hierarchical_context_and_prepare_turn_order(tmp_path: Path) -> None:
 
     event_id, recall = service.prepare_turn("u", "thread", "concise direct answers")
     touched = service.store.get_node("u", concept.id)
-    event = service.store.get_node("u", event_id)
 
-    assert event is not None
+    # prepare_turn only pre-allocates the event id; the event node is persisted
+    # later by the memory writer with a proper summary.
+    assert event_id.startswith("event_")
+    assert service.store.get_node("u", event_id) is None
     assert touched is not None and touched.access_count >= 1
     assert recall.immediate or recall.working or recall.background or recall.buffer
-    assert event.id not in {
+    assert event_id not in {
         node.id for node in [*recall.immediate, *recall.working, *recall.background, *recall.buffer]
     }
 

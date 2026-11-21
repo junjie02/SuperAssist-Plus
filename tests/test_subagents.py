@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 from fastapi.testclient import TestClient
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from langgraph.errors import GraphRecursionError
 
 from superassist.config import Settings
@@ -19,7 +19,7 @@ from superassist.subagents import (
 )
 import superassist.subagents.executor as executor_module
 from superassist.channels.daily_quiz import make_daily_quiz_tool
-from superassist.subagents.executor import SubagentExecutor, _filter_tools
+from superassist.subagents.executor import SubagentExecutor, _filter_tools, _quiz_workflow_succeeded
 from superassist.tools import default_tools
 from superassist.ui.server import create_app
 
@@ -29,11 +29,28 @@ def test_directory_subagents_expose_expected_prompts_and_default() -> None:
     configs = {config.name: config for config in registry.list()}
 
     assert registry.default().name == "general-purpose"
-    assert registry.names() == ["general-purpose", "research", "shenlun-quiz"]
+    assert registry.names() == [
+        "general-purpose",
+        "research",
+        "shenlun-analysis-grader",
+        "shenlun-countermeasure-grader",
+        "shenlun-document-grader",
+        "shenlun-essay-grader",
+        "shenlun-quiz",
+        "shenlun-summary-grader",
+    ]
     assert "Do not call the task tool" in configs["general-purpose"].system_prompt
     assert "Prioritize reliable primary or official sources" in configs["research"].system_prompt
     assert configs["shenlun-quiz"].model_profile == "memory"
     assert configs["shenlun-quiz"].allowed_tools == ["daily_quiz_update", "read_file"]
+    assert configs["shenlun-quiz"].max_turns == 48
+    for name in registry.names():
+        if name.endswith("-grader"):
+            assert configs[name].allowed_tools == ["read_file"]
+            assert configs[name].model_profile == "main"
+            assert "derived_scoring_points" in configs[name].system_prompt
+            assert "模拟采分点" not in configs[name].system_prompt
+    assert "15%" in configs["shenlun-essay-grader"].system_prompt
     assert "task.parameters.question_count" in configs["shenlun-quiz"].description
     assert "/mnt/skills/public/huasheng13/SKILL.md" in configs["shenlun-quiz"].system_prompt
     assert "中高难度" in configs["shenlun-quiz"].system_prompt
@@ -117,6 +134,31 @@ def test_memory_model_profile_reuses_existing_deepseek_configuration(tmp_path, m
     assert resolved.base_url == "https://api.deepseek.com/v1"
     assert resolved.use_responses_api is True
     assert {tool.name for tool in executor.tools} == {"daily_quiz_update", "read_file"}
+
+
+def test_qwen_memory_profile_disables_thinking_and_responses_api(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        SUPERASSIST_DATA_DIR=tmp_path,
+        SUPERASSIST_MEMORY_MODEL="qwen3.8-max",
+        SUPERASSIST_MEMORY_API_KEY="qwen-secret",
+        SUPERASSIST_MEMORY_BASE_URL="https://dashscope.example/v1",
+        SUPERASSIST_USE_RESPONSES_API=True,
+        SUPERASSIST_EMBEDDING_PROVIDER="hash",
+    )
+    config = SubagentRegistry(settings).get("shenlun-quiz")
+    captured = {}
+
+    def create_model(resolved):
+        captured["settings"] = resolved
+        return FallbackChatModel()
+
+    monkeypatch.setattr(executor_module, "create_chat_model", create_model)
+    SubagentExecutor(config=config, tools=default_tools(include_task=False), settings=settings)
+
+    resolved = captured["settings"]
+    assert resolved.model == "qwen3.8-max"
+    assert resolved.use_responses_api is False
+    assert resolved.enable_thinking is False
 
 
 def test_subagent_executor_runs_fallback_agent(tmp_path) -> None:
@@ -226,6 +268,25 @@ def test_subagent_executor_summarizes_when_recursion_limit_is_reached(tmp_path, 
     assert result.status == SubagentStatus.COMPLETED
     assert "maximum recursion limit" in result.result
     assert result.ai_messages
+
+
+def test_quiz_workflow_requires_finalize_and_public_view() -> None:
+    messages = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "daily_quiz_update",
+                    "args": {"action": "finalize", "review_summary": "checked"},
+                    "id": "finalize_call",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        ToolMessage(content="Quiz set finalized: 10 questions", tool_call_id="finalize_call"),
+    ]
+
+    assert _quiz_workflow_succeeded(messages) == (True, False)
 
 
 def test_subagent_task_store_fastapi_endpoints(tmp_path) -> None:

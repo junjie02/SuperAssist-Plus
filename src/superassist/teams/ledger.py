@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import secrets
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,7 +25,12 @@ class LedgerTamperError(LedgerError):
 
 
 class TeamLedger:
-    """Append-only JSONL ledger with file locking and hash-chain validation."""
+    """Durable append-only JSONL ledger for a team thread.
+
+    Every stream uses the same record envelope: a monotonic sequence, a
+    previous-record hash, a content hash, and an HMAC.  ``FileLock`` protects
+    the read/validate/append transaction across threads and processes.
+    """
 
     def __init__(self, root: Path, *, key_path: Path | None = None) -> None:
         self.root = root.resolve()
@@ -89,9 +95,7 @@ class TeamLedger:
                 record["extra"] = extra
             record["hash"] = _record_hash(record)
             record["sig"] = self._sign(record)
-            with path.open("a", encoding="utf-8", newline="\n") as handle:
-                handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-                handle.flush()
+            _durable_append(path, record)
             return record
 
     def append_inbox(self, thread_id: str, agent: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -102,17 +106,23 @@ class TeamLedger:
 
     def _append_side_channel(self, path: Path, thread_id: str, agent: str, payload: dict[str, Any]) -> dict[str, Any]:
         lock = FileLock(str(path) + ".lock")
-        record = {
-            "id": f"raw_{uuid4().hex}",
-            "thread_id": thread_id,
-            "agent": agent,
-            "created_at": datetime.now(UTC).isoformat(),
-            "payload": payload,
-        }
         with lock:
-            with path.open("a", encoding="utf-8", newline="\n") as handle:
-                handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-                handle.flush()
+            records = self._read_records_unlocked(path)
+            self._validate_records(records)
+            previous = records[-1] if records else None
+            record = {
+                "id": f"raw_{uuid4().hex}",
+                "seq": len(records) + 1,
+                "thread_id": thread_id,
+                "agent": agent,
+                "channel": "inbox" if path.parent.name == "inbox" else "outbox",
+                "created_at": datetime.now(UTC).isoformat(),
+                "payload": payload,
+                "prev_hash": previous["hash"] if previous else GENESIS_HASH,
+            }
+            record["hash"] = _record_hash(record)
+            record["sig"] = self._sign(record)
+            _durable_append(path, record)
         return record
 
     def read_ledger(self, thread_id: str) -> list[dict[str, Any]]:
@@ -125,6 +135,26 @@ class TeamLedger:
 
     def validate_thread(self, thread_id: str) -> None:
         self.read_ledger(thread_id)
+        thread = self.thread_dir(thread_id)
+        for channel_name in ("inbox", "outbox"):
+            channel_dir = thread / channel_name
+            if not channel_dir.exists():
+                continue
+            for path in channel_dir.glob("*.jsonl"):
+                self._read_side_channel(path)
+
+    def read_inbox(self, thread_id: str, agent: str) -> list[dict[str, Any]]:
+        return self._read_side_channel(self.inbox_path(thread_id, agent))
+
+    def read_raw(self, thread_id: str, agent: str) -> list[dict[str, Any]]:
+        return self._read_side_channel(self.outbox_path(thread_id, agent))
+
+    def _read_side_channel(self, path: Path) -> list[dict[str, Any]]:
+        lock = FileLock(str(path) + ".lock")
+        with lock:
+            records = self._read_records_unlocked(path)
+            self._validate_records(records)
+            return records
 
     def _read_records_unlocked(self, path: Path) -> list[dict[str, Any]]:
         if not path.exists():
@@ -147,6 +177,8 @@ class TeamLedger:
     def _validate_records(self, records: list[dict[str, Any]]) -> None:
         previous_hash = GENESIS_HASH
         for index, record in enumerate(records, start=1):
+            if not isinstance(record, dict):
+                raise LedgerTamperError(f"Invalid ledger record at index {index}")
             if record.get("seq") != index:
                 raise LedgerTamperError(f"Ledger sequence mismatch at record {index}")
             if record.get("prev_hash") != previous_hash:
@@ -164,9 +196,31 @@ class TeamLedger:
         lock = FileLock(str(self.key_path) + ".lock")
         with lock:
             if self.key_path.exists():
-                return bytes.fromhex(self.key_path.read_text(encoding="utf-8").strip())
+                try:
+                    key = bytes.fromhex(self.key_path.read_text(encoding="utf-8").strip())
+                except (OSError, ValueError) as exc:
+                    raise LedgerError(f"Invalid HMAC key file: {self.key_path}") from exc
+                if len(key) != 32:
+                    raise LedgerError(f"Invalid HMAC key length in {self.key_path}")
+                return key
             key = secrets.token_bytes(32)
-            self.key_path.write_text(key.hex(), encoding="utf-8")
+            temporary = self.key_path.with_name(f".{self.key_path.name}.{uuid4().hex}.tmp")
+            try:
+                with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+                    handle.write(key.hex())
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    temporary.chmod(0o600)
+                except OSError:
+                    pass
+                os.replace(temporary, self.key_path)
+                _fsync_directory(self.key_path.parent)
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
             return key
 
     def _sign(self, record: dict[str, Any]) -> str:
@@ -191,3 +245,26 @@ def _safe_name(value: str) -> str:
             keep.append("_")
     name = "".join(keep).strip("._")
     return name or "default"
+
+
+def _durable_append(path: Path, record: dict[str, Any]) -> None:
+    """Append one complete JSON line and force it through the OS buffers."""
+    encoded = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    """Best-effort directory durability; opening directories is unsupported on Windows."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)

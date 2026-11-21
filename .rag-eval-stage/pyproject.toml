@@ -1,15 +1,17 @@
 [project]
 name = "rag-eval"
 version = "0.1.0"
-description = "Reproducible Vector RAG vs LightRAG evaluation over SuperAssist uploads"
+description = "Reproducible retrieval and RAG evaluations for SuperAssist"
 requires-python = ">=3.11"
 dependencies = [
+    "beir>=2.2.0,<3.0.0",
     "numpy>=1.26.0",
 ]
 
 [project.scripts]
 rag-eval-generate = "rag_eval.generate_questions:main"
 rag-eval-run = "rag_eval.evaluate:main"
+rag-eval-beir = "rag_eval.beir_ablation:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]

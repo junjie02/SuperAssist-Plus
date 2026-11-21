@@ -18,6 +18,7 @@ class SuperAssistState(AgentState):
 
     user_id: str
     thread_id: str
+    conversation_generation: NotRequired[int]
     input: str
     memory_query: NotRequired[str]
     suppress_memory_write: NotRequired[bool]
@@ -36,6 +37,10 @@ class SuperAssistState(AgentState):
     rag_context: NotRequired[str]
     rag_sources: NotRequired[list[str]]
     rag_retrieval: NotRequired[dict[str, Any]]
+    rag_trace: NotRequired[dict[str, Any]]
+    answer: NotRequired[str]
+    final_status: NotRequired[str]
+    evidence_pool: NotRequired[list[dict[str, Any]]]
     metadata: NotRequired[dict[str, Any]]
     image_search_results: NotRequired[Annotated[dict[str, dict[str, Any]], _merge_dicts]]
     outbound_images: NotRequired[Annotated[list[dict[str, Any]], _merge_unique_images]]

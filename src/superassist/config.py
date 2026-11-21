@@ -29,8 +29,12 @@ class Settings(BaseSettings):
     base_url: str = Field(default="https://api.openai.com/v1", alias="SUPERASSIST_BASE_URL")
     temperature: float | None = Field(default=None, alias="SUPERASSIST_TEMPERATURE")
     max_tokens: int | None = Field(default=None, alias="SUPERASSIST_MAX_TOKENS")
+    model_timeout_seconds: int = Field(default=60, ge=10, le=600, alias="SUPERASSIST_MODEL_TIMEOUT_SECONDS")
     reasoning_effort: ReasoningEffort = Field(default="medium", alias="SUPERASSIST_REASONING_EFFORT")
     use_responses_api: bool = Field(default=True, alias="SUPERASSIST_USE_RESPONSES_API")
+    # Qwen-compatible gateways expose thinking through extra_body rather than
+    # the OpenAI Responses reasoning field. None preserves provider defaults.
+    enable_thinking: bool | None = Field(default=None, alias="SUPERASSIST_ENABLE_THINKING")
     claude_fallback_model: str = Field(
         default="claude-opus-5",
         alias="SUPERASSIST_CLAUDE_FALLBACK_MODEL",
@@ -157,6 +161,29 @@ class Settings(BaseSettings):
     rag_candidate_top_k: int = Field(default=50, ge=1, le=500, alias="SUPERASSIST_RAG_CANDIDATE_TOP_K")
     rag_chunk_top_k: int = Field(default=10, ge=1, le=100, alias="SUPERASSIST_RAG_CHUNK_TOP_K")
     rag_rrf_k: int = Field(default=60, ge=1, le=1000, alias="SUPERASSIST_RAG_RRF_K")
+    rag_reranker_enabled: bool = Field(default=False, alias="SUPERASSIST_RAG_RERANKER_ENABLED")
+    rag_reranker_model: str = Field(
+        default="BAAI/bge-reranker-v2-m3",
+        alias="SUPERASSIST_RAG_RERANKER_MODEL",
+    )
+    rag_reranker_candidate_top_k: int = Field(
+        default=30,
+        ge=1,
+        le=200,
+        alias="SUPERASSIST_RAG_RERANKER_CANDIDATE_TOP_K",
+    )
+    rag_reranker_batch_size: int = Field(
+        default=16,
+        ge=1,
+        le=128,
+        alias="SUPERASSIST_RAG_RERANKER_BATCH_SIZE",
+    )
+    rag_reranker_max_length: int = Field(
+        default=512,
+        ge=64,
+        le=4096,
+        alias="SUPERASSIST_RAG_RERANKER_MAX_LENGTH",
+    )
     rag_context_max_tokens: int = Field(default=5000, ge=256, le=50000, alias="SUPERASSIST_RAG_CONTEXT_MAX_TOKENS")
     rag_accumulated_evidence_max_tokens: int = Field(
         default=8000,
@@ -165,11 +192,23 @@ class Settings(BaseSettings):
         alias="SUPERASSIST_RAG_ACCUMULATED_EVIDENCE_MAX_TOKENS",
     )
     rag_stagnant_search_limit: int = Field(default=2, ge=1, le=10, alias="SUPERASSIST_RAG_STAGNANT_SEARCH_LIMIT")
+    # Explicit Agentic RAG control-plane budgets. The legacy middleware path
+    # remains available when this flag is disabled.
+    agentic_rag_enabled: bool = Field(default=True, alias="SUPERASSIST_AGENTIC_RAG_ENABLED")
+    agentic_rag_max_steps: int = Field(default=20, ge=4, le=100, alias="SUPERASSIST_AGENTIC_RAG_MAX_STEPS")
+    agentic_rag_max_retrieval_calls: int = Field(default=6, ge=1, le=30, alias="SUPERASSIST_AGENTIC_RAG_MAX_RETRIEVAL_CALLS")
+    agentic_rag_max_rewrites: int = Field(default=3, ge=0, le=10, alias="SUPERASSIST_AGENTIC_RAG_MAX_REWRITES")
+    agentic_rag_max_backtracks: int = Field(default=2, ge=0, le=10, alias="SUPERASSIST_AGENTIC_RAG_MAX_BACKTRACKS")
+    agentic_rag_max_subquestions: int = Field(default=4, ge=1, le=12, alias="SUPERASSIST_AGENTIC_RAG_MAX_SUBQUESTIONS")
+    agentic_rag_web_fallback_enabled: bool = Field(default=True, alias="SUPERASSIST_AGENTIC_RAG_WEB_FALLBACK_ENABLED")
+    agentic_rag_wall_clock_seconds: float = Field(default=45.0, ge=1.0, le=600.0, alias="SUPERASSIST_AGENTIC_RAG_WALL_CLOCK_SECONDS")
     feishu_app_id: str = Field(default="", alias="SUPERASSIST_FEISHU_APP_ID")
     feishu_app_secret: str = Field(default="", alias="SUPERASSIST_FEISHU_APP_SECRET")
     feishu_domain: str = Field(default="https://open.feishu.cn", alias="SUPERASSIST_FEISHU_DOMAIN")
     feishu_allowed_open_ids: str = Field(default="", alias="SUPERASSIST_FEISHU_ALLOWED_OPEN_IDS")
     feishu_mention_only: bool = Field(default=True, alias="SUPERASSIST_FEISHU_MENTION_ONLY")
+    feishu_bot_open_id: str = Field(default="", alias="SUPERASSIST_FEISHU_BOT_OPEN_ID")
+    feishu_bot_name: str = Field(default="", alias="SUPERASSIST_FEISHU_BOT_NAME")
     feishu_active_session_seconds: int = Field(
         default=180,
         alias="SUPERASSIST_FEISHU_ACTIVE_SESSION_SECONDS",
@@ -201,6 +240,12 @@ class Settings(BaseSettings):
         ge=0,
         le=100000,
         alias="SUPERASSIST_FEISHU_IMAGE_OCR_MAX_CHARS",
+    )
+    feishu_image_processing_concurrency: int = Field(
+        default=2,
+        ge=1,
+        le=8,
+        alias="SUPERASSIST_FEISHU_IMAGE_PROCESSING_CONCURRENCY",
     )
     feishu_image_context_ttl_seconds: int = Field(
         default=180,
@@ -239,16 +284,46 @@ class Settings(BaseSettings):
         alias="SUPERASSIST_DAILY_BRIEF_CATCH_UP_MINUTES",
     )
     daily_brief_max_candidates: int = Field(
-        default=80,
+        default=36,
         ge=10,
         le=300,
         alias="SUPERASSIST_DAILY_BRIEF_MAX_CANDIDATES",
+    )
+    daily_brief_max_web_requests: int = Field(
+        default=24,
+        ge=3,
+        le=100,
+        alias="SUPERASSIST_DAILY_BRIEF_MAX_WEB_REQUESTS",
+    )
+    daily_brief_model_timeout_seconds: int = Field(
+        default=120,
+        ge=30,
+        le=600,
+        alias="SUPERASSIST_DAILY_BRIEF_MODEL_TIMEOUT_SECONDS",
+    )
+    daily_brief_generation_retries: int = Field(
+        default=1,
+        ge=0,
+        le=3,
+        alias="SUPERASSIST_DAILY_BRIEF_GENERATION_RETRIES",
+    )
+    daily_brief_retry_delay_seconds: float = Field(
+        default=15,
+        ge=0,
+        le=300,
+        alias="SUPERASSIST_DAILY_BRIEF_RETRY_DELAY_SECONDS",
     )
     daily_brief_min_sources: int = Field(
         default=3,
         ge=1,
         le=20,
         alias="SUPERASSIST_DAILY_BRIEF_MIN_SOURCES",
+    )
+    daily_brief_max_reused_sources: int = Field(
+        default=3,
+        ge=0,
+        le=20,
+        alias="SUPERASSIST_DAILY_BRIEF_MAX_REUSED_SOURCES",
     )
     daily_brief_model: str = Field(
         default="deepseek-v4-flash",
@@ -384,6 +459,10 @@ class Settings(BaseSettings):
     @property
     def daily_brief_state_path(self) -> Path:
         return self.data_dir / "channels" / "daily_brief_state.json"
+
+    @property
+    def daily_brief_run_log_path(self) -> Path:
+        return self.data_dir / "logs" / "daily-brief-runs.jsonl"
 
     @property
     def daily_quiz_data_dir(self) -> Path:

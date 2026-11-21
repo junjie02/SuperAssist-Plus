@@ -134,7 +134,7 @@ async def _sse_chat_stream(
         if error_msg:
             yield f"data: {json.dumps({'type': 'error', 'message': error_msg}, ensure_ascii=False)}\n\n"
         elif result is not None:
-            yield f"data: {json.dumps({'type': 'done', 'thread_id': result.thread_id, 'answer': result.answer or ''}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'thread_id': result.thread_id, 'answer': result.answer or '', 'metadata': result.metadata}, ensure_ascii=False)}\n\n"
         else:
             yield f"data: {json.dumps({'type': 'error', 'message': 'No response from AI engine'}, ensure_ascii=False)}\n\n"
 

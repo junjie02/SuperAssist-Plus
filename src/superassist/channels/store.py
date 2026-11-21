@@ -12,6 +12,18 @@ from pathlib import Path
 from typing import Any
 
 
+def _safe_json(value: Any) -> str:
+    """Serialize event metadata without ever failing the message insert.
+
+    A message must never be dropped because one metadata field could not be
+    JSON-encoded (Feishu SDK objects leak into mentions in some event shapes).
+    """
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return json.dumps(value, ensure_ascii=False, default=str)
+
+
 @dataclass(frozen=True)
 class FeishuStoredMessage:
     seq: int
@@ -30,9 +42,13 @@ class FeishuStoredMessage:
 class FeishuMessageStore:
     """Durable, idempotent inbox for all visible Feishu messages."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, image_dir: str | Path | None = None) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Mirrored image files so tools can read them by path later. Defaults to
+        # a sibling 图片/ directory; FeishuChannel passes the tool workspace.
+        self.image_dir = Path(image_dir) if image_dir is not None else self.path.parent / "图片"
+        self.image_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._init_schema()
 
@@ -67,8 +83,8 @@ class FeishuMessageStore:
                     text,
                     root_id,
                     chat_type,
-                    json.dumps(mentions, ensure_ascii=False),
-                    json.dumps(files, ensure_ascii=False),
+                    _safe_json(mentions),
+                    _safe_json(files),
                     created_at or now,
                     now,
                 ),
@@ -133,6 +149,15 @@ class FeishuMessageStore:
                 (chat_id, through_seq),
             )
 
+    @staticmethod
+    def _image_suffix(mime_type: str) -> str:
+        return {
+            "image/png": ".png",
+            "image/jpeg": ".jpg",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+        }.get(str(mime_type or "").lower(), ".img")
+
     def save_image(
         self,
         *,
@@ -141,6 +166,17 @@ class FeishuMessageStore:
         data: bytes,
         mime_type: str,
     ) -> None:
+        digest = hashlib.sha256(data).hexdigest()
+        date_dir = datetime.now().strftime("%Y%m%d")
+        target_dir = self.image_dir / date_dir
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / f"{digest[:16]}{self._image_suffix(mime_type)}"
+            if not target.exists():
+                target.write_bytes(data)
+        except OSError:
+            # File mirroring is best-effort; the sqlite payload stays authoritative.
+            pass
         try:
             with self._lock, self._connect() as conn:
                 conn.execute(
@@ -153,7 +189,7 @@ class FeishuMessageStore:
                     (
                         message_id,
                         image_key,
-                        hashlib.sha256(data).hexdigest(),
+                        digest,
                         mime_type,
                         data,
                         datetime.now(UTC).isoformat(),
@@ -162,6 +198,14 @@ class FeishuMessageStore:
         except sqlite3.IntegrityError:
             # Direct helper callers may download before their message has entered the inbox.
             return
+
+    def find_image_path(self, data: bytes) -> str | None:
+        """Return the workspace-relative path of a previously mirrored image."""
+        prefix = hashlib.sha256(data).hexdigest()[:16]
+        for candidate in sorted(self.image_dir.glob(f"*/{prefix}.*")):
+            relative = Path(self.image_dir.name) / candidate.relative_to(self.image_dir)
+            return relative.as_posix()
+        return None
 
     def get_image(self, *, message_id: str, image_key: str) -> tuple[bytes, str] | None:
         with self._lock, self._connect() as conn:

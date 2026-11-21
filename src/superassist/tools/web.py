@@ -3,9 +3,11 @@ from __future__ import annotations
 import html
 import json
 import re
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from urllib.error import URLError
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 from urllib.request import Request, urlopen
@@ -30,18 +32,46 @@ _OFFICIAL_MEDIA_DOMAINS: ContextVar[tuple[str, ...]] = ContextVar(
     "superassist_official_media_domains",
     default=(),
 )
+_OFFICIAL_MEDIA_REQUEST_BUDGET: ContextVar[_WebRequestBudget | None]
+
+
+@dataclass
+class _WebRequestBudget:
+    limit: int
+    used: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def consume(self) -> bool:
+        with self.lock:
+            if self.used >= self.limit:
+                return False
+            self.used += 1
+            return True
+
+
+_OFFICIAL_MEDIA_REQUEST_BUDGET = ContextVar(
+    "superassist_official_media_request_budget",
+    default=None,
+)
 
 
 @contextmanager
-def official_media_web_scope(domains: list[str] | tuple[str, ...] | set[str]) -> Iterator[None]:
+def official_media_web_scope(
+    domains: list[str] | tuple[str, ...] | set[str],
+    *,
+    max_requests: int | None = None,
+) -> Iterator[None]:
     """Restrict web tools to official-media domains for the current agent run."""
 
     normalized = tuple(sorted({_normalize_domain(item) for item in domains if _normalize_domain(item)}))
-    token = _OFFICIAL_MEDIA_DOMAINS.set(normalized)
+    domains_token = _OFFICIAL_MEDIA_DOMAINS.set(normalized)
+    budget = _WebRequestBudget(max(0, int(max_requests))) if max_requests is not None else None
+    budget_token = _OFFICIAL_MEDIA_REQUEST_BUDGET.set(budget)
     try:
         yield
     finally:
-        _OFFICIAL_MEDIA_DOMAINS.reset(token)
+        _OFFICIAL_MEDIA_REQUEST_BUDGET.reset(budget_token)
+        _OFFICIAL_MEDIA_DOMAINS.reset(domains_token)
 
 
 def is_allowed_official_url(url: str, domains: tuple[str, ...] | list[str] | set[str]) -> bool:
@@ -59,6 +89,13 @@ def _normalize_domain(value: str) -> str:
 def _ensure_network_enabled() -> str | None:
     if not get_settings().tool_network_enabled:
         return "Error: Network tools are disabled by SUPERASSIST_TOOL_NETWORK_ENABLED=false"
+    return None
+
+
+def _consume_request_budget() -> str | None:
+    budget = _OFFICIAL_MEDIA_REQUEST_BUDGET.get()
+    if budget is not None and not budget.consume():
+        return f"Error: Official-media web request limit reached ({budget.limit})"
     return None
 
 
@@ -146,6 +183,9 @@ def web_search(query: str, max_results: int = 5) -> str:
     ]
     errors: list[str] = []
     for url in urls:
+        budget_error = _consume_request_budget()
+        if budget_error:
+            return budget_error
         try:
             body, _content_type = _fetch_url(url)
         except URLError as exc:
@@ -183,6 +223,9 @@ def web_fetch(url: str, max_chars: int = 12000) -> str:
     official_domains = _OFFICIAL_MEDIA_DOMAINS.get()
     if official_domains and not is_allowed_official_url(url, official_domains):
         return "Error: URL is outside the configured official-media source list"
+    budget_error = _consume_request_budget()
+    if budget_error:
+        return budget_error
     max_chars = max(1000, min(max_chars, 50000))
     try:
         body, content_type = _fetch_url(url)

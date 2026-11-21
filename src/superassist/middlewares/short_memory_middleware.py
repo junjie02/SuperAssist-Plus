@@ -8,6 +8,7 @@ summary checkpoints whenever the active segment reaches its turn/token limit.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,8 @@ from superassist.agent.streaming import clean_answer_text
 from superassist.config import Settings
 from superassist.redis_store import get_redis_store
 from superassist.skills import active_skill_activations, active_skill_names
+
+logger = logging.getLogger(__name__)
 
 
 class ShortMemoryMiddleware(AgentMiddleware[SuperAssistState]):
@@ -56,6 +59,20 @@ class ShortMemoryMiddleware(AgentMiddleware[SuperAssistState]):
         thread_dir = self._settings.data_dir / "threads" / thread_id
         thread_dir.mkdir(parents=True, exist_ok=True)
         path = thread_dir / "messages.jsonl"
+        existing_metadata = self._load_thread_metadata(thread_dir)
+        expected_generation = int(state.get("conversation_generation") or 0)
+        try:
+            current_generation = int(existing_metadata.get("conversation_generation") or 0)
+        except (TypeError, ValueError):
+            current_generation = 0
+        if expected_generation != current_generation:
+            logger.info(
+                "Skipping stale short-memory write thread_id=%s expected_generation=%d current_generation=%d",
+                thread_id,
+                expected_generation,
+                current_generation,
+            )
+            return None
         assistant_created_at = str(state.get("assistant_message_created_at") or "") or datetime.now(UTC).isoformat()
         append_jsonl(
             path,
@@ -79,8 +96,8 @@ class ShortMemoryMiddleware(AgentMiddleware[SuperAssistState]):
             "loaded_skills": loaded_skills,
             "skill_activations": skill_activations,
             "user_id": str(state.get("user_id") or ""),
+            "conversation_generation": expected_generation,
         }
-        existing_metadata = self._load_thread_metadata(thread_dir)
         if self._model is not None:
             meta_update.update(
                 maybe_compress_short_memory(
@@ -117,6 +134,7 @@ class ShortMemoryMiddleware(AgentMiddleware[SuperAssistState]):
             thread_id,
             skill_activations,
             ttl_seconds=self._settings.skill_active_ttl_seconds,
+            generation=expected_generation,
         )
         self._redis.save_short_memory(
             thread_id,
@@ -126,6 +144,7 @@ class ShortMemoryMiddleware(AgentMiddleware[SuperAssistState]):
                 "summary_version": int(merged_metadata.get("summary_version") or 0),
                 "file_size": path.stat().st_size,
                 "file_mtime_ns": path.stat().st_mtime_ns,
+                "conversation_generation": expected_generation,
             },
         )
 

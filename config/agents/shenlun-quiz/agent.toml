@@ -6,4 +6,7 @@ default = false
 model_profile = "memory"
 allowed_tools = ["daily_quiz_update", "read_file"]
 timeout_seconds = 600
-max_turns = 16
+# Quiz generation includes source reads, draft validation, per-question audits,
+# finalization, and public-view retrieval. Keep a larger agent-local budget so
+# the complete workflow can finish without hitting the global default.
+max_turns = 48

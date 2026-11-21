@@ -1,9 +1,10 @@
 import json
 
+import pytest
 from langchain.agents import create_agent
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import tool
 from pydantic import Field
@@ -12,12 +13,70 @@ from superassist.config import Settings
 from superassist.llm import (
     FailoverChatModel,
     MiniMaxCompatibleChatModel,
+    ModelFailoverRestart,
     OneSecondRetryChatModel,
+    _route_messages,
     create_chat_model,
     create_memory_model,
     is_minimax_model,
-    _route_messages,
 )
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_fallback_env(monkeypatch) -> None:
+    """Stop tests from inheriting the developer's project ``.env`` fallbacks.
+
+    ``Settings`` loads ``PROJECT_ROOT/.env``, so a locally configured Claude or
+    DeepSeek fallback silently turns every constructed model into a
+    ``FailoverChatModel`` and breaks assertions about the primary route.
+    Tests that exercise failover pass their keys explicitly, which wins over
+    environment variables.
+    """
+    for name in (
+        "SUPERASSIST_CLAUDE_FALLBACK_API_KEY",
+        "SUPERASSIST_CLAUDE_FALLBACK_BASE_URL",
+        "SUPERASSIST_DEEPSEEK_FALLBACK_API_KEY",
+        "SUPERASSIST_DEEPSEEK_FALLBACK_BASE_URL",
+    ):
+        monkeypatch.setenv(name, "")
+
+
+def test_stream_failures_after_first_chunk_request_full_replay_on_fallback() -> None:
+    class PartialFailureRoute(BaseChatModel):
+        @property
+        def _llm_type(self) -> str:
+            return "partial-failure-route"
+
+        def _stream(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[no-untyped-def]
+            yield ChatGenerationChunk(message=AIMessageChunk(content="partial gpt answer"))
+            raise TimeoutError("provider overloaded")
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[no-untyped-def]
+            raise NotImplementedError
+
+    class FallbackRoute(BaseChatModel):
+        @property
+        def _llm_type(self) -> str:
+            return "fallback-route"
+
+        def _stream(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[no-untyped-def]
+            yield ChatGenerationChunk(message=AIMessageChunk(content="complete claude answer"))
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[no-untyped-def]
+            raise NotImplementedError
+
+    model = FailoverChatModel(
+        [PartialFailureRoute(), FallbackRoute()],
+        ["gpt", "claude"],
+    )
+
+    chunks = model._stream([HumanMessage(content="hello")])
+    assert next(chunks).message.content == "partial gpt answer"
+    with pytest.raises(ModelFailoverRestart) as error:
+        next(chunks)
+    assert error.value.from_route == "gpt"
+    assert error.value.to_route == "claude"
+    assert model.active_route == "claude"
 
 
 def test_failover_model_switches_on_transient_failure_and_stays_on_route() -> None:
@@ -110,10 +169,13 @@ def test_create_chat_model_builds_responses_primary_with_configured_fallbacks() 
     model = create_chat_model(settings)
 
     assert isinstance(model, FailoverChatModel)
+    # Build expected route names from settings: fallback model names are
+    # deployment configuration and may legitimately change (e.g. datestamped
+    # DeepSeek snapshots) without this test needing an edit.
     assert model._identifying_params["routes"] == [
-        "primary:gpt-5.6-sol",
-        "claude:claude-opus-5",
-        "deepseek:deepseek-v4-flash",
+        f"primary:{settings.model}",
+        f"claude:{settings.claude_fallback_model}",
+        f"deepseek:{settings.deepseek_fallback_model}",
     ]
     assert model._routes[0].use_responses_api is True
     assert model._routes[0].use_previous_response_id is False
@@ -121,6 +183,24 @@ def test_create_chat_model_builds_responses_primary_with_configured_fallbacks() 
     assert model._routes[1].use_previous_response_id is False
     assert model._routes[2].use_responses_api is True
     assert model._routes[2].use_previous_response_id is False
+
+
+def test_qwen_model_disables_thinking_with_chat_completions_extra_body() -> None:
+    settings = Settings(
+        SUPERASSIST_MODEL="qwen3.8-max",
+        SUPERASSIST_API_KEY="qwen-secret",
+        SUPERASSIST_BASE_URL="https://dashscope.example/v1",
+        SUPERASSIST_ENABLE_THINKING=False,
+        SUPERASSIST_USE_RESPONSES_API=True,
+        SUPERASSIST_CLAUDE_FALLBACK_API_KEY="",
+        SUPERASSIST_DEEPSEEK_FALLBACK_API_KEY="",
+    )
+
+    model = create_chat_model(settings)
+    payload = model._get_request_payload([HumanMessage(content="hello")])
+
+    assert model.use_responses_api is False
+    assert payload["extra_body"]["enable_thinking"] is False
 
 
 def test_deepseek_fallback_replaces_image_pixels_with_degradation_marker() -> None:

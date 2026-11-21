@@ -8,7 +8,7 @@
 - 所有可观察数据结构使用 Pydantic v2 (`BaseModel`) 或 `@dataclass(frozen=True)`。可变运行态（队列、缓存、会话池）使用 `@dataclass`（非 frozen）。
 - 所有时间戳为 UTC，写库使用 `datetime.fromisoformat()` 反序列化、`isoformat()` 序列化。
 - 配置在 [`config.Settings`](superassist/config.py) 集中，环境变量前缀 `SUPERASSIST_`。
-- 没有外层 LangGraph 包装：lead agent = 单次 `langchain.agents.create_agent` + 一条确定性 middleware 链。子 agent (`SubagentExecutor`) 才使用 `StateGraph`。
+- 普通聊天仍是单次 `langchain.agents.create_agent` + 确定性 middleware 链；RAG 模式在 `SUPERASSIST_AGENTIC_RAG_ENABLED=true` 时由 `rag/agentic_graph.py` 使用外层 `StateGraph`，旧 middleware RAG 路径保留作回滚。
 
 ---
 
@@ -223,6 +223,11 @@
 | `rag_candidate_top_k` | `50` | Dense 和 BM25 各自进入 RRF 的候选数。 |
 | `rag_chunk_top_k` | `10` | 每次检索最多返回的原文 Chunk 数。 |
 | `rag_rrf_k` | `60` | Weighted RRF 的排名平滑常数。 |
+| `rag_reranker_enabled` | `False` | 是否对 Hybrid 的 RRF 候选启用 Cross-Encoder 重排。 |
+| `rag_reranker_model` | `BAAI/bge-reranker-v2-m3` | Cross-Encoder 模型，首次重排时懒加载。 |
+| `rag_reranker_candidate_top_k` | `30` | 送入 Cross-Encoder 的 RRF 候选数量。 |
+| `rag_reranker_batch_size` | `16` | Cross-Encoder 推理批大小。 |
+| `rag_reranker_max_length` | `512` | Query-Chunk pair 的最大模型长度。 |
 | `rag_context_max_tokens` | `5000` | 单次检索可注入的证据 Token 上限。 |
 | `rag_accumulated_evidence_max_tokens` | `8000` | 一轮 Agentic RAG 累计新证据 Token 上限。 |
 | `rag_stagnant_search_limit` | `2` | 连续没有新增 Chunk 时停止继续检索的阈值。 |
@@ -240,6 +245,7 @@
 | `feishu_max_images_per_activation` | `12` | 一批直接交给主视觉模型的图片数上限。 |
 | `feishu_image_ocr_enabled` | `True` | 是否运行本地 RapidOCR；OCR 失败不阻止原图进入主模型。 |
 | `feishu_image_ocr_max_chars` | `12000` | 多图 OCR 注入当前轮文本历史的总字符上限。 |
+| `feishu_image_processing_concurrency` | `2` | 图片下载和逐图 OCR 的有界并发数，范围 1-8。 |
 | `feishu_image_context_ttl_seconds` | `180` | 最新一组原图跨消息保留的滑动 TTL；有效后续消息刷新计时。 |
 
 **企业微信**
@@ -648,10 +654,12 @@ TIME 节点的语义边不自动推断：事件实际发生时间必须显式添
 
 - 持有 `_bundle` (AgentBundle)、`rag_mode`、`_run_event_reporter`、`_tool_event_reporter`、`_active_agent_text_seen`（防重复发同一段流式文本）。
 - `run(message, *, user_id, thread_id)` 同步路径；`run_streaming(...)` 流式路径，二者都被 `@traceable` 装饰，`process_inputs=without_self`。
+- `run` / `run_streaming` 在限流、历史加载和模型调用前精确识别独立 `/clear`。命令直接调用 `conversation_state.clear_short_state` 并返回，不进入 RAG、Memory middleware、Skill 或 Agent；普通回合与清理共用 thread-state 本地锁和 Redis 锁。
 - `_initial_state(message, user_id, thread_id)`:
   - thread_id 缺省时生成 `thread_<12hex>`。
   - `_load_thread_metadata` 读 `data_dir/threads/<thread_id>/thread_meta.json`，失败返回 `{}`。
   - `_load_history` 调 `load_short_memory(messages_path, metadata, ...)`，读取摘要检查点后的完整活动段。
+  - `conversation_generation` 从 `thread_meta.json` 进入 state；Redis 短记忆和 Skill 缓存必须匹配该代次，`ShortMemoryMiddleware` 写回前再次校验，拒绝清理前旧回合的迟到写入。
   - 初始消息按 `<ShortMemory>` SystemMessage、活动段、最新 `HumanMessage(message)` 排列，并初始化 `rag_mode` / `rag_context` / `rag_sources`。
 - `run` 与 `run_streaming` 都用 `rag_turn_context(rag_service, user_id, rag_mode)` 包住整个 Agent 循环，使 `rag_search` 工具和 middleware 共享同一个并发安全的 Chunk 去重集合、证据预算和停止状态。
 - `_stream_agent`: 用 `agent.stream(state, ..., stream_mode=["messages","values"])` 同时收文本块和 state 快照；`accumulate_stream_text` 处理多种 chunk 形态；最终 state 取最后一个 `values` 模式 chunk 或退回初始 state。
@@ -892,7 +900,7 @@ LangChain 1.x middleware 的钩子分类：`before_agent` / `after_agent`（agen
 - `task(description, prompt, subagent_type="", parameters=None)`：空类型动态解析为清单中唯一的 `default=true` Agent；`parameters` 是结构化 JSON，会注入子 Agent 首轮上下文。subagents 关闭返回错误串；type 不存在时返回 `available` 列表；信号量 acquire 走 `timeout = config.timeout_seconds`，超时返回 `"Task timed out. Error: No subagent slot available after Xs"`。
 - 命中槽位后构造 `SubagentExecutor`：`tools=default_tools(include_task=False, include_images=False)`（再次保险禁用嵌套 task，并确保图片展示决策只属于 lead agent），`run_event_reporter` 优先用绑定时传入的，其次 fallback 到 `current_run_event_reporter()`。
 - `shenlun-quiz` 的 `parameters.question_count` 还会直接绑定为 `daily_quiz_update` 的委派题量；`prepare_generation` 把 1–30 写入 session，后续 draft/finalize 只认 session 题量。参数缺失时使用 `SUPERASSIST_DAILY_QUIZ_QUESTION_COUNT`。
-- 每次 session 原子保存时同步刷新 `study/shenlun/current/<thread-hash>.public.md` 与 `.private.json`。主 Agent 的动态 `<CurrentQuiz>` 只注入状态和稳定资源名：`quiz://current/public` 可随时只读，`quiz://current/private` 仅在完整答案表已保存或 session 已完成后可读；通用文件写入/删除工具拒绝 `quiz://`。
+- 每次 session 原子保存时同步刷新 `study/shenlun/current/<thread-hash>.public.md` 与 `.private.json`。主 Agent 的动态 `<CurrentQuiz>` 只注入状态和稳定资源名：`quiz://current/public` 可随时只读，`quiz://current/private` 仅在完整答案表已保存或 session 已完成后可读，`quiz://current/wrongbook` 可随时只读当前会话对应的历史错题本；通用文件写入/删除工具拒绝 `quiz://`。错题本写入必须通过 `daily_quiz_update(action=wrongbook_add, wrong_question={...})`，由 Store 同步更新 `wrong_questions.json` 和 `错题本.md`，并按题目去重。
 - `SUPERASSIST_DAILY_QUIZ_SCHEDULER_ENABLED` 只控制定时生成；缺省时兼容旧 `SUPERASSIST_DAILY_QUIZ_ENABLED`。`SUPERASSIST_DAILY_QUIZ_CONTEXT_ENABLED` 独立控制主 Agent 的 `daily_quiz_update` 工具和 `<CurrentQuiz>` 注入。
 - `grading_context` 保存完整答案表并按 `selected_option == correct_option` 形成确定性 `is_correct`；主 Agent 只生成 feedback / weakness，`grade` 再次按答案键计算并落库，模型传入的 `is_correct` 不参与最终分数。
 - 返回字符串格式：`Task Succeeded. Result: ...` / `Task timed out. Error: ...` / `Task failed. Error: ...`，由 lead agent 自然地拼回回答。
@@ -1215,6 +1223,7 @@ LangChain `@tool("team_task")`：
 8. 可选 RapidOCR 在本地线程中逐图识别，结果标为不可信辅助文本；OCR 缺包、初始化或识别失败时 fail-open。
 9. 当前轮的内容块按“成员文字/成员图片”关联；短期记忆只写 ConversationBatch 文本投影、OCR 和最终回答，不写 Base64。Writer 每批执行一次，并把 batch/message/sender provenance 写入节点 metadata。
 10. 构造 `report` 闭包流式处理 `thinking` / `agent_reasoning` / `agent_text` / `subagent_text`；`runtime.memory_queue.flush()` 后提交最终卡片，模型失败不推进消息游标。
+11. 私聊独立 `/clear`、群聊明确 `@机器人 /clear` 在 Agent 前执行：清理线程短期历史/摘要/Skill 激活和飞书图片上下文，消费到命令水位并取消旧 pending activation；长期记忆、RAG、测验/错题、申论文件、任务账本及线程映射保持不变。
 
 #### 13.2.3 卡片渲染
 

@@ -6,6 +6,7 @@
 - SQLite 保存原始 Chunk，并通过 FTS5 提供 BM25；
 - FAISS 保存同一批 Chunk 的 Dense embedding；
 - 应用层用 Reciprocal Rank Fusion（RRF）融合两路排名；
+- 可选 Cross-Encoder 对 Hybrid 候选逐对打分并重排；
 - Agent 可以改写查询并重复检索，Session 跨调用去重和控制累计证据预算。
 
 实体、关系、摘要和文件级来源都不作为证据。**唯一证据单元是实际进入模型上下文的原文 Chunk。**
@@ -70,13 +71,21 @@ Token 计数使用完全离线的本地估算器，避免 `tiktoken` 首次运�
 
 ## 4. 混合检索
 
-`HybridRAGService.retrieve(user_id, query, mode)` 支持：
+`HybridRAGService.retrieve(user_id, query, mode, *, rerank=None)` 支持：
 
 | mode | 路径 |
 | --- | --- |
 | `hybrid` | Dense + BM25 + RRF，默认 |
 | `dense` | 只使用 FAISS 语义召回 |
 | `bm25` | 只使用 FTS5 关键词召回 |
+
+`hybrid` 的 Dense 与 BM25 查询在独立检索线程中并行执行，二者完成后再进行 RRF 融合；
+用户级读写锁仍覆盖整个检索快照，避免文档索引更新期间混用不同版本的结果。
+
+设置 `SUPERASSIST_RAG_RERANKER_ENABLED=true` 后，`hybrid` 会将 RRF 前 N 个候选交给
+Cross-Encoder，以查询和完整 Chunk 文本组成 pair 打分，再截取最终 Top-K。默认模型为
+`BAAI/bge-reranker-v2-m3`，候选数 30；模型懒加载，重排失败时保留原 RRF 顺序。调用方可用
+`rerank=True/False` 显式覆盖全局开关，主要用于同一进程内的消融评测。
 
 Dense 使用归一化向量内积，等价于余弦相似度。BM25 对文件名、标题路径和正文使用不同权重。
 Hybrid 不直接比较两种异构分数，而按排名计算：
@@ -125,6 +134,11 @@ rag_search(query, mode="hybrid|dense|bm25")
 | `SUPERASSIST_RAG_CANDIDATE_TOP_K` | 50 |
 | `SUPERASSIST_RAG_CHUNK_TOP_K` | 10 |
 | `SUPERASSIST_RAG_RRF_K` | 60 |
+| `SUPERASSIST_RAG_RERANKER_ENABLED` | false |
+| `SUPERASSIST_RAG_RERANKER_MODEL` | BAAI/bge-reranker-v2-m3 |
+| `SUPERASSIST_RAG_RERANKER_CANDIDATE_TOP_K` | 30 |
+| `SUPERASSIST_RAG_RERANKER_BATCH_SIZE` | 16 |
+| `SUPERASSIST_RAG_RERANKER_MAX_LENGTH` | 512 |
 | `SUPERASSIST_RAG_CONTEXT_MAX_TOKENS` | 5000 |
 | `SUPERASSIST_RAG_ACCUMULATED_EVIDENCE_MAX_TOKENS` | 8000 |
 | `SUPERASSIST_RAG_STAGNANT_SEARCH_LIMIT` | 2 |
@@ -132,14 +146,14 @@ rag_search(query, mode="hybrid|dense|bm25")
 ## 7. 评测合同
 
 Retriever 评测只能使用 `hits[].chunk_id`，不能使用文档 ID、来源 ID、摘要或其它派生数据冒充证据。
-Dense、BM25、Hybrid 和后续 Reranker 的对照必须使用相同原文 Chunk、最终 K 和可见上下文 Token 预算。
+Dense、BM25、Hybrid 和 Reranker 的对照必须使用相同原文 Chunk、最终 K 和可见上下文 Token 预算。
 
 第一阶段消融组：
 
 1. Dense only；
 2. BM25 only；
 3. Dense + BM25 + RRF；
-4. 后续增加 Hybrid + Reranker。
+4. Dense + BM25 + RRF + Cross-Encoder Reranker。
 
 报告 Recall@K、Precision@K、All-evidence@K、MRR、gold quote 覆盖率、回答准确率、P50/P95 延迟；
 Token 必须拆成检索上下文、在线检索模型调用和回答输入输出，不能统称“检索 Token”。
@@ -149,7 +163,7 @@ Token 必须拆成检索上下文、在线检索模型调用和回答输入输�
 - SQLite/FAISS 适合单机第一版，不支持多进程共同写同一用户索引；
 - 中文 BM25 使用内置 bigram 分词，尚未接入专业中文 analyzer；
 - 没有 OCR、父子 Chunk 扩展、ACL、版本切换和事务 outbox；
-- 没有 Cross-Encoder reranker；
+- Cross-Encoder 目前是进程内 CPU/GPU 推理，尚未拆分为独立批处理服务；
 - FAISS 在文档新增或删除时按用户全量重建。
 
 这些边界由 `Retriever` 和 `HybridRAGService` 接口隔离。升级企业版时可把存储替换为 PostgreSQL、对象存储

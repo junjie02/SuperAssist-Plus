@@ -138,6 +138,26 @@ def test_official_media_scope_filters_search_and_blocks_fetch(monkeypatch) -> No
     assert "outside the configured official-media" in blocked
 
 
+def test_official_media_scope_enforces_shared_request_limit(monkeypatch) -> None:
+    requested: list[str] = []
+
+    def fetch(url):
+        requested.append(url)
+        return "plain text", "text/plain"
+
+    monkeypatch.setattr(web_module, "_fetch_url", fetch)
+
+    with official_media_web_scope(["gov.cn"], max_requests=2):
+        first = web_fetch.invoke({"url": "https://www.gov.cn/a"})
+        second = web_fetch.invoke({"url": "https://www.gov.cn/b"})
+        blocked = web_fetch.invoke({"url": "https://www.gov.cn/c"})
+
+    assert first == "plain text"
+    assert second == "plain text"
+    assert "request limit reached (2)" in blocked
+    assert requested == ["https://www.gov.cn/a", "https://www.gov.cn/b"]
+
+
 def test_tool_lookup_by_name() -> None:
     assert _tool("read_file").name == "read_file"
 

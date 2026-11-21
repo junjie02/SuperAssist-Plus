@@ -29,6 +29,15 @@ _MODEL_INPUT_LOG_BACKUPS = 3
 logger = logging.getLogger(__name__)
 
 
+class ModelFailoverRestart(RuntimeError):
+    """Signals that a partially streamed route must be replayed from scratch."""
+
+    def __init__(self, from_route: str, to_route: str) -> None:
+        self.from_route = from_route
+        self.to_route = to_route
+        super().__init__(f"Streaming route {from_route} failed after output; restart on {to_route}")
+
+
 class _FailoverRouteState:
     def __init__(self, selected_index: int = 0) -> None:
         self.selected_index = selected_index
@@ -198,8 +207,14 @@ class FailoverChatModel(BaseChatModel):
                 return
             except Exception as exc:  # noqa: BLE001 - see synchronous route boundary above
                 last_error = exc
-                if emitted or not _should_failover(exc) or index == len(self._routes) - 1:
+                if not _should_failover(exc) or index == len(self._routes) - 1:
                     raise
+                if emitted:
+                    self._route_state.selected_index = index + 1
+                    raise ModelFailoverRestart(
+                        self._route_names[index],
+                        self._route_names[index + 1],
+                    ) from exc
                 logger.warning(
                     "Streaming model route failed before first chunk; switching from %s to %s error_type=%s",
                     self._route_names[index],
@@ -297,45 +312,27 @@ class MiniMaxCompatibleChatModel(OneSecondRetryChatModel):
 
 def create_chat_model(settings: Settings | None = None) -> BaseChatModel:
     settings = settings or get_settings()
+    # An empty primary key is the documented deterministic offline mode. Do
+    # not let fallback credentials inherited from a project .env trigger a
+    # network call in tests or local development.
     if not settings.api_key:
-        routes: list[Runnable] = []
-        route_names: list[str] = []
-        if settings.claude_fallback_api_key and settings.claude_fallback_base_url:
-            routes.append(
-                _create_compatible_fallback_model(
-                    model=settings.claude_fallback_model,
-                    api_key=settings.claude_fallback_api_key,
-                    base_url=settings.claude_fallback_base_url,
-                    settings=settings,
-                    call_kind="lead_agent_claude_fallback",
-                )
-            )
-            route_names.append(f"claude:{settings.claude_fallback_model}")
-        if settings.deepseek_fallback_api_key and settings.deepseek_fallback_base_url:
-            routes.append(
-                _create_compatible_fallback_model(
-                    model=settings.deepseek_fallback_model,
-                    api_key=settings.deepseek_fallback_api_key,
-                    base_url=settings.deepseek_fallback_base_url,
-                    settings=settings,
-                    call_kind="lead_agent_deepseek_fallback",
-                )
-            )
-            route_names.append(f"deepseek:{settings.deepseek_fallback_model}")
-        if not routes:
-            return FallbackChatModel()
-        return routes[0] if len(routes) == 1 else FailoverChatModel(routes, route_names)
+        return FallbackChatModel()
     if settings.model_provider.lower() != "openai":
         raise ValueError(f"Unsupported model provider: {settings.model_provider}")
     kwargs = {
         "model": settings.model,
         "api_key": settings.api_key,
         "base_url": settings.base_url,
-        "timeout": 60,
+        "timeout": settings.model_timeout_seconds,
         "max_retries": 2,
         "stream_usage": True,
         "use_responses_api": settings.use_responses_api,
     }
+    if is_qwen_model(settings.model, settings.base_url):
+        # DashScope-compatible Qwen endpoints use Chat Completions and expose
+        # the reasoning switch in extra_body, matching the provider SDK.
+        kwargs["use_responses_api"] = False
+        kwargs["extra_body"] = {"enable_thinking": settings.enable_thinking is not False}
     if settings.use_responses_api:
         # Preserve the full multimodal turn across tool-loop requests.
         kwargs["use_previous_response_id"] = False
@@ -410,7 +407,7 @@ def _create_compatible_fallback_model(
         model=model,
         api_key=api_key,
         base_url=base_url,
-        timeout=60,
+        timeout=settings.model_timeout_seconds,
         max_retries=1,
         stream_usage=True,
         use_responses_api=settings.use_responses_api,
@@ -458,6 +455,10 @@ def create_memory_model(
 
 def is_minimax_model(model: str, base_url: str = "") -> bool:
     return "minimax" in model.lower() or "minimax" in base_url.lower()
+
+
+def is_qwen_model(model: str, base_url: str = "") -> bool:
+    return "qwen" in model.lower() or "qwen" in base_url.lower()
 
 
 def is_gpt_5_6_model(model: str) -> bool:

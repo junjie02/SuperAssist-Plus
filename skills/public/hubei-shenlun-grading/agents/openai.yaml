@@ -1,0 +1,4 @@
+interface:
+  display_name: "湖北申论答卷评分"
+  short_description: "按题号增量保存分批图片，补全题目与答案后再评分"
+  default_prompt: "Use $hubei-shenlun-grading to save every reliable fragment into its original-question file, continue incomplete files across uploads, and grade only when requested after all content is complete."

@@ -257,6 +257,11 @@ def test_multimodal_tool_result_becomes_responses_function_output() -> None:
             SUPERASSIST_BASE_URL="https://gateway.example/v1",
             SUPERASSIST_EMBEDDING_PROVIDER="hash",
             SUPERASSIST_USE_RESPONSES_API=True,
+            # Keep the primary route unwrapped: Settings would otherwise pick up
+            # the developer's .env fallbacks and return a FailoverChatModel.
+            SUPERASSIST_CLAUDE_FALLBACK_API_KEY="",
+            SUPERASSIST_DEEPSEEK_FALLBACK_API_KEY="",
+            SUPERASSIST_DEEPSEEK_FALLBACK_BASE_URL="",
         )
     )
     payload = model._get_request_payload(

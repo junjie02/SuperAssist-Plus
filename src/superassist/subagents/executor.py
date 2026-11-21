@@ -9,7 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from langchain.agents import create_agent
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
 from langgraph.errors import GraphRecursionError
@@ -319,8 +319,26 @@ class SubagentExecutor:
 
     def _finalize(self, state: dict[str, Any]) -> dict[str, Any]:
         holder = state["result"]
-        answer = _last_ai_text(state.get("messages", []))
+        messages = list(state.get("messages", []))
+        answer = _last_ai_text(messages)
         holder.result = answer
+        if self.config.name == "shenlun-quiz":
+            finalized, public_view = _quiz_workflow_succeeded(messages)
+            if not (finalized and public_view):
+                holder.status = SubagentStatus.FAILED
+                holder.error = (
+                    "Quiz workflow did not complete the required finalize -> public_view sequence; "
+                    "the task is not considered published."
+                )
+                holder.completed_at = datetime.now(UTC)
+                TASK_STORE.put(holder)
+                logger.warning(
+                    "Subagent quiz workflow incomplete: task_id=%s finalized=%s public_view=%s",
+                    holder.task_id,
+                    finalized,
+                    public_view,
+                )
+                return {"result": holder}
         holder.status = SubagentStatus.COMPLETED
         holder.completed_at = datetime.now(UTC)
         TASK_STORE.put(holder)
@@ -339,13 +357,19 @@ def _filter_tools(tools: list[BaseTool], allowed: list[str] | None) -> list[Base
 def _settings_for_model_profile(settings: Settings, profile: str) -> Settings:
     if profile != "memory":
         return settings
+    memory_model = settings.memory_model
+    memory_base_url = settings.memory_base_url or settings.base_url
+    is_qwen = "qwen" in memory_model.lower() or "qwen" in memory_base_url.lower()
     return settings.model_copy(
         update={
-            "model": settings.memory_model,
+            "model": memory_model,
             "api_key": settings.memory_api_key or settings.api_key,
-            "base_url": settings.memory_base_url or settings.base_url,
+            "base_url": memory_base_url,
             "max_tokens": settings.memory_max_tokens,
-            "use_responses_api": settings.use_responses_api,
+            # Qwen's enable_thinking switch is a Chat Completions extra_body
+            # parameter; Responses would silently ignore or reject it.
+            "use_responses_api": False if is_qwen else settings.use_responses_api,
+            "enable_thinking": False if is_qwen else settings.enable_thinking,
         }
     )
 
@@ -355,6 +379,33 @@ def _last_ai_text(messages: list[Any]) -> str:
         if isinstance(message, AIMessage):
             return clean_answer_text(message.content)
     return ""
+
+
+def _quiz_workflow_succeeded(messages: list[Any]) -> tuple[bool, bool]:
+    """Verify tool-side publication instead of trusting the model's final prose."""
+    pending: dict[str, tuple[str, str]] = {}
+    finalized = False
+    public_view = False
+    for message in messages:
+        if isinstance(message, AIMessage):
+            for call in getattr(message, "tool_calls", []) or []:
+                if not isinstance(call, dict) or call.get("name") != "daily_quiz_update":
+                    continue
+                call_id = str(call.get("id") or "")
+                args = call.get("args") if isinstance(call.get("args"), dict) else {}
+                if call_id:
+                    pending[call_id] = (str(args.get("action") or ""), call_id)
+        elif isinstance(message, ToolMessage):
+            action_info = pending.get(str(getattr(message, "tool_call_id", "") or ""))
+            if action_info is None:
+                continue
+            action = action_info[0]
+            content = str(getattr(message, "content", "") or "").strip()
+            if action == "finalize" and content.startswith("Quiz set finalized:"):
+                finalized = True
+            elif action == "public_view" and content and not content.startswith("Error:"):
+                public_view = True
+    return finalized, public_view
 
 
 def _run_coro_sync(coro):

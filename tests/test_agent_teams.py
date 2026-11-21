@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -152,6 +153,23 @@ def test_jsonl_bus_writes_inbox_and_raw_outbox_separately(tmp_path: Path) -> Non
     assert not bus.ledger_path("t").exists()
 
 
+def test_jsonl_side_channels_are_hash_chained_and_signed(tmp_path: Path) -> None:
+    bus = TeamLedger(tmp_path)
+    bus.append_inbox("t", "codex", {"prompt": "one"})
+    bus.append_inbox("t", "codex", {"prompt": "two"})
+
+    records = bus.read_inbox("t", "codex")
+    assert [record["seq"] for record in records] == [1, 2]
+    assert records[1]["prev_hash"] == records[0]["hash"]
+
+    path = bus.inbox_path("t", "codex")
+    record = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    record["payload"]["prompt"] = "tampered"
+    path.write_text(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+    with pytest.raises(LedgerTamperError, match="hash mismatch"):
+        bus.read_inbox("t", "codex")
+
+
 class FakeMember:
     instances: list["FakeMember"] = []
 
@@ -211,6 +229,32 @@ def test_team_supervisor_unknown_agent_returns_clear_error(tmp_path: Path) -> No
 
     with pytest.raises(Exception, match="Unknown team agent"):
         supervisor.invoke("missing", thread_id="t", description="bad", prompt="no")
+
+
+def test_team_supervisor_supports_durable_async_tasks(tmp_path: Path) -> None:
+    FakeMember.instances.clear()
+    supervisor = TeamSupervisor(
+        _team_config(),
+        settings=Settings(SUPERASSIST_DATA_DIR=tmp_path, SUPERASSIST_EMBEDDING_PROVIDER="hash"),
+        member_factory=FakeMember,
+    )
+    try:
+        queued = supervisor.invoke("codex", thread_id="t", description="async", prompt="background", wait=False)
+        assert queued.status == "queued"
+        for _ in range(100):
+            status = supervisor.poll(queued.task_id, thread_id="t")
+            if status.status == "completed":
+                break
+            time.sleep(0.01)
+        assert status.status == "completed"
+        assert status.result == "codex saw 1: background"
+        assert [record["kind"] for record in supervisor.bus.read_ledger("t")] == [
+            "task",
+            "task_started",
+            "result",
+        ]
+    finally:
+        supervisor.close()
 
 
 def test_team_task_uses_active_thread_context(tmp_path: Path) -> None:

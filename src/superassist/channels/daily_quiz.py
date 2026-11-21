@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 QUIZ_OPTIONS = ("A", "B", "C", "D")
 QUIZ_PUBLIC_RESOURCE = "quiz://current/public"
 QUIZ_PRIVATE_RESOURCE = "quiz://current/private"
+QUIZ_WRONGBOOK_RESOURCE = "quiz://current/wrongbook"
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -92,8 +93,8 @@ class DailyQuizStore:
             _atomic_json(path, data)
             _atomic_text(chat_dir / "日报笔记本.md", self._render_notebook(records, when.date()))
 
-    def has_notebook(self, chat_id: str) -> bool:
-        return bool(self._notebook_records(chat_id))
+    def has_notebook(self, chat_id: str, now: datetime | None = None) -> bool:
+        return bool(self._notebook_records(chat_id, now))
 
     def start_session(
         self,
@@ -176,6 +177,8 @@ class DailyQuizStore:
         private_available = bool(questions) and (
             session.get("status") == "completed" or len(submitted_answers) == len(questions)
         )
+        chat_id = str(session.get("chat_id") or "")
+        wrong_items = self._wrong_items(chat_id) if chat_id else []
         return {
             "status": str(session.get("status") or "unknown"),
             "session_id": str(session.get("session_id") or ""),
@@ -183,6 +186,9 @@ class DailyQuizStore:
             "public_resource": QUIZ_PUBLIC_RESOURCE,
             "private_resource": QUIZ_PRIVATE_RESOURCE,
             "private_available": private_available,
+            "wrongbook_resource": QUIZ_WRONGBOOK_RESOURCE,
+            "wrongbook_count": len(wrong_items),
+            "active_wrongbook_count": sum(1 for item in wrong_items if item.get("status") != "mastered"),
         }
 
     def resolve_current_resource(self, thread_id: str, resource: str) -> Path:
@@ -194,6 +200,15 @@ class DailyQuizStore:
             if not path.exists():
                 with self._lock:
                     self._write_current_resources(session)
+            return path
+        if resource == QUIZ_WRONGBOOK_RESOURCE:
+            chat_id = str(session.get("chat_id") or "")
+            if not chat_id:
+                raise FileNotFoundError("No quiz chat is mapped to the current conversation")
+            path = self._chat_dir(chat_id) / "错题本.md"
+            if not path.exists():
+                with self._lock:
+                    _atomic_text(path, self._render_wrongbook(self._wrong_items(chat_id)))
             return path
         if resource != QUIZ_PRIVATE_RESOURCE:
             raise FileNotFoundError(f"Unknown quiz resource: {resource}")
@@ -221,7 +236,9 @@ class DailyQuizStore:
         *,
         question_count: int | str | None = None,
     ) -> str:
-        if not self.has_notebook(chat_id):
+        # Retention is measured against the caller's reference time so a brief
+        # delivered at a simulated "now" is not judged against wall-clock today.
+        if not self.has_notebook(chat_id, now):
             return "Error: recent daily brief notebook is empty"
         try:
             session = self.start_session(
@@ -235,7 +252,7 @@ class DailyQuizStore:
             return f"Error: invalid quiz question_count: {exc}"
         return f"""<QuizGenerationMaterials>
 题量：{session.get('question_count')}。
-{self._study_material(session)}
+{self._study_material(session, now)}
 </QuizGenerationMaterials>"""
 
     def save_draft(self, thread_id: str, questions: list[dict[str, Any]]) -> str:
@@ -306,7 +323,7 @@ class DailyQuizStore:
 1. 逐题查看 selected_option、correct_option、is_correct、explanation 和 evidence，不得重新判定或更改 is_correct。
 2. 为每题形成结果对象：number、feedback、weakness。feedback 要解释正确依据及主要干扰项；答错时 weakness 要指出具体薄弱点，答对时可为空。
 3. 调用 `daily_quiz_update`，action=`grade`，一次提交全部 results，并填写 overall_feedback。工具会按保存的答案确定最终正误、分数并更新错题本。
-4. 工具保存成功后，由你输出完整批改报告：总分、逐题用户答案、标准答案、正误、解析，最后总结薄弱点和复习建议。
+4. 工具保存成功后，由你输出完整批改报告：总分、每道题的原题、用户答案、标准答案、正误、解析，最后总结薄弱点和复习建议。
 5. 不得跳过工具调用，不得只给答案表，也不得生成下一组题。
 </DailyPoliticalQuizGrading>"""
 
@@ -380,11 +397,12 @@ class DailyQuizStore:
             self._archive_quiz(session)
             return f"Agent grading saved. Score: {correct_count}/{len(questions)}. Now present the full grading report."
 
-    def _study_material(self, session: dict[str, Any]) -> str:
+    def _study_material(self, session: dict[str, Any], now: datetime | None = None) -> str:
         chat_id = str(session.get("chat_id") or "")
-        records = self._notebook_records(chat_id)
+        reference = self._local_datetime(now)
+        records = self._notebook_records(chat_id, reference)
         active_wrong = self._wrong_items(chat_id, active_only=True)
-        notebook = self._render_notebook(records, self._local_datetime(None).date())
+        notebook = self._render_notebook(records, reference.date())
         wrongbook = self._render_wrongbook(self._wrong_items(chat_id), include_heading=False)
         return f"""总题量：{session.get('question_count')} 题。覆盖近几日日报的主要政策理论，并优先复习未掌握错题。
 当前 active 错题数：{len(active_wrong)}。
@@ -519,15 +537,126 @@ class DailyQuizStore:
         _atomic_json(path, data)
         _atomic_text(chat_dir / "错题本.md", self._render_wrongbook(items))
 
-    def _notebook_records(self, chat_id: str) -> list[dict[str, Any]]:
+    def add_wrong_question(self, chat_id: str, payload: dict[str, Any]) -> str:
+        """Add a manually reported mistake while keeping JSON and Markdown in sync."""
+
+        if not str(chat_id or "").strip():
+            return "Error: wrongbook requires a mapped Feishu chat"
+        question = str(payload.get("question") or "").strip()
+        correct_option = str(payload.get("correct_option") or "").strip().upper()
+        explanation = str(payload.get("explanation") or "").strip()
+        weakness = str(payload.get("weakness") or "").strip()
+        if not question or not explanation or not weakness:
+            return "Error: wrong_question requires question, explanation, and weakness"
+        if correct_option not in QUIZ_OPTIONS:
+            return "Error: wrong_question.correct_option must be A, B, C, or D"
+
+        raw_options = payload.get("options") if isinstance(payload.get("options"), dict) else {}
+        options = {
+            key: str(raw_options.get(key) or payload.get(f"option_{key.lower()}") or "").strip()
+            for key in QUIZ_OPTIONS
+        }
+        selected = str(payload.get("selected_option") or "").strip().upper()
+        if selected and selected not in QUIZ_OPTIONS:
+            return "Error: wrong_question.selected_option must be A, B, C, or D"
+        if selected == correct_option:
+            return "Error: wrong_question.selected_option must differ from correct_option"
+        source_date = str(payload.get("source_date") or "").strip()
+        source_title = str(payload.get("source_title") or "").strip()
+        evidence = str(payload.get("evidence") or "").strip()[:4000]
+        feedback = str(payload.get("feedback") or "").strip()
+        question_key = self._wrongbook_question_key(question)
+        now = datetime.now(UTC).isoformat()
+
+        with self._lock:
+            chat_dir = self._chat_dir(chat_id)
+            path = chat_dir / "wrong_questions.json"
+            data = _read_json(path, {"chat_id": chat_id, "items": []})
+            items = [item for item in data.get("items", []) if isinstance(item, dict)]
+            item_id = str(payload.get("wrong_question_id") or "").strip()
+            existing = next(
+                (
+                    item
+                    for item in items
+                    if (item_id and str(item.get("id")) == item_id)
+                    or self._wrongbook_question_key(str(item.get("question") or "")) == question_key
+                ),
+                None,
+            )
+            if existing is None:
+                item_id = "W-" + hashlib.sha1(
+                    f"{question}|{source_date}".encode("utf-8")
+                ).hexdigest()[:10].upper()
+                collision = 0
+                while any(str(item.get("id")) == item_id for item in items):
+                    collision += 1
+                    item_id = "W-" + hashlib.sha1(
+                        f"{question}|{source_date}|{now}|{collision}".encode("utf-8")
+                    ).hexdigest()[:10].upper()
+                items.append(
+                    {
+                        "id": item_id,
+                        "status": "active",
+                        "question": question,
+                        "options": options,
+                        "correct_option": correct_option,
+                        "explanation": explanation,
+                        "source_date": source_date,
+                        "source_title": source_title,
+                        "evidence": evidence,
+                        "wrong_count": 1,
+                        "last_selected_option": selected,
+                        "feedback": feedback,
+                        "weakness": weakness,
+                        "created_at": now,
+                        "last_wrong_at": now,
+                    }
+                )
+                message = f"Wrongbook entry added: {item_id}."
+            else:
+                item_id = str(existing.get("id") or item_id)
+                existing.update(
+                    {
+                        "status": "active",
+                        "question": question,
+                        "correct_option": correct_option,
+                        "explanation": explanation,
+                        "last_selected_option": selected or existing.get("last_selected_option") or "",
+                        "weakness": weakness,
+                        "last_wrong_at": now,
+                    }
+                )
+                if any(options.values()):
+                    existing["options"] = options
+                if source_date:
+                    existing["source_date"] = source_date
+                if source_title:
+                    existing["source_title"] = source_title
+                if evidence:
+                    existing["evidence"] = evidence
+                if feedback:
+                    existing["feedback"] = feedback
+                existing["wrong_count"] = int(existing.get("wrong_count") or 0) + 1
+                existing.pop("mastered_at", None)
+                message = f"Wrongbook entry updated: {item_id}."
+            data = {"chat_id": chat_id, "updated_at": now, "items": items}
+            _atomic_json(path, data)
+            _atomic_text(chat_dir / "错题本.md", self._render_wrongbook(items))
+            return f"{message} Total entries: {len(items)}."
+
+    def _notebook_records(self, chat_id: str, now: datetime | None = None) -> list[dict[str, Any]]:
         data = _read_json(self._chat_dir(chat_id) / "briefs.json", {"briefs": []})
-        cutoff = self._local_datetime(None).date() - timedelta(days=self.settings.daily_quiz_notebook_days - 1)
+        cutoff = self._local_datetime(now).date() - timedelta(days=self.settings.daily_quiz_notebook_days - 1)
         return [item for item in data.get("briefs", []) if self._entry_date(item) >= cutoff]
 
     def _wrong_items(self, chat_id: str, *, active_only: bool = False) -> list[dict[str, Any]]:
         data = _read_json(self._chat_dir(chat_id) / "wrong_questions.json", {"items": []})
         items = [item for item in data.get("items", []) if isinstance(item, dict)]
         return [item for item in items if item.get("status") == "active"] if active_only else items
+
+    @staticmethod
+    def _wrongbook_question_key(question: str) -> str:
+        return re.sub(r"\W+", "", question).casefold()
 
     @staticmethod
     def _render_question_set(questions: list[dict[str, Any]]) -> str:
@@ -711,7 +840,7 @@ def get_daily_quiz_store(settings: Settings) -> DailyQuizStore:
 
 
 def resolve_daily_quiz_virtual_path(settings: Settings, resource: str) -> Path:
-    if resource not in {QUIZ_PUBLIC_RESOURCE, QUIZ_PRIVATE_RESOURCE}:
+    if resource not in {QUIZ_PUBLIC_RESOURCE, QUIZ_PRIVATE_RESOURCE, QUIZ_WRONGBOOK_RESOURCE}:
         raise FileNotFoundError(f"Unknown quiz resource: {resource}")
     thread_id = current_team_thread_id()
     if not thread_id:
@@ -728,16 +857,33 @@ def make_daily_quiz_tool(
 
     @tool("daily_quiz_update")
     def daily_quiz_update(
-        action: Literal["prepare_generation", "draft", "finalize", "public_view", "grading_context", "grade"],
+        action: Literal[
+            "prepare_generation",
+            "draft",
+            "finalize",
+            "public_view",
+            "grading_context",
+            "grade",
+            "wrongbook_add",
+        ],
         question_count: Annotated[
             int | None,
             Field(ge=1, le=30, description="Requested size for a new generated quiz set."),
         ] = None,
-        questions: list[dict[str, Any]] | None = None,
+        questions: Annotated[
+            list[dict[str, Any]] | str | None,
+            Field(
+                description=(
+                    "For action=draft, pass a native JSON array of question objects, "
+                    "for example [{\"question\":\"...\"}]. Do not quote or stringify the array."
+                )
+            ),
+        ] = None,
         review_summary: str = "",
         answers: list[str] | None = None,
         results: list[dict[str, Any]] | None = None,
         overall_feedback: str = "",
+        wrong_question: dict[str, Any] | None = None,
     ) -> str:
         """Save and review a quiz set, or persist the main Agent's grading decisions.
 
@@ -754,6 +900,16 @@ def make_daily_quiz_tool(
         use action=grade with one result per question containing number, feedback,
         and weakness, plus overall_feedback. The tool compares every submitted option
         with the saved answer key and persists the deterministic result.
+        When the main Agent identifies a mistake outside that grading flow, use
+        action=wrongbook_add with wrong_question containing question, correct_option,
+        explanation, and weakness. It may also contain options, selected_option,
+        feedback, source_date, source_title, and evidence. Grading already adds wrong
+        answers automatically, so do not add the same graded mistake a second time.
+
+        The questions argument must be a native JSON array, never a JSON-encoded
+        string. If draft validation fails, retry with the corrected array. Never
+        fabricate or manually simulate a public quiz; public output is allowed only
+        after successful finalize followed by public_view.
         """
 
         thread_id = current_team_thread_id()
@@ -773,6 +929,15 @@ def make_daily_quiz_tool(
                 thread_id,
                 question_count=requested_count,
             )
+        if action == "wrongbook_add":
+            from superassist.channels.store import FeishuThreadStore
+
+            entry = FeishuThreadStore(settings.feishu_thread_store_path).get_entry_by_thread_id(thread_id)
+            if entry is None:
+                return "Error: no Feishu conversation is mapped to this thread"
+            if not isinstance(wrong_question, dict):
+                return "Error: action=wrongbook_add requires a wrong_question object"
+            return store.add_wrong_question(str(entry.get("chat_id") or ""), wrong_question)
         if action == "public_view":
             return store.current_quiz_text(thread_id) or "Error: no finalized quiz is active"
         if action == "grading_context":
@@ -782,9 +947,27 @@ def make_daily_quiz_tool(
             return store.save_grading(thread_id, list(results or []), overall_feedback)
         if action == "finalize":
             return store.finalize(thread_id, review_summary)
-        return store.save_draft(thread_id, list(questions or []))
+        normalized_questions, error = _coerce_questions_argument(questions)
+        if error:
+            return error
+        return store.save_draft(thread_id, normalized_questions)
 
     return daily_quiz_update
+
+
+def _coerce_questions_argument(value: list[dict[str, Any]] | str | None) -> tuple[list[dict[str, Any]], str | None]:
+    """Accept one provider's accidental JSON-string encoding without weakening validation."""
+    parsed: Any = value
+    for _ in range(2):
+        if not isinstance(parsed, str):
+            break
+        try:
+            parsed = json.loads(parsed)
+        except json.JSONDecodeError:
+            return [], "Error: action=draft requires questions to be a valid JSON array of objects"
+    if not isinstance(parsed, list) or not all(isinstance(item, dict) for item in parsed):
+        return [], "Error: action=draft requires questions to be a JSON array of objects, not a scalar string"
+    return list(parsed), None
 
 
 class DailyQuizScheduler:

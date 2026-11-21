@@ -4,9 +4,10 @@ from langchain_core.tools import BaseTool
 
 from superassist.tools.files import delete_path, list_files, read_file, write_file
 from superassist.tools.images import generate_image, image_search, inspect_image, present_images
+from superassist.tools.ocr import ocr_image
 from superassist.tools.shell import shell as shell_tool
 from superassist.tools.task import make_task_tool, task
-from superassist.tools.team import team_task
+from superassist.tools.team import team_task, team_task_status
 from superassist.tools.web import web_fetch, web_search
 
 
@@ -24,11 +25,12 @@ def default_tools(
         web_search,
         web_fetch,
         shell_tool,
+        ocr_image,
     ]
     if include_images:
         tools.extend([image_search, inspect_image, present_images, generate_image])
     if include_task:
         tools.append(make_task_tool(run_event_reporter) if run_event_reporter is not None else task)
     if include_team_task:
-        tools.append(team_task)
+        tools.extend([team_task, team_task_status])
     return tools

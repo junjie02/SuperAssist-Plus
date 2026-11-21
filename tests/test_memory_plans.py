@@ -12,6 +12,7 @@ from superassist.memory.plans import (
     UpdateNodeOp,
     UpdatePlan,
 )
+from superassist.models import NodeType
 
 
 def test_update_plan_round_trips_operations_payload() -> None:
@@ -45,19 +46,23 @@ def test_update_plan_round_trips_operations_payload() -> None:
     assert plan.operations[1].weight == 0.8
 
 
-def test_update_plan_rejects_event_in_add_node() -> None:
-    with pytest.raises(Exception):
-        UpdatePlan.model_validate(
-            {
-                "operations": [
-                    {
-                        "op": "ADD_NODE",
-                        "node_type": "event",
-                        "data": {"description": "x"},
-                    }
-                ]
-            }
-        )
+def test_update_plan_accepts_event_in_add_node() -> None:
+    # The memory writer records the current turn as an event node, so plans must
+    # be able to carry one.
+    plan = UpdatePlan.model_validate(
+        {
+            "operations": [
+                {
+                    "op": "ADD_NODE",
+                    "node_type": "event",
+                    "data": {"description": "x"},
+                }
+            ]
+        }
+    )
+
+    assert isinstance(plan.operations[0], AddNodeOp)
+    assert plan.operations[0].node_type is NodeType.EVENT
 
 
 def test_update_plan_rejects_unknown_edge_type() -> None:
@@ -110,11 +115,17 @@ def test_update_plan_legacy_nodes_become_add_node_and_grounds_edge() -> None:
     assert add_edge.edge_type.value == "GROUNDS"
 
 
-def test_update_plan_legacy_skips_event_nodes() -> None:
+def test_update_plan_legacy_keeps_event_nodes() -> None:
+    # The fallback writer emits `{nodes: [{type: event}, ...]}`; the event node
+    # must survive parsing so the turn itself is recorded in the graph.
     plan = UpdatePlan.parse(
-        {"nodes": [{"type": "event", "title": "ignored", "description": "ignored"}]}
+        {"nodes": [{"type": "event", "title": "turn", "description": "User: hi"}]}
     )
-    assert plan.operations == []
+
+    assert len(plan.operations) == 1
+    operation = plan.operations[0]
+    assert isinstance(operation, AddNodeOp)
+    assert operation.node_type is NodeType.EVENT
 
 
 def test_update_plan_handles_empty_input() -> None:

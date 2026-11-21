@@ -1,8 +1,9 @@
 """Public entry point that drives one agent turn.
 
-The actual agent graph (model + tools + middleware chain) is built by
-``factory.build_agent`` and consists of a single LangChain ``create_agent``
-call — there is no outer LangGraph state graph. This runtime only:
+The ordinary agent graph (model + tools + middleware chain) is built by
+``factory.build_agent`` as a single LangChain ``create_agent`` call. RAG turns
+can instead use an explicit outer ``AgenticRagGraph`` when the feature flag is
+enabled. This runtime:
 
 * loads thread history from disk into the initial message list
 * invokes ``agent.invoke`` (sync) or ``agent.stream`` (streaming)
@@ -32,9 +33,23 @@ from superassist.agent.short_memory import (
 from superassist.agent.state import SuperAssistState
 from superassist.agent.streaming import StreamParts, accumulate_stream_parts, clean_answer_text
 from superassist.config import Settings, get_settings
-from superassist.llm import is_minimax_model
+from superassist.conversation_state import (
+    CLEAR_COMMAND,
+    CLEAR_CONFIRMATION,
+    CLEAR_WITH_ATTACHMENTS_MESSAGE,
+    ConversationStateBusyError,
+    clear_short_state,
+    conversation_state_lock,
+    parse_clear_command,
+    thread_generation,
+)
+from superassist.llm import ModelFailoverRestart, is_minimax_model
+from superassist.middlewares.memory_recall_middleware import MemoryRecallMiddleware
+from superassist.middlewares.memory_writer_middleware import MemoryWriterMiddleware
+from superassist.middlewares.short_memory_middleware import ShortMemoryMiddleware
 from superassist.models import AgentRunEvent, AgentRunResult
 from superassist.observability import runnable_trace_config, traceable, without_self
+from superassist.rag.agentic_graph import AgenticRagGraph
 from superassist.rag.context import rag_turn_context
 from superassist.rag.service import HybridRAGService
 from superassist.redis_store import get_redis_store
@@ -71,6 +86,14 @@ class AgentRuntime:
             rag_mode=rag_mode,
             rag_service=rag_service,
         )
+        self._agentic_graph: AgenticRagGraph | None = None
+        if self.rag_mode and rag_service is not None and getattr(self.settings, "agentic_rag_enabled", False):
+            self._agentic_graph = AgenticRagGraph(
+                model=self._bundle.model,
+                retriever=rag_service,
+                settings=self.settings,
+                reporter=self._run_event_reporter,
+            )
 
     @property
     def agent(self) -> Any:
@@ -107,9 +130,15 @@ class AgentRuntime:
 
             if get_team_supervisor() is self.team_supervisor:
                 set_team_supervisor(None)
+        store = getattr(self.memory, "store", None)
+        engine = getattr(store, "_engine", None) or getattr(store, "engine", None)
+        if engine is not None:
+            engine.dispose()
 
     def set_run_event_reporter(self, reporter: Callable[[AgentRunEvent], None] | None) -> None:
         self._run_event_reporter = reporter
+        if self._agentic_graph is not None:
+            self._agentic_graph.reporter = reporter
 
     # -- Sync turn ---------------------------------------------------------
 
@@ -143,38 +172,48 @@ class AgentRuntime:
         suppress_memory_write: bool,
         suppress_short_memory_write: bool,
     ) -> AgentRunResult:
+        resolved_thread_id = thread_id or f"thread_{uuid4().hex[:12]}"
+        if parse_clear_command(message):
+            return self._clear_command_result(resolved_thread_id, user_id=user_id, emit_answer=False)
         allowed, count = self._redis.allow_request(user_id)
         if not allowed:
-            return self._rate_limit_result(thread_id, count)
-        state = self._initial_state(
-            message,
-            user_id=user_id,
-            thread_id=thread_id,
-            memory_query=memory_query,
-            suppress_memory_write=suppress_memory_write,
-            suppress_short_memory_write=suppress_short_memory_write,
-        )
-        with run_event_reporter_context(self._run_event_reporter):
-            self._report_run_event("preparing_context", "Preparing context...", thread_id=state["thread_id"])
-            try:
-                with rag_turn_context(
-                    self._bundle.rag_service,
-                    user_id,
-                    self.rag_mode,
-                ), team_thread_context(state["thread_id"]):
-                    final_state = self.agent.invoke(
-                        state,
-                        runnable_trace_config(
-                            run_name="superassist.lead_agent",
-                            user_id=user_id,
-                            thread_id=state["thread_id"],
-                            tags=["agent", "lead"],
-                            metadata={"streaming": False, **self._tool_compatibility_metadata()},
-                        ),
-                    )
-            except Exception as exc:
-                return self._error_result(state["thread_id"], exc)
-        return self._result_from(state["thread_id"], final_state)
+            return self._rate_limit_result(resolved_thread_id, count)
+        try:
+            with conversation_state_lock(self.settings, resolved_thread_id, redis_store=self._redis):
+                state = self._initial_state(
+                    message,
+                    user_id=user_id,
+                    thread_id=resolved_thread_id,
+                    memory_query=memory_query,
+                    suppress_memory_write=suppress_memory_write,
+                    suppress_short_memory_write=suppress_short_memory_write,
+                )
+                with run_event_reporter_context(self._run_event_reporter):
+                    self._report_run_event("preparing_context", "Preparing context...", thread_id=state["thread_id"])
+                    try:
+                        if self._agentic_graph is not None:
+                            final_state = self._run_agentic_graph(state, user_id=user_id)
+                        else:
+                            with rag_turn_context(
+                                self._bundle.rag_service,
+                                user_id,
+                                self.rag_mode,
+                            ), team_thread_context(state["thread_id"]):
+                                final_state = self.agent.invoke(
+                                    state,
+                                    runnable_trace_config(
+                                        run_name="superassist.lead_agent",
+                                        user_id=user_id,
+                                        thread_id=state["thread_id"],
+                                        tags=["agent", "lead"],
+                                        metadata={"streaming": False, **self._tool_compatibility_metadata()},
+                                    ),
+                                )
+                    except Exception as exc:
+                        return self._error_result(state["thread_id"], exc)
+                return self._result_from(state["thread_id"], final_state)
+        except ConversationStateBusyError:
+            return self._busy_result(resolved_thread_id)
 
     # -- Streaming turn ----------------------------------------------------
 
@@ -214,27 +253,97 @@ class AgentRuntime:
         suppress_short_memory_write: bool = False,
         memory_source_context: dict[str, Any] | None = None,
     ) -> AgentRunResult:
+        resolved_thread_id = thread_id or f"thread_{uuid4().hex[:12]}"
+        if parse_clear_command(message):
+            if isinstance(message_content, list):
+                return self._direct_result(
+                    resolved_thread_id,
+                    CLEAR_WITH_ATTACHMENTS_MESSAGE,
+                    emit_answer=True,
+                    clear_rejected=True,
+                )
+            return self._clear_command_result(resolved_thread_id, user_id=user_id, emit_answer=True)
         allowed, count = self._redis.allow_request(user_id)
         if not allowed:
-            return self._rate_limit_result(thread_id, count)
-        state = self._initial_state(
-            message,
+            return self._rate_limit_result(resolved_thread_id, count)
+        try:
+            with conversation_state_lock(self.settings, resolved_thread_id, redis_store=self._redis):
+                state = self._initial_state(
+                    message,
+                    user_id=user_id,
+                    thread_id=resolved_thread_id,
+                    message_content=message_content,
+                    memory_query=memory_query,
+                    suppress_memory_write=suppress_memory_write,
+                    suppress_short_memory_write=suppress_short_memory_write,
+                    memory_source_context=memory_source_context,
+                )
+                with run_event_reporter_context(self._run_event_reporter):
+                    self._report_run_event("preparing_context", "Preparing context...", thread_id=state["thread_id"])
+                    self._report_run_event("thinking", "Thinking...", thread_id=state["thread_id"])
+                    try:
+                        if self._agentic_graph is not None:
+                            final_state = self._run_agentic_graph(state, user_id=user_id, emit_answer=True)
+                        else:
+                            final_state = self._stream_agent(state, user_id=user_id, thread_id=state["thread_id"])
+                    except Exception as exc:
+                        return self._error_result(state["thread_id"], exc)
+                return self._result_from(state["thread_id"], final_state)
+        except ConversationStateBusyError:
+            return self._busy_result(resolved_thread_id)
+
+    def _run_agentic_graph(
+        self,
+        state: SuperAssistState,
+        *,
+        user_id: str,
+        emit_answer: bool = False,
+    ) -> dict[str, Any]:
+        """Run the explicit RAG graph and persist the completed turn once."""
+
+        assert self._agentic_graph is not None
+        working_state: dict[str, Any] = dict(state)
+        recall_update = MemoryRecallMiddleware(self.memory).before_agent(working_state, runtime=None)
+        if recall_update:
+            working_state.update(recall_update)
+            recall = recall_update.get("memory_recall")
+            if recall:
+                working_state["messages"] = [
+                    *list(working_state.get("messages") or []),
+                    SystemMessage(content=f"<LongTermMemory>\n{json.dumps(recall, ensure_ascii=False)}\n</LongTermMemory>"),
+                ]
+        graph_state = self._agentic_graph.initial_state(
+            messages=list(working_state.get("messages") or []),
+            input_text=str(working_state.get("input") or ""),
             user_id=user_id,
-            thread_id=thread_id,
-            message_content=message_content,
-            memory_query=memory_query,
-            suppress_memory_write=suppress_memory_write,
-            suppress_short_memory_write=suppress_short_memory_write,
-            memory_source_context=memory_source_context,
+            thread_id=str(working_state.get("thread_id") or ""),
+            metadata=dict(working_state.get("metadata") or {}),
         )
-        with run_event_reporter_context(self._run_event_reporter):
-            self._report_run_event("preparing_context", "Preparing context...", thread_id=state["thread_id"])
-            self._report_run_event("thinking", "Thinking...", thread_id=state["thread_id"])
-            try:
-                final_state = self._stream_agent(state, user_id=user_id, thread_id=state["thread_id"])
-            except Exception as exc:
-                return self._error_result(state["thread_id"], exc)
-        return self._result_from(state["thread_id"], final_state)
+        graph_state.update({"memory_event_id": working_state.get("memory_event_id", "")})
+        with team_thread_context(str(working_state.get("thread_id") or "")):
+            final_state = self._agentic_graph.invoke(graph_state)
+        result = {**working_state, **final_state}
+        answer = str(final_state.get("answer") or "").strip()
+        if answer:
+            result["messages"] = [
+                *list(working_state.get("messages") or []),
+                AIMessage(content=answer),
+            ]
+        self._persist_agentic_turn(result)
+        if emit_answer and answer:
+            self._report_agent_text(answer, thread_id=str(working_state.get("thread_id") or ""))
+        return result
+
+    def _persist_agentic_turn(self, state: dict[str, Any]) -> None:
+        """Apply the existing durable side effects exactly once after finalize."""
+
+        if not state.get("messages"):
+            return
+        try:
+            ShortMemoryMiddleware(self.settings, self._bundle.short_memory_model).after_agent(state, runtime=None)
+            MemoryWriterMiddleware(self.memory_queue).after_agent(state, runtime=None)
+        except Exception:
+            logger.exception("Agentic RAG turn persistence failed")
 
     def _stream_agent(self, state: SuperAssistState, *, user_id: str, thread_id: str) -> dict[str, Any]:
         last_values: dict[str, Any] | None = None
@@ -250,33 +359,60 @@ class AgentRuntime:
                 user_id,
                 self.rag_mode,
             ), team_thread_context(thread_id):
-                for item in self.agent.stream(
-                    state,
-                    runnable_trace_config(
-                        run_name="superassist.lead_agent.streaming",
-                        user_id=user_id,
-                        thread_id=thread_id,
-                        tags=["agent", "lead", "streaming"],
-                        metadata={"streaming": True, **self._tool_compatibility_metadata()},
-                    ),
-                    stream_mode=["messages", "values"],
-                ):
-                    if isinstance(item, tuple) and len(item) == 2:
-                        mode, chunk = str(item[0]), item[1]
-                    else:
-                        mode, chunk = "values", item
-                    if mode == "messages":
-                        _accumulate_stream_usage(usage_totals, seen_usage, chunk)
-                        reasoning, text, current_message_id = accumulate_stream_parts(
-                            stream_buffers, current_message_id, chunk
+                replay_state: dict[str, Any] = dict(state)
+                while True:
+                    try:
+                        for item in self.agent.stream(
+                            replay_state,
+                            runnable_trace_config(
+                                run_name="superassist.lead_agent.streaming",
+                                user_id=user_id,
+                                thread_id=thread_id,
+                                tags=["agent", "lead", "streaming"],
+                                metadata={"streaming": True, **self._tool_compatibility_metadata()},
+                            ),
+                            stream_mode=["messages", "values"],
+                        ):
+                            if isinstance(item, tuple) and len(item) == 2:
+                                mode, chunk = str(item[0]), item[1]
+                            else:
+                                mode, chunk = "values", item
+                            if mode == "messages":
+                                _accumulate_stream_usage(usage_totals, seen_usage, chunk)
+                                reasoning, text, current_message_id = accumulate_stream_parts(
+                                    stream_buffers, current_message_id, chunk
+                                )
+                                if reasoning:
+                                    self._report_run_event("agent_reasoning", reasoning, thread_id=thread_id)
+                                if text:
+                                    self._report_agent_text(text, thread_id=thread_id)
+                                continue
+                            if mode == "values" and isinstance(chunk, dict):
+                                last_values = chunk
+                        break
+                    except ModelFailoverRestart as exc:
+                        logger.warning(
+                            "Restarting streamed agent turn on fallback route from=%s to=%s",
+                            exc.from_route,
+                            exc.to_route,
                         )
-                        if reasoning:
-                            self._report_run_event("agent_reasoning", reasoning, thread_id=thread_id)
-                        if text:
-                            self._report_agent_text(text, thread_id=thread_id)
-                        continue
-                    if mode == "values" and isinstance(chunk, dict):
-                        last_values = chunk
+                        self._report_run_event(
+                            "model_failover_reset",
+                            "主模型响应中断，正在切换备用模型...",
+                            thread_id=thread_id,
+                            from_route=exc.from_route,
+                            to_route=exc.to_route,
+                        )
+                        stream_buffers.clear()
+                        current_message_id = None
+                        usage_totals = {"input_tokens": 0, "output_tokens": 0, "cache_read": 0}
+                        seen_usage.clear()
+                        if self._active_agent_text_seen is not None:
+                            self._active_agent_text_seen.clear()
+                        # A values event is emitted only after a graph node commits,
+                        # so replaying it avoids repeating completed tool calls while
+                        # excluding the failed model's partial AI message.
+                        replay_state = dict(last_values or state)
         finally:
             self._active_agent_text_seen = previous_seen
         result = last_values or dict(state)
@@ -315,11 +451,12 @@ class AgentRuntime:
         resolved_thread_id = thread_id or f"thread_{uuid4().hex[:12]}"
         message_created_at = datetime.now(UTC).isoformat()
         thread_metadata = self._load_thread_metadata(resolved_thread_id)
-        history = self._load_history(resolved_thread_id, thread_metadata)
+        generation = thread_generation(thread_metadata)
+        history = self._load_history(resolved_thread_id, thread_metadata, generation=generation)
         skill_activations = active_skill_activations(
             {
                 **dict(thread_metadata.get("skill_activations") or {}),
-                **self._redis.load_skill_activations(resolved_thread_id),
+                **self._redis.load_skill_activations(resolved_thread_id, generation=generation),
             },
             self.settings.skill_active_ttl_seconds,
         )
@@ -334,6 +471,7 @@ class AgentRuntime:
             "loaded_skills": loaded_skills,
             "skill_activations": skill_activations,
             "active_skills_at_turn_start": loaded_skills,
+            "conversation_generation": generation,
             **self._tool_compatibility_metadata(),
         }
         current_content = message if message_content is None else message_content
@@ -351,6 +489,7 @@ class AgentRuntime:
             "message_created_at": message_created_at,
             "user_id": user_id,
             "thread_id": resolved_thread_id,
+            "conversation_generation": generation,
             "loaded_skills": loaded_skills,
             "skill_activations": skill_activations,
             "tool_events": [],
@@ -362,9 +501,9 @@ class AgentRuntime:
             "metadata": metadata,
         }
 
-    def _load_history(self, thread_id: str, metadata: dict[str, Any]) -> Any:
+    def _load_history(self, thread_id: str, metadata: dict[str, Any], *, generation: int = 0) -> Any:
         path = self.settings.data_dir / "threads" / thread_id / "messages.jsonl"
-        cached = self._redis.load_short_memory(thread_id)
+        cached = self._redis.load_short_memory(thread_id, generation=generation)
         cache_matches_file = True
         if cached is not None and path.exists():
             stat = path.stat()
@@ -396,6 +535,58 @@ class AgentRuntime:
             return {}
         return data if isinstance(data, dict) else {}
 
+    def _clear_command_result(self, thread_id: str, *, user_id: str, emit_answer: bool) -> AgentRunResult:
+        try:
+            result = clear_short_state(
+                self.settings,
+                thread_id=thread_id,
+                user_id=user_id,
+                redis_store=self._redis,
+            )
+        except ConversationStateBusyError:
+            return self._busy_result(thread_id, emit_answer=emit_answer)
+        except (PermissionError, ValueError) as exc:
+            message = "无法清除当前会话：会话不存在或无权访问。"
+            return self._direct_result(
+                thread_id,
+                message,
+                emit_answer=emit_answer,
+                clear_error=type(exc).__name__,
+            )
+        return self._direct_result(
+            thread_id,
+            CLEAR_CONFIRMATION,
+            emit_answer=emit_answer,
+            cleared=True,
+            conversation_generation=result.generation,
+            cleared_message_records=result.cleared_message_records,
+            cleared_skills=list(result.cleared_skills),
+        )
+
+    def _direct_result(
+        self,
+        thread_id: str,
+        answer: str,
+        *,
+        emit_answer: bool,
+        **metadata: Any,
+    ) -> AgentRunResult:
+        if emit_answer:
+            self._report_agent_text(answer, thread_id=thread_id, control_command=CLEAR_COMMAND)
+        return AgentRunResult(
+            thread_id=thread_id,
+            answer=answer,
+            metadata={**metadata, "final_assistant_text": answer},
+        )
+
+    def _busy_result(self, thread_id: str, *, emit_answer: bool = False) -> AgentRunResult:
+        return self._direct_result(
+            thread_id,
+            "当前会话正在处理另一条消息，请稍后重试。",
+            emit_answer=emit_answer,
+            conversation_busy=True,
+        )
+
     @staticmethod
     def _rate_limit_result(thread_id: str | None, count: int) -> AgentRunResult:
         message = "请求过于频繁，请稍后再试。"
@@ -411,7 +602,7 @@ class AgentRuntime:
 
     def _result_from(self, thread_id: str, final_state: dict[str, Any]) -> AgentRunResult:
         messages = list(final_state.get("messages") or [])
-        answer = _last_ai_text(messages)
+        answer = str(final_state.get("answer") or "").strip() or _last_ai_text(messages)
         metadata = dict(final_state.get("metadata") or {})
         if not metadata.get("final_assistant_text") and answer:
             metadata["final_assistant_text"] = answer

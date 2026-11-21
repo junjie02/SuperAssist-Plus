@@ -42,7 +42,7 @@ Go 是面向浏览器的产品入口：负责认证、WebSocket 生命周期、�
 - **工具与 Subagent**：支持文件、网页、主 Agent 图片搜索、`gpt-image-2` 生图和可选 Shell 工具；运行时扫描 `config/agents/*/agent.toml`，把 Agent 名称和描述注入主 Agent，再通过 `task` 动态调用对应模块。搜索图片候选只作为本轮临时视觉上下文，主 Agent 明确选择后才会发送到飞书；生成图片会自动进入当前飞书回复。
 - **ACP Agent Teams**：通过 `agent_team.toml` 接入 Claude Code 等外部 Agent，使用带文件锁、hash chain 和 HMAC 的 JSONL ledger 记录协作过程。
 - **可视化与管理**：导航栏提供 Chat、Memory Graph、Knowledge、Settings；管理员额外拥有 Users 页面，可查看各 Web/飞书/企业微信身份的会话、消息记录与长期记忆图，并可删除选中的未压缩短记忆记录。
-- **飞书 Bot**：所有可见群消息先按 `message_id` 幂等落入持久化账本；艾特后以 1.5 秒静默窗口聚合后续文字和图片，并按成员、时间与回复关系形成一轮短期记忆。图片原始字节在入口缓存并随批次直接交给主模型，可选本地 OCR 仅作校对辅助；批次成功消费后立即清理对应原始字节。私聊按用户隔离，群聊按 `chat_id` 共享短记忆、长期 Memory 图和 RAG；同会话任务串行排队，不再丢弃忙碌期间的消息。
+- **飞书 Bot**：所有可见群消息先按 `message_id` 幂等落入持久化账本；艾特后以 1.5 秒静默窗口聚合后续文字和图片，并按成员、时间与回复关系形成一轮短期记忆。图片原始字节在入口缓存，识别前会应用 EXIF 方向，并在本地 OCR 对某个方向有充分证据时自动纠正 90/180/270 度旋转，再随批次交给主模型；OCR 文本仅作校对辅助，方向证据不足时保留原像素。批次成功消费后立即清理对应原始字节。私聊按用户隔离，群聊按 `chat_id` 共享短记忆、长期 Memory 图和 RAG；同会话任务串行排队，不再丢弃忙碌期间的消息。
 - **企业微信 Bot**：使用官方 WebSocket SDK，无需公网回调；支持流式回复、成员白名单、单聊隔离、群聊共享记忆、RAG 开关、重复消息过滤和断线重连。
 
 ## 快速开始
@@ -127,6 +127,11 @@ superassist-wecom-rpa
 未艾特内容不会到达本地账本，也就无法在下次激活时补入批次。
 群聊中只发送一个机器人艾特也会触发 Agent；此时 Agent 会处理上次成功激活后尚未消费的群聊消息。
 
+Web、CLI、企业微信和飞书私聊可单独发送 `/clear` 清除当前线程的短期对话、压缩摘要和已激活 Skill；
+飞书群聊必须显式发送 `@机器人 /clear`，它会清除本群共享线程并消费清理前尚未处理的批次。
+该命令不会调用模型，也不会删除长期 Memory 图、RAG 文档、错题本、申论文件、Subagent 任务记录或账号数据。
+请勿在 `/clear` 消息中同时携带图片或文件。
+
 包含 LaTeX 公式的最终回答会创建飞书云文档，写入原生公式并发送文档链接；还需开通文档创建/编辑和
 云空间协作者权限（`docx:document`、`drive:permission:member:create`）。普通回答继续使用消息卡片；文档
 创建、写入或授权失败时会自动回退到原卡片，避免丢失回答。
@@ -179,8 +184,9 @@ Python 配置集中在 `src/superassist/config.py`，示例见 [.env.example](.e
 | `SUPERASSIST_MEMORY_RETRIEVAL_LOG_ENABLED` | `true` | 记录长期记忆召回各阶段耗时到 `logs/memory-retrieval.jsonl` |
 | `SUPERASSIST_MEMORY_RETRIEVAL_LOG_MAX_BYTES` | `20971520` | 记忆召回日志单文件轮转阈值，保留 3 个备份 |
 | `SUPERASSIST_AGENTS_DIR` | `config/agents` | 模块化 Subagent 定义目录；每个子目录包含 `agent.toml` 和提示文件 |
-| `SUPERASSIST_FEISHU_IMAGE_OCR_ENABLED` | `true` | 飞书图片启用本地 RapidOCR 辅助；原图无论 OCR 是否成功都会直接交给主模型 |
+| `SUPERASSIST_FEISHU_IMAGE_OCR_ENABLED` | `true` | 飞书图片启用本地 RapidOCR 辅助和四方向可信度择优；方向证据不足时保留原图 |
 | `SUPERASSIST_FEISHU_IMAGE_OCR_MAX_CHARS` | `12000` | 单条飞书多图 OCR 写入当前轮文本历史的字符上限 |
+| `SUPERASSIST_FEISHU_IMAGE_PROCESSING_CONCURRENCY` | `2` | 飞书图片下载与逐图 OCR 的最大并发数（1-8） |
 | `SUPERASSIST_FEISHU_IMAGE_CONTEXT_TTL_SECONDS` | `180` | 飞书会话原图上下文的滑动 TTL；有效消息会刷新，过期后只复用文本描述 |
 | `SUPERASSIST_FEISHU_DOC_URL_BASE` | `https://feishu.cn/docx` | 公式回答创建后的飞书云文档链接前缀；Lark 国际版可改为对应租户域名 |
 | `SUPERASSIST_IMAGE_GENERATION_MODEL` | `gpt-image-2` | `generate_image` 工具调用的生图模型名称 |
@@ -219,6 +225,11 @@ Python 配置集中在 `src/superassist/config.py`，示例见 [.env.example](.e
 | `SUPERASSIST_RAG_CHUNK_OVERLAP_TOKENS` | `64` | 同 section 相邻 Chunk 重叠 Token |
 | `SUPERASSIST_RAG_CANDIDATE_TOP_K` | `50` | Dense 与 BM25 各自候选数 |
 | `SUPERASSIST_RAG_CHUNK_TOP_K` | `10` | 每次最终返回的原文 Chunk 上限 |
+| `SUPERASSIST_RAG_RERANKER_ENABLED` | `false` | 是否对 Hybrid 的 RRF 候选启用 Cross-Encoder 重排 |
+| `SUPERASSIST_RAG_RERANKER_MODEL` | `BAAI/bge-reranker-v2-m3` | Cross-Encoder 模型；首次使用时懒加载 |
+| `SUPERASSIST_RAG_RERANKER_CANDIDATE_TOP_K` | `30` | 送入 Cross-Encoder 的 RRF 候选数 |
+| `SUPERASSIST_RAG_RERANKER_BATCH_SIZE` | `16` | Cross-Encoder 推理批大小 |
+| `SUPERASSIST_RAG_RERANKER_MAX_LENGTH` | `512` | Query-Chunk pair 的最大模型长度 |
 | `SUPERASSIST_RAG_CONTEXT_MAX_TOKENS` | `5000` | 单次检索上下文预算 |
 | `SUPERASSIST_RAG_ACCUMULATED_EVIDENCE_MAX_TOKENS` | `8000` | 一轮 Agent 的累计唯一证据预算 |
 | `SUPERASSIST_RAG_STAGNANT_SEARCH_LIMIT` | `2` | 连续无新增 Chunk 后停止检索 |

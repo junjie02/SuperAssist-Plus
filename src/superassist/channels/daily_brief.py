@@ -57,6 +57,7 @@ class LatestCandidate:
     url: str
     discovered_from: str
     published_hint: str = ""
+    reused: bool = False
 
 
 @dataclass(frozen=True)
@@ -196,6 +197,66 @@ def collect_latest_candidates(config: OfficialMediaConfig, max_candidates: int =
     return balanced
 
 
+def select_brief_candidates(
+    candidates: list[LatestCandidate],
+    seen_urls: dict[str, str] | set[str],
+    *,
+    window_start: datetime,
+    now: datetime,
+    min_sources: int,
+    max_reused_sources: int = 3,
+) -> list[LatestCandidate]:
+    """Prefer unseen articles, then reuse recent articles to fill the source gap."""
+
+    earliest_date = (window_start - timedelta(days=1)).date().isoformat()
+    seen_mapping = seen_urls if isinstance(seen_urls, dict) else {str(url): "" for url in seen_urls}
+    fresh: list[LatestCandidate] = []
+    reusable: list[LatestCandidate] = []
+    cutoff = now.astimezone(UTC) - timedelta(days=SEEN_URL_RETENTION_DAYS)
+    fresh_urls: set[str] = set()
+    for candidate in candidates:
+        canonical = _canonical_url(candidate.url)
+        if canonical in fresh_urls:
+            continue
+        timestamp = seen_mapping.get(canonical)
+        if not timestamp:
+            if candidate.published_hint and candidate.published_hint < earliest_date:
+                continue
+            fresh.append(candidate)
+            fresh_urls.add(canonical)
+            continue
+        try:
+            seen_at = datetime.fromisoformat(str(timestamp)).astimezone(UTC)
+        except ValueError:
+            continue
+        if seen_at >= cutoff:
+            reusable.append(candidate)
+
+    deficit = max(0, min_sources - len(fresh))
+    reuse_count = min(deficit, max(0, max_reused_sources))
+    reused_urls: set[str] = set()
+    selected_reused: list[LatestCandidate] = []
+    for candidate in reusable:
+        canonical = _canonical_url(candidate.url)
+        if canonical in reused_urls or canonical in fresh_urls:
+            continue
+        selected_reused.append(
+            LatestCandidate(
+                candidate.source_id,
+                candidate.source_name,
+                candidate.title,
+                candidate.url,
+                candidate.discovered_from,
+                candidate.published_hint,
+                reused=True,
+            )
+        )
+        reused_urls.add(canonical)
+        if len(selected_reused) >= reuse_count:
+            break
+    return [*fresh, *selected_reused]
+
+
 def _collect_page(source: OfficialMediaSource, page_url: str) -> list[LatestCandidate]:
     body, _content_type = _fetch_url(page_url, timeout=20)
     parser = _LinkParser()
@@ -264,6 +325,19 @@ def extract_urls(text: str) -> list[str]:
     return [match.rstrip(".,;:!?，。；：！？'") for match in URL_RE.findall(str(text or ""))]
 
 
+def append_reused_source_note(answer: str, reused: Iterable[LatestCandidate]) -> str:
+    """Make reused articles explicit in the delivered brief."""
+
+    reused_items = list(reused)
+    if not reused_items:
+        return answer
+    if NO_NEW_CONTENT_MARKER in answer:
+        answer = answer.replace(NO_NEW_CONTENT_MARKER, "本时段新内容不足，以下为延续阅读。")
+    lines = ["", "延续阅读（此前时段已引用）："]
+    lines.extend(f"- [{item.source_name}] {item.title} {item.url}" for item in reused_items)
+    return answer.rstrip() + "\n".join(lines)
+
+
 def validate_brief_sources(answer: str, domains: Iterable[str], min_sources: int) -> list[str]:
     if NO_NEW_CONTENT_MARKER in answer:
         return []
@@ -298,6 +372,7 @@ class DailyBriefScheduler:
         self._redis = get_redis_store(settings)
         self._task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
+        self._run_log_lock = threading.Lock()
 
     async def start(self) -> None:
         if not self.settings.daily_brief_enabled:
@@ -334,7 +409,8 @@ class DailyBriefScheduler:
             scheduled_for=self.now_factory(self.timezone),
             target_chat_ids=[chat_id],
             force=True,
-            persist=False,
+            persist=True,
+            run_kind="manual",
             progress_reporter=progress_reporter,
         )
 
@@ -345,6 +421,7 @@ class DailyBriefScheduler:
         target_chat_ids: list[str] | None = None,
         force: bool = False,
         persist: bool = True,
+        run_kind: str = "scheduled",
         progress_reporter: DailyBriefProgressReporter | None = None,
     ) -> DailyBriefRunResult:
         async with self._lock:
@@ -354,6 +431,7 @@ class DailyBriefScheduler:
             if now.tzinfo is None:
                 now = now.replace(tzinfo=self.timezone)
             slot_id = now.strftime("%Y-%m-%dT%H:%M")
+            self._record_run_event(slot_id, "run_started", now, run_kind=run_kind)
             if not force and not self._redis.claim_once(
                 "schedule-daily-brief",
                 slot_id,
@@ -378,28 +456,83 @@ class DailyBriefScheduler:
                 config,
                 self.settings.daily_brief_max_candidates,
             )
-            seen_urls = set(state.get("seen_urls", {}))
-            earliest_date = (window_start - timedelta(days=1)).date().isoformat()
-            candidates = [
-                item
-                for item in candidates
-                if _canonical_url(item.url) not in seen_urls
-                and (not item.published_hint or item.published_hint >= earliest_date)
-            ]
+            seen_urls = state.get("seen_urls", {})
+            if not isinstance(seen_urls, (dict, set)):
+                seen_urls = {}
+            candidates = select_brief_candidates(
+                candidates,
+                seen_urls,
+                window_start=window_start,
+                now=now,
+                min_sources=self.settings.daily_brief_min_sources,
+                max_reused_sources=self.settings.daily_brief_max_reused_sources,
+            )
+            self._record_run_event(
+                slot_id,
+                "candidates_collected",
+                now,
+                candidate_count=len(candidates),
+                source_count=len({item.source_id for item in candidates}),
+                reused_count=len([item for item in candidates if item.reused]),
+            )
             progress(
                 38,
                 "官媒候选收集完成",
                 f"获得 {len(candidates)} 条候选，覆盖 {len({item.source_id for item in candidates})} 个来源",
             )
-            prompt = build_daily_brief_prompt(prompt_template, config, candidates, window_start, now)
+            prompt = build_daily_brief_prompt(
+                prompt_template,
+                config,
+                candidates,
+                window_start,
+                now,
+                max_web_requests=self.settings.daily_brief_max_web_requests,
+            )
 
-            try:
-                progress(45, "DeepSeek 正在核验候选和原文")
-                model_progress = progress if progress_reporter is not None else None
-                answer = await asyncio.to_thread(self._generate, prompt, config, now, model_progress)
-            except Exception as exc:  # noqa: BLE001 - scheduled job must stay alive after one model failure
-                logger.exception("Daily brief generation failed slot=%s", slot_id)
-                return DailyBriefRunResult("failed", f"generation failed: {type(exc).__name__}: {exc}")
+            model_progress = progress if progress_reporter is not None else None
+            reused_candidates = [item for item in candidates if item.reused]
+            answer = ""
+            generation_attempts = 1 + self.settings.daily_brief_generation_retries
+            for attempt in range(generation_attempts):
+                try:
+                    progress(45, "DeepSeek 正在核验候选和原文")
+                    self._record_run_event(
+                        slot_id,
+                        "generation_attempt_started",
+                        now,
+                        attempt=attempt + 1,
+                        max_attempts=generation_attempts,
+                    )
+                    answer = await asyncio.to_thread(
+                        self._generate,
+                        prompt,
+                        config,
+                        now,
+                        model_progress,
+                        reused_candidates,
+                        attempt,
+                    )
+                    break
+                except Exception as exc:  # noqa: BLE001 - scheduled job must stay alive after one model failure
+                    logger.exception(
+                        "Daily brief generation attempt failed slot=%s attempt=%d/%d",
+                        slot_id,
+                        attempt + 1,
+                        generation_attempts,
+                    )
+                    self._record_run_event(
+                        slot_id,
+                        "generation_attempt_failed",
+                        now,
+                        attempt=attempt + 1,
+                        max_attempts=generation_attempts,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    if attempt + 1 >= generation_attempts:
+                        return DailyBriefRunResult("failed", f"generation failed: {type(exc).__name__}: {exc}")
+                    progress(45, "生成暂时失败，稍后重试", f"第 {attempt + 2}/{generation_attempts} 次尝试")
+                    await asyncio.sleep(self.settings.daily_brief_retry_delay_seconds)
 
             progress(88, "正在校验官媒来源和引用", f"初稿约 {len(answer)} 字")
             validation_errors = validate_brief_sources(
@@ -409,26 +542,46 @@ class DailyBriefScheduler:
             )
             if validation_errors:
                 logger.warning("Daily brief source validation failed slot=%s errors=%s", slot_id, validation_errors)
+                self._record_run_event(
+                    slot_id,
+                    "validation_failed",
+                    now,
+                    errors=validation_errors,
+                    answer_chars=len(answer),
+                )
                 return DailyBriefRunResult("failed", "; ".join(validation_errors), answer)
 
             chunks = split_brief_cards(answer)
             progress(95, "正在发送飞书简报", f"共 {len(chunks)} 张卡片，发送至 {len(targets)} 个会话")
+            archived_count = 0
             for chat_id in targets:
                 for chunk in chunks:
                     message_id = await self.sender(chat_id, chunk)
                     if not message_id:
+                        self._record_run_event(slot_id, "send_failed", now, chat_id=chat_id)
                         return DailyBriefRunResult("failed", f"Feishu send failed for chat {chat_id}", answer)
                 if persist and self.brief_recorder is not None:
                     try:
                         self.brief_recorder(chat_id, now, answer)
+                        archived_count += 1
                     except Exception:  # noqa: BLE001 - notebook failure must not discard a delivered brief
                         logger.exception(
                             "Failed to archive delivered daily brief chat_suffix=%s",
                             chat_id[-8:] if chat_id else "unknown",
                         )
+                        self._record_run_event(slot_id, "archive_failed", now, chat_id=chat_id)
 
             if persist:
                 self._record_success(state, slot_id, now, answer)
+            self._record_run_event(
+                slot_id,
+                "run_succeeded",
+                now,
+                run_kind=run_kind,
+                target_count=len(targets),
+                answer_chars=len(answer),
+                archived_count=archived_count,
+            )
             progress(100, "简报已生成并发送")
             logger.info(
                 "Daily brief delivered slot=%s candidates=%d sources=%d targets=%d",
@@ -457,6 +610,18 @@ class DailyBriefScheduler:
             raise
         except Exception as exc:  # noqa: BLE001 - preserve future scheduled runs after one failure
             logger.exception("Daily brief run failed before completion")
+            scheduled_for = kwargs.get("scheduled_for")
+            if not isinstance(scheduled_for, datetime):
+                scheduled_for = self.now_factory(self.timezone)
+            if scheduled_for.tzinfo is None:
+                scheduled_for = scheduled_for.replace(tzinfo=self.timezone)
+            self._record_run_event(
+                scheduled_for.strftime("%Y-%m-%dT%H:%M"),
+                "run_failed",
+                scheduled_for,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
             return DailyBriefRunResult("failed", f"{type(exc).__name__}: {exc}")
 
     def _generate(
@@ -465,6 +630,8 @@ class DailyBriefScheduler:
         config: OfficialMediaConfig,
         now: datetime,
         progress: Callable[[int, str, str], None] | None = None,
+        reused_candidates: list[LatestCandidate] | None = None,
+        attempt: int = 0,
     ) -> str:
         runtime_settings = self.settings.model_copy(
             update={
@@ -479,6 +646,7 @@ class DailyBriefScheduler:
                 "model": self.settings.daily_brief_model,
                 "api_key": self.settings.resolved_daily_brief_api_key,
                 "base_url": self.settings.resolved_daily_brief_base_url,
+                "model_timeout_seconds": self.settings.daily_brief_model_timeout_seconds,
             }
         )
         tool_started = 0
@@ -527,14 +695,19 @@ class DailyBriefScheduler:
             )
         )
         thread_id = f"daily_brief_{now.strftime('%Y%m%d_%H%M')}"
+        if attempt:
+            thread_id = f"{thread_id}_retry{attempt}"
         try:
-            with official_media_web_scope(config.domains):
+            with official_media_web_scope(
+                config.domains,
+                max_requests=self.settings.daily_brief_max_web_requests,
+            ):
                 invoke = getattr(runtime, "run_streaming", None) if progress is not None else None
                 invoke = invoke or runtime.run
                 result = invoke(prompt, user_id="system:shenlun-daily", thread_id=thread_id)
                 if result.metadata.get("model_error"):
                     raise RuntimeError(result.metadata.get("model_error_message") or result.metadata["model_error"])
-                answer = result.answer.strip()
+                answer = append_reused_source_note(result.answer.strip(), reused_candidates or [])
                 validation_errors = validate_brief_sources(
                     answer,
                     config.domains,
@@ -547,7 +720,7 @@ class DailyBriefScheduler:
                     result = invoke(correction, user_id="system:shenlun-daily", thread_id=thread_id)
                     if result.metadata.get("model_error"):
                         raise RuntimeError(result.metadata.get("model_error_message") or result.metadata["model_error"])
-                    answer = result.answer.strip()
+                    answer = append_reused_source_note(result.answer.strip(), reused_candidates or [])
             if not answer:
                 raise RuntimeError("model returned an empty daily brief")
             return answer
@@ -605,6 +778,23 @@ class DailyBriefScheduler:
         )
         _write_json_atomic(self.settings.daily_brief_state_path, state)
 
+    def _record_run_event(self, slot_id: str, event: str, scheduled_for: datetime, **details: Any) -> None:
+        record = {
+            "recorded_at": datetime.now(UTC).isoformat(),
+            "slot": slot_id,
+            "scheduled_for": scheduled_for.isoformat(),
+            "event": event,
+            **details,
+        }
+        path = self.settings.daily_brief_run_log_path
+        try:
+            with self._run_log_lock:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError:
+            logger.exception("Failed to append daily brief run log event=%s slot=%s", event, slot_id)
+
 
 def build_daily_brief_prompt(
     template: str,
@@ -612,13 +802,15 @@ def build_daily_brief_prompt(
     candidates: list[LatestCandidate],
     window_start: datetime,
     window_end: datetime,
+    *,
+    max_web_requests: int | None = None,
 ) -> str:
     edition = "晨报" if window_end.hour < 13 else "晚报"
     sources = "\n".join(
         f"- {source.name}: {', '.join(source.domains)}" for source in config.sources
     )
     candidate_text = "\n".join(
-        f"{index}. [{item.source_name}] {item.title}"
+        f"{index}. [{item.source_name}{'｜延续阅读' if item.reused else ''}] {item.title}"
         f"{f'（URL 日期线索: {item.published_hint}）' if item.published_hint else ''}\n   {item.url}"
         for index, item in enumerate(candidates, start=1)
     ) or "（最新栏目暂未解析出候选链接，请仅按当前日期在允许的官媒域名内补充检索。）"
@@ -630,6 +822,7 @@ def build_daily_brief_prompt(
 - window_start: {window_start.isoformat()}
 - window_end: {window_end.isoformat()}
 - current_date: {window_end.date().isoformat()}
+- max_web_requests: {max_web_requests if max_web_requests is not None else 'unlimited'}
 </DailyBriefContext>
 
 <OfficialMediaAllowlist>
@@ -740,11 +933,13 @@ __all__ = [
     "OfficialMediaSource",
     "build_daily_brief_prompt",
     "collect_latest_candidates",
+    "append_reused_source_note",
     "extract_urls",
     "latest_scheduled_at",
     "load_official_media_config",
     "next_scheduled_at",
     "parse_schedule_times",
+    "select_brief_candidates",
     "split_brief_cards",
     "validate_brief_sources",
 ]

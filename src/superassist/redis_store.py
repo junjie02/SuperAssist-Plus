@@ -112,13 +112,14 @@ class RedisRuntimeStore:
             return
         key = self.key("lock", namespace, _digest(identity))
         token = uuid4().hex
-        acquired = bool(
-            self._run(False, lambda: self._client.set(key, token, nx=True, ex=max(1, ttl_seconds)))
-        )
+        failed = object()
+        raw = self._run(failed, lambda: self._client.set(key, token, nx=True, ex=max(1, ttl_seconds)))
+        remote_acquired = raw is not failed and bool(raw)
+        acquired = remote_acquired or (raw is failed and not self.settings.redis_required)
         try:
             yield acquired
         finally:
-            if acquired:
+            if remote_acquired:
                 script = (
                     "if redis.call('get', KEYS[1]) == ARGV[1] then "
                     "return redis.call('del', KEYS[1]) else return 0 end"
@@ -159,12 +160,34 @@ class RedisRuntimeStore:
                 lambda: self._client.delete(self.key("feishu", "activation", _digest(scope_key))),
             )
 
-    def save_skill_activations(self, thread_id: str, activations: dict[str, float], *, ttl_seconds: int) -> None:
-        self.set_json("skills", thread_id, activations, ttl_seconds=ttl_seconds)
+    def save_skill_activations(
+        self,
+        thread_id: str,
+        activations: dict[str, float],
+        *,
+        ttl_seconds: int,
+        generation: int | None = None,
+    ) -> None:
+        value: dict[str, Any] = activations
+        if generation is not None:
+            value = {"conversation_generation": generation, "activations": activations}
+        self.set_json("skills", thread_id, value, ttl_seconds=ttl_seconds)
 
-    def load_skill_activations(self, thread_id: str) -> dict[str, float]:
+    def load_skill_activations(self, thread_id: str, *, generation: int | None = None) -> dict[str, float]:
         value = self.get_json("skills", thread_id)
         if not isinstance(value, dict):
+            return {}
+        if "activations" in value:
+            try:
+                cached_generation = int(value.get("conversation_generation") or 0)
+            except (TypeError, ValueError):
+                return {}
+            if generation is not None and cached_generation != generation:
+                return {}
+            value = value.get("activations")
+            if not isinstance(value, dict):
+                return {}
+        elif generation not in (None, 0):
             return {}
         result: dict[str, float] = {}
         for name, activated_at in value.items():
@@ -182,9 +205,32 @@ class RedisRuntimeStore:
             ttl_seconds=self.settings.redis_short_memory_ttl_seconds,
         )
 
-    def load_short_memory(self, thread_id: str) -> dict[str, Any] | None:
+    def load_short_memory(self, thread_id: str, *, generation: int | None = None) -> dict[str, Any] | None:
         value = self.get_json("short-memory", thread_id)
-        return value if isinstance(value, dict) else None
+        if not isinstance(value, dict):
+            return None
+        if generation is not None:
+            try:
+                cached_generation = int(value.get("conversation_generation") or 0)
+            except (TypeError, ValueError):
+                return None
+            if cached_generation != generation:
+                return None
+        return value
+
+    def clear_thread_short_state(self, thread_id: str) -> None:
+        """Invalidate only recent conversation and Skill activation caches."""
+
+        if not self.enabled:
+            return
+
+        def operation() -> Any:
+            pipe = self._client.pipeline()
+            pipe.delete(self.key("short-memory", _digest(thread_id)))
+            pipe.delete(self.key("skills", _digest(thread_id)))
+            return pipe.execute()
+
+        self._run(None, operation)
 
     def memory_version(self, user_id: str) -> int:
         if not self.enabled:
@@ -377,6 +423,18 @@ return ids
         if not isinstance(value, dict):
             return None
         return {"card_id": str(value.get("card_id") or ""), "last_text": str(value.get("last_text") or "")}
+
+    def set_grading_card_state(self, message_id: str, value: dict[str, Any]) -> None:
+        self.set_json(
+            "feishu:grading-card",
+            message_id,
+            value,
+            ttl_seconds=max(3600, self.settings.redis_task_ttl_seconds),
+        )
+
+    def get_grading_card_state(self, message_id: str) -> dict[str, Any] | None:
+        value = self.get_json("feishu:grading-card", message_id)
+        return value if isinstance(value, dict) else None
 
     def save_image_context(self, scope_key: str, payloads: list[tuple[bytes, str]], *, ttl_seconds: int) -> None:
         if not self.enabled:

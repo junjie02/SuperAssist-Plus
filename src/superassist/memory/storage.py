@@ -4,6 +4,7 @@ import json
 import uuid
 from collections.abc import Iterable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import Engine, Connection, create_engine, event, text
@@ -32,6 +33,21 @@ def _parse_dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value)
 
 
+def create_sqlite_engine(db_path: str | Path) -> Engine:
+    """Create a SQLite engine at ``db_path`` with foreign keys enforced."""
+    path = Path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    engine = create_engine(f"sqlite:///{path}")
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection: Any, connection_record: Any) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys = ON")
+        cursor.close()
+
+    return engine
+
+
 def create_engine_from_settings(settings: "Settings") -> Engine:  # type: ignore[name-defined]  # noqa: F821
     """Build a SQLAlchemy Engine from settings.
 
@@ -43,17 +59,7 @@ def create_engine_from_settings(settings: "Settings") -> Engine:  # type: ignore
 
     if not db_url:
         # --- SQLite fallback (development / testing) -----------------------
-        settings.db_path.parent.mkdir(parents=True, exist_ok=True)
-        url = f"sqlite:///{settings.db_path}"
-        engine = create_engine(url)
-
-        @event.listens_for(engine, "connect")
-        def _set_sqlite_pragma(dbapi_connection: Any, connection_record: Any) -> None:
-            cursor = dbapi_connection.cursor()
-            cursor.execute("PRAGMA foreign_keys = ON")
-            cursor.close()
-
-        return engine
+        return create_sqlite_engine(settings.db_path)
 
     # --- MySQL ----------------------------------------------------------
     return create_engine(

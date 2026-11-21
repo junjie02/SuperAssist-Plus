@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import sqlite3
 import threading
 import time
 from datetime import datetime
@@ -20,7 +21,9 @@ from superassist.channels.feishu import (
     FeishuCardView,
     FeishuChannel,
     FeishuInboundMessage,
+    FeishuOCRCandidate,
     ImageDownloadError,
+    apply_shenlun_grading_event,
     attributed_feishu_text,
     build_card_content,
     build_image_memory_text,
@@ -31,17 +34,21 @@ from superassist.channels.feishu import (
     feishu_memory_scope,
     format_daily_brief_progress,
     format_model_error,
+    format_shenlun_grading_card,
     format_subagent_card_text,
+    has_bot_mention,
     image_mime_type,
     load_feishu_settings,
     original_image_payload,
     parse_effort_command,
     parse_feishu_content,
     parse_feishu_event,
+    select_ocr_orientation,
     should_trigger_agent,
 )
 from superassist.channels.store import FeishuMessageStore, FeishuThreadStore
 from superassist.config import Settings, get_settings
+from superassist.conversation_state import CLEAR_CONFIRMATION, CLEAR_GROUP_CONFIRMATION
 from superassist.models import AgentRunEvent, AgentRunResult
 
 
@@ -60,6 +67,7 @@ def _settings(tmp_path, **overrides):
         SUPERASSIST_EMBEDDING_PROVIDER="hash",
         SUPERASSIST_FEISHU_APP_ID="",
         SUPERASSIST_FEISHU_APP_SECRET="",
+        SUPERASSIST_FEISHU_BOT_OPEN_ID="ou_bot",
         **overrides,
     )
 
@@ -189,7 +197,7 @@ def test_parse_feishu_event_extracts_thread_fields() -> None:
                 root_id="root_1",
                 chat_type="group",
                 content=json.dumps({"text": "@bot do it"}),
-                mentions=[{"name": "@bot"}],
+                mentions=[{"name": "@bot", "id": "ou_bot", "id_type": "open_id", "key": "@_user_1"}],
             ),
             sender=SimpleNamespace(sender_id=SimpleNamespace(open_id="ou_1")),
         )
@@ -200,7 +208,9 @@ def test_parse_feishu_event_extracts_thread_fields() -> None:
     assert inbound.chat_id == "chat_1"
     assert inbound.topic_id == "root_1"
     assert inbound.sender_open_id == "ou_1"
-    assert inbound.mentions == [{"name": "@bot"}]
+    assert inbound.mentions == [
+        {"name": "@bot", "id": "ou_bot", "id_type": "open_id", "key": "@_user_1", "open_id": "ou_bot"}
+    ]
 
 
 def test_should_trigger_private_or_mentions() -> None:
@@ -212,12 +222,12 @@ def test_should_trigger_private_or_mentions() -> None:
         "ou",
         "@bot hello",
         chat_type="group",
-        mentions=[{"name": "@bot"}],
+        mentions=[{"name": "@bot", "id": "ou_bot", "id_type": "open_id", "key": "@_user_1"}],
     )
 
-    assert should_trigger_agent(private, mention_only=True) is True
-    assert should_trigger_agent(group_without_mention, mention_only=True) is False
-    assert should_trigger_agent(group_with_mention, mention_only=True) is True
+    assert should_trigger_agent(private, mention_only=True, bot_open_id="ou_bot") is True
+    assert should_trigger_agent(group_without_mention, mention_only=True, bot_open_id="ou_bot") is False
+    assert should_trigger_agent(group_with_mention, mention_only=True, bot_open_id="ou_bot") is True
 
 
 def test_group_with_only_mention_is_an_explicit_activation() -> None:
@@ -227,11 +237,92 @@ def test_group_with_only_mention_is_an_explicit_activation() -> None:
         "ou",
         "@bot",
         chat_type="group",
-        mentions=[{"name": "@bot"}],
+        mentions=[{"name": "@bot", "id": "ou_bot", "id_type": "open_id", "key": "@_user_1"}],
     )
 
-    assert should_trigger_agent(inbound, mention_only=True) is True
+    assert should_trigger_agent(inbound, mention_only=True, bot_open_id="ou_bot") is True
     assert clean_mention_text(inbound.text, inbound.mentions) == ""
+
+
+def test_bot_mention_requires_own_open_id() -> None:
+    bot = FeishuInboundMessage(
+        "chat",
+        "msg_bot",
+        "ou",
+        "@bot hello",
+        chat_type="group",
+        mentions=[{"name": "@bot", "id": "ou_bot", "id_type": "open_id"}],
+    )
+    someone_else = FeishuInboundMessage(
+        "chat",
+        "msg_other",
+        "ou",
+        "@alice hello",
+        chat_type="group",
+        mentions=[{"name": "@alice", "id": "ou_alice", "id_type": "open_id"}],
+    )
+    bare_at = FeishuInboundMessage("chat", "msg_bare", "ou", "@bot hello", chat_type="group")
+
+    assert has_bot_mention(bot, bot_open_id="ou_bot") is True
+    assert has_bot_mention(someone_else, bot_open_id="ou_bot") is False
+    assert has_bot_mention(bare_at, bot_open_id="ou_bot") is False
+    assert should_trigger_agent(someone_else, mention_only=True, bot_open_id="ou_bot") is False
+
+
+def test_bot_mention_name_fallback_only_without_open_id() -> None:
+    inbound = FeishuInboundMessage(
+        "chat",
+        "msg",
+        "ou",
+        "@bot hello",
+        chat_type="group",
+        mentions=[{"name": "@Bot", "id": "ou_alice", "id_type": "open_id"}],
+    )
+
+    assert has_bot_mention(inbound, bot_name="bot") is True
+    assert has_bot_mention(inbound, bot_name="someone else") is False
+    # With no identity at all, a bare @ must never be treated as an @bot.
+    assert has_bot_mention(inbound) is False
+
+
+def test_group_mentioning_another_user_does_not_trigger_channel(tmp_path) -> None:
+    channel = FeishuChannel(_settings(tmp_path), monotonic_clock=lambda: 1000.0)
+    inbound = FeishuInboundMessage(
+        "chat_1",
+        "msg_1",
+        "ou_1",
+        "@alice 帮我看看",
+        chat_type="group",
+        mentions=[{"name": "@alice", "id": "ou_alice", "id_type": "open_id"}],
+    )
+
+    assert channel._should_accept_message(inbound) is False
+
+
+def test_parse_feishu_event_preserves_sdk_mention_open_id() -> None:
+    sdk_mention = SimpleNamespace(
+        key="@_user_1",
+        id="ou_bot",
+        id_type="open_id",
+        name="@bot",
+        tenant_key="tenant_1",
+    )
+    event = SimpleNamespace(
+        event=SimpleNamespace(
+            message=SimpleNamespace(
+                chat_id="chat_1",
+                message_id="msg_1",
+                chat_type="group",
+                content=json.dumps({"text": "@_user_1 你好"}),
+                mentions=[sdk_mention],
+            ),
+            sender=SimpleNamespace(sender_id=SimpleNamespace(open_id="ou_1")),
+        )
+    )
+
+    inbound = parse_feishu_event(event)
+
+    assert has_bot_mention(inbound, bot_open_id="ou_bot") is True
 
 
 def test_group_requires_explicit_activation_for_each_batch(tmp_path) -> None:
@@ -247,7 +338,7 @@ def test_group_requires_explicit_activation_for_each_batch(tmp_path) -> None:
         "ou_1",
         "@bot hello",
         chat_type="group",
-        mentions=[{"name": "@bot"}],
+        mentions=[{"name": "@bot", "id": "ou_bot", "id_type": "open_id", "key": "@_user_1"}],
     )
 
     assert channel._should_accept_message(inactive) is False
@@ -270,7 +361,7 @@ def test_group_activation_sessions_are_independent_and_private_is_always_accepte
         "ou_1",
         "@bot hello",
         chat_type="group",
-        mentions=[{"name": "@bot"}],
+        mentions=[{"name": "@bot", "id": "ou_bot", "id_type": "open_id", "key": "@_user_1"}],
     )
     other_group = FeishuInboundMessage("chat_2", "msg_2", "ou_2", "hello", chat_type="group")
     private = FeishuInboundMessage("p2p_1", "msg_3", "ou_1", "hello", chat_type="p2p")
@@ -354,6 +445,104 @@ def test_feishu_message_store_is_idempotent_and_advances_cursor(tmp_path) -> Non
     assert store.get_image(message_id="msg_1", image_key="img_1") is None
 
 
+def test_feishu_private_clear_resets_transient_state_without_running_agent(tmp_path) -> None:
+    async def go():
+        runtime_calls = []
+        channel = FeishuChannel(
+            _settings(tmp_path),
+            runtime_factory=lambda reporter: runtime_calls.append(reporter),
+        )
+        thread_id = channel.store.get_or_create_thread_id(
+            chat_id="chat_private",
+            topic_id="__private__",
+            user_id="feishu:ou_1",
+        )
+        thread_dir = tmp_path / "threads" / thread_id
+        thread_dir.mkdir(parents=True)
+        (thread_dir / "messages.jsonl").write_text('{"role":"user","content":"old"}\n', encoding="utf-8")
+        (thread_dir / "thread_meta.json").write_text(
+            json.dumps(
+                {
+                    "user_id": "feishu:ou_1",
+                    "summary": "old",
+                    "loaded_skills": ["deep-research"],
+                    "skill_activations": {"deep-research": time.time()},
+                }
+            ),
+            encoding="utf-8",
+        )
+        grading_file = tmp_path / "workspace" / "shenlun-grading" / thread_id / "question.md"
+        grading_file.parent.mkdir(parents=True)
+        grading_file.write_text("important", encoding="utf-8")
+        channel._set_image_context("private:chat_private", [(b"image", "image/png")])
+        sent = []
+
+        async def send(_inbound, text, *, final):
+            sent.append((text, final))
+            return "card"
+
+        channel._send_or_patch = send
+        await channel.handle_inbound(
+            FeishuInboundMessage("chat_private", "msg_clear", "ou_1", " /CLEAR ", chat_type="p2p")
+        )
+
+        metadata = json.loads((thread_dir / "thread_meta.json").read_text(encoding="utf-8"))
+        assert runtime_calls == []
+        assert sent == [(CLEAR_CONFIRMATION, True)]
+        assert channel.message_store.list_unconsumed("chat_private") == []
+        assert channel._get_image_context("private:chat_private") is None
+        assert (thread_dir / "messages.jsonl").read_text(encoding="utf-8") == ""
+        assert metadata["loaded_skills"] == []
+        assert metadata["conversation_generation"] == 1
+        assert grading_file.read_text(encoding="utf-8") == "important"
+
+    _run(go())
+
+
+def test_feishu_group_clear_consumes_pending_batch_and_reports_shared_scope(tmp_path) -> None:
+    async def go():
+        runtime_calls = []
+        channel = FeishuChannel(
+            _settings(tmp_path, SUPERASSIST_FEISHU_ALLOWED_OPEN_IDS="ou_owner"),
+            runtime_factory=lambda reporter: runtime_calls.append(reporter),
+        )
+        sent = []
+
+        async def send(_inbound, text, *, final):
+            sent.append((text, final))
+            return "card"
+
+        channel._send_or_patch = send
+        await channel.handle_inbound(
+            FeishuInboundMessage("chat_group", "msg_context", "ou_member", "old pending context", chat_type="group")
+        )
+        assert [item.message_id for item in channel.message_store.list_unconsumed("chat_group")] == ["msg_context"]
+
+        await channel.handle_inbound(
+            FeishuInboundMessage(
+                "chat_group",
+                "msg_clear",
+                "ou_owner",
+                "@bot /clear",
+                chat_type="group",
+                mentions=[{"name": "@bot", "id": "ou_bot", "id_type": "open_id", "key": "@_user_1"}],
+            )
+        )
+
+        entry = channel.store.get_latest_chat_entry("chat_group")
+        assert entry is not None
+        metadata = json.loads(
+            (tmp_path / "threads" / entry["thread_id"] / "thread_meta.json").read_text(encoding="utf-8")
+        )
+        assert runtime_calls == []
+        assert sent == [(CLEAR_GROUP_CONFIRMATION, True)]
+        assert channel.message_store.list_unconsumed("chat_group") == []
+        assert metadata["user_id"] == "feishu-group:chat_group"
+        assert metadata["conversation_generation"] == 1
+
+    _run(go())
+
+
 def test_group_activation_batches_multiple_speakers_and_late_image(tmp_path) -> None:
     received = []
 
@@ -409,7 +598,7 @@ def test_group_activation_batches_multiple_speakers_and_late_image(tmp_path) -> 
                     "@bot 请综合处理",
                     sender_name="Owner",
                     chat_type="group",
-                    mentions=[{"name": "@bot"}],
+                    mentions=[{"name": "@bot", "id": "ou_bot", "id_type": "open_id", "key": "@_user_1"}],
                 )
             )
         )
@@ -434,8 +623,8 @@ def test_group_activation_batches_multiple_speakers_and_late_image(tmp_path) -> 
         assert 'sender_id="ou_b" sender_name="Bob"' in message
         assert 'sender_id="ou_owner" sender_name="Owner"' in message
         assert '<text>请综合处理</text>' in message
-        assert "[Image 1]" in message
-        assert "visible text" in message
+        assert '<image index="1" status="attached" />' in message
+        assert "AuxiliaryOCR" not in message  # OCR is now an on-demand tool, not default input
         assert isinstance(content, list)
         assert any(item.get("type") == "image_url" for item in content)
         assert any("from sender ou_b" in item.get("text", "") for item in content)
@@ -491,7 +680,7 @@ def test_group_only_mention_activates_preceding_messages(tmp_path) -> None:
                 "@bot",
                 sender_name="Owner",
                 chat_type="group",
-                mentions=[{"name": "@bot"}],
+                mentions=[{"name": "@bot", "id": "ou_bot", "id_type": "open_id", "key": "@_user_1"}],
             )
         )
 
@@ -659,6 +848,119 @@ def test_format_subagent_card_text_uses_description() -> None:
     )
 
     assert format_subagent_card_text(event) == "Subagent [repo scan]: checking files"
+
+
+def test_shenlun_grading_card_accumulates_graders_and_completed_questions() -> None:
+    state = apply_shenlun_grading_event(
+        None,
+        AgentRunEvent(
+            type="grading_question_started",
+            message="start",
+            metadata={
+                "job_id": "job-1",
+                "question_number": 1,
+                "total": 5,
+                "question_type": "summary",
+                "question_type_label": "归纳概括",
+                "max_score": 20,
+                "threshold": 4,
+                "question": {"display_number": "原试卷第2题", "stem": "请概括材料中的主要问题。"},
+            },
+        ),
+    )
+    for grader_id, score in (("a", 14), ("b", 16)):
+        state = apply_shenlun_grading_event(
+            state,
+            AgentRunEvent(
+                type="grading_grader_completed",
+                message="grader done",
+                metadata={
+                    "job_id": "job-1",
+                    "question_number": 1,
+                    "total": 5,
+                    "question_type": "summary",
+                    "question_type_label": "归纳概括",
+                    "max_score": 20,
+                    "threshold": 4,
+                    "grader_id": grader_id,
+                    "grader": {
+                        "score": score,
+                        "derived_scoring_points": [
+                            {"point": f"采分点{grader_id}", "awarded_score": 2, "max_score": 3}
+                        ],
+                        "score_components": {"content": score},
+                        "deductions": [{"type": "typo", "basis": "3个错别字", "points": 1}],
+                        "calculation": f"内容{score}-扣分1",
+                        "hit_points": [f"命中{grader_id}"],
+                        "missed_points": [f"遗漏{grader_id}"],
+                        "comments": f"意见{grader_id}",
+                    },
+                },
+            ),
+        )
+    state = apply_shenlun_grading_event(
+        state,
+        AgentRunEvent(
+            type="grading_question_completed",
+            message="complete",
+            metadata={
+                "job_id": "job-1",
+                "question_number": 1,
+                "total": 5,
+                "question_type": "summary",
+                "question_type_label": "归纳概括",
+                "max_score": 20,
+                "threshold": 4,
+                "question": {"display_number": "原试卷第2题", "stem": "请概括材料中的主要问题。"},
+                "graders": state["questions"]["1"]["graders"],
+                "score_difference": 2,
+                "third_review_triggered": False,
+                "arbitration_triggered": False,
+                "adopted_grader_ids": ["a", "b"],
+                "calculation": "(14 + 16) / 2 = 15",
+                "final_score": 15,
+                "revision_advice": ["补全限定词"],
+            },
+        ),
+    )
+    state = apply_shenlun_grading_event(
+        state,
+        AgentRunEvent(
+            type="grading_question_started",
+            message="start 2",
+            metadata={
+                "job_id": "job-1",
+                "question_number": 2,
+                "total": 5,
+                "question_type": "analysis",
+                "question_type_label": "综合分析",
+                "max_score": 20,
+                "threshold": 4,
+                "question": {"display_number": "原试卷第3题", "stem": "请分析这一现象产生的原因。"},
+            },
+        ),
+    )
+
+    rendered = format_shenlun_grading_card(state)
+
+    assert "已完成 1/5" in rendered
+    assert "原试卷第2题｜归纳概括" in rendered
+    assert "**题目**\n请概括材料中的主要问题。\n\n**解析**" in rendered
+    assert rendered.index("请概括材料中的主要问题。") < rendered.index("采分依据：")
+    assert "评分员1：14分" in rendered
+    assert "评分员2：16分" in rendered
+    assert "采分依据：采分点a(2/3)" in rendered
+    assert "分项：content=14" in rendered
+    assert "扣分：typo 1分（3个错别字）" in rendered
+    assert "评分算式：内容14-扣分1" in rendered
+    assert "命中：命中a" in rendered
+    assert "遗漏：遗漏b" in rendered
+    assert "采用：评分员1、评分员2" in rendered
+    assert "计算：(14 + 16) / 2 = 15" in rendered
+    assert "最终得分：**15分**" in rendered
+    assert "原试卷第3题｜综合分析" in rendered
+    assert "请分析这一现象产生的原因。" in rendered
+    assert "第3题｜尚未开始" in rendered
 
 
 def test_feishu_channel_requires_credentials(tmp_path) -> None:
@@ -1144,8 +1446,9 @@ def test_feishu_effort_command_persists_and_applies_to_next_message(monkeypatch,
 
     _run(go())
 
-def test_feishu_image_and_ocr_reach_main_runtime_in_one_multimodal_call(tmp_path) -> None:
+def test_feishu_image_reaches_runtime_without_default_ocr(tmp_path) -> None:
     received = []
+    ocr_calls = []
 
     class Runtime:
         def __init__(self, _reporter):
@@ -1172,6 +1475,7 @@ def test_feishu_image_and_ocr_reach_main_runtime_in_one_multimodal_call(tmp_path
         channel._download_image_payloads = download_payloads
 
         async def extract_images_ocr(_payloads):
+            ocr_calls.append(1)
             return "A small OCR result."
 
         channel._extract_images_ocr = extract_images_ocr
@@ -1190,7 +1494,8 @@ def test_feishu_image_and_ocr_reach_main_runtime_in_one_multimodal_call(tmp_path
 
         assert len(received) == 1
         message, content = received[0]
-        assert "A small OCR result." in message
+        assert not ocr_calls  # OCR must not run on the default image path
+        assert "A small OCR result." not in message
         assert message.endswith("不要只做泛泛的图片描述。")
         assert "一张图片" in message
         assert "识别并解答" in message
@@ -1274,13 +1579,13 @@ def test_feishu_full_image_context_uses_sliding_three_minute_ttl(tmp_path) -> No
         first_message, first_content = received[0]
         second_message, second_content = received[1]
         third_message, third_content = received[2]
-        assert "OCR once" in first_message
+        assert "OCR once" not in first_message  # no default OCR on the image path
         assert first_content[0]["image_url"]["url"].endswith("b3JpZ2luYWwtaW1hZ2U=")
         assert second_message == "继续分析细节"
         assert second_content[0] == first_content[0]
         assert third_message == "现在总结一下"
         assert third_content is None
-        assert len(ocr_calls) == 1
+        assert not ocr_calls  # OCR is on-demand only
         assert channel._image_contexts == {}
 
     _run(go())
@@ -1337,9 +1642,137 @@ def test_feishu_local_ocr_collects_multiple_images_and_truncates(tmp_path) -> No
         )
     )
 
-    assert calls == [(4, 4, 3), (4, 4, 3)]
+    assert calls == [(4, 4, 3)] * 8
     assert text.startswith("[Image 1]\nfirst line")
     assert len(text) <= 28
+
+
+def test_feishu_local_ocr_processes_images_with_bounded_parallelism(tmp_path) -> None:
+    source = io.BytesIO()
+    Image.new("RGB", (4, 4), "white").save(source, format="JPEG")
+    channel = FeishuChannel(
+        _settings(tmp_path, SUPERASSIST_FEISHU_IMAGE_PROCESSING_CONCURRENCY=2)
+    )
+    lock = threading.Lock()
+    two_workers_started = threading.Event()
+    active = 0
+    max_active = 0
+
+    def engine(_pixels):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+            if active == 2:
+                two_workers_started.set()
+        assert two_workers_started.wait(timeout=2)
+        time.sleep(0.005)
+        with lock:
+            active -= 1
+        return ([[None, "parallel text", 0.99]], 0.1)
+
+    channel._ocr_engine = engine
+    try:
+        text = _run(
+            channel._extract_images_ocr(
+                [(source.getvalue(), "image/jpeg") for _ in range(3)]
+            )
+        )
+    finally:
+        channel._ocr_executor.shutdown(wait=True)
+
+    assert max_active == 2
+    assert text.index("[Image 1]") < text.index("[Image 2]") < text.index("[Image 3]")
+
+
+def test_feishu_image_downloads_use_bounded_parallelism_and_keep_order(tmp_path) -> None:
+    channel = FeishuChannel(
+        _settings(tmp_path, SUPERASSIST_FEISHU_IMAGE_PROCESSING_CONCURRENCY=2)
+    )
+    active = 0
+    max_active = 0
+
+    async def download(_message_id, image_key):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return image_key.encode(), "image/png"
+
+    channel._get_or_download_image = download
+    payloads = _run(
+        channel._download_image_payloads(
+            [{"image_key": f"img_{index}"} for index in range(5)],
+            "message",
+        )
+    )
+
+    assert max_active == 2
+    assert [data for data, _mime_type in payloads] == [
+        b"img_0",
+        b"img_1",
+        b"img_2",
+        b"img_3",
+        b"img_4",
+    ]
+
+
+def test_feishu_ocr_auto_rotates_when_one_orientation_is_clearly_better(tmp_path) -> None:
+    source = io.BytesIO()
+    Image.new("RGB", (8, 4), "white").save(source, format="PNG")
+    channel = FeishuChannel(_settings(tmp_path))
+    calls = []
+    outputs = [
+        [[None, "bad", 0.4]],
+        [[None, "correct orientation text", 0.99]],
+        [[None, "weak", 0.4]],
+        [[None, "upside down", 0.5]],
+    ]
+
+    def engine(pixels):
+        calls.append(pixels.shape)
+        return outputs[len(calls) - 1], 0.1
+
+    channel._ocr_engine = engine
+    payloads = [(source.getvalue(), "image/png")]
+    text = _run(channel._extract_images_ocr(payloads))
+
+    assert calls == [(4, 8, 3), (8, 4, 3), (4, 8, 3), (8, 4, 3)]
+    assert text == "[Image 1]\ncorrect orientation text"
+    with Image.open(io.BytesIO(payloads[0][0])) as rotated:
+        assert rotated.size == (4, 8)
+
+
+def test_feishu_image_applies_exif_orientation_even_when_ocr_is_disabled(tmp_path) -> None:
+    source = io.BytesIO()
+    image = Image.new("RGB", (8, 4), "white")
+    exif = image.getexif()
+    exif[274] = 6
+    image.save(source, format="JPEG", exif=exif)
+    channel = FeishuChannel(
+        _settings(tmp_path, SUPERASSIST_FEISHU_IMAGE_OCR_ENABLED=False)
+    )
+    payloads = [(source.getvalue(), "image/jpeg")]
+
+    text = _run(channel._extract_images_ocr(payloads))
+
+    assert text == ""
+    assert payloads[0][1] == "image/jpeg"
+    with Image.open(io.BytesIO(payloads[0][0])) as oriented:
+        assert oriented.size == (4, 8)
+        assert oriented.getexif().get(274) is None
+
+
+def test_feishu_ocr_keeps_original_orientation_when_evidence_is_ambiguous() -> None:
+    candidates = [
+        FeishuOCRCandidate(0, ("original text",), 12, 0.85),
+        FeishuOCRCandidate(90, ("similar text",), 13, 0.84),
+        FeishuOCRCandidate(180, ("weak",), 4, 0.5),
+        FeishuOCRCandidate(270, ("weak",), 4, 0.5),
+    ]
+
+    assert select_ocr_orientation(candidates).angle == 0
 
 
 def test_download_image_payloads_uses_message_id_and_image_key(tmp_path) -> None:
@@ -1413,7 +1846,7 @@ def test_feishu_channel_shows_agent_text_and_final_card(tmp_path) -> None:
             sender_name="小馨",
             text="@bot 做个计划",
             chat_type="group",
-            mentions=[{"name": "@bot"}],
+            mentions=[{"name": "@bot", "id": "ou_bot", "id_type": "open_id", "key": "@_user_1"}],
         )
 
         await channel.handle_inbound(inbound)
@@ -1504,6 +1937,62 @@ def test_feishu_final_card_cannot_be_overwritten_by_slow_partial_update(tmp_path
     _run(go())
 
 
+def test_feishu_resets_partial_card_before_fallback_answer(tmp_path) -> None:
+    class Runtime:
+        def __init__(self, reporter):
+            self.memory_queue = SimpleNamespace(flush=lambda: None)
+            self.reporter = reporter
+
+        def run_streaming(self, message, *, user_id, thread_id):
+            self.reporter(
+                AgentRunEvent(
+                    type="agent_text",
+                    message="GPT partial answer",
+                    metadata={},
+                )
+            )
+            self.reporter(
+                AgentRunEvent(
+                    type="model_failover_reset",
+                    message="主模型响应中断，正在切换备用模型...",
+                    metadata={"from_route": "primary:gpt", "to_route": "claude:claude-opus-5"},
+                )
+            )
+            self.reporter(
+                AgentRunEvent(
+                    type="agent_text",
+                    message="Claude complete answer",
+                    metadata={},
+                )
+            )
+            return AgentRunResult(thread_id=thread_id, answer="Claude complete answer", metadata={})
+
+    async def go():
+        channel = FeishuChannel(_settings(tmp_path), runtime_factory=lambda reporter: Runtime(reporter))
+        channel._main_loop = asyncio.get_running_loop()
+        sent: list[str | FeishuCardView] = []
+
+        async def reply(_message_id, text):
+            sent.append(text)
+            return "card_1"
+
+        async def update(_message_id, text):
+            sent.append(text)
+
+        channel._reply_card = reply
+        channel._update_card = update
+        await channel.handle_inbound(
+            FeishuInboundMessage("chat", "msg", "ou", "hello", chat_type="p2p")
+        )
+        await asyncio.sleep(0.1)
+
+        assert "GPT partial answer" in sent
+        assert "主模型响应中断，正在切换备用模型..." in sent
+        assert sent[-1] == "Claude complete answer"
+
+    _run(go())
+
+
 def test_feishu_channel_does_not_patch_blank_text_or_blank_final(tmp_path) -> None:
     class Runtime:
         def __init__(self, reporter):
@@ -1555,5 +2044,226 @@ def test_feishu_channel_ignores_non_allowed_users(tmp_path) -> None:
         )
 
         await channel.handle_inbound(inbound)
+
+    _run(go())
+
+
+def test_default_tools_register_on_demand_ocr() -> None:
+    from superassist.tools import default_tools
+
+    assert "ocr_image" in {item.name for item in default_tools()}
+
+
+def test_feishu_images_are_mirrored_into_workspace_by_date(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    store = FeishuMessageStore(tmp_path / "messages.sqlite3", image_dir=workspace / "图片")
+    data = b"\x89PNG\r\n\x1a\nfake-image-bytes"
+
+    store.save_image(message_id="msg_1", image_key="img_1", data=data, mime_type="image/png")
+
+    date_dir = datetime.now().strftime("%Y%m%d")
+    mirrored = list((workspace / "图片" / date_dir).glob("*.png"))
+    assert len(mirrored) == 1
+    assert mirrored[0].read_bytes() == data
+    assert store.find_image_path(data) == f"图片/{date_dir}/{mirrored[0].name}"
+
+
+def test_multimodal_content_exposes_workspace_image_paths() -> None:
+    content = build_multimodal_image_content(
+        "请讲解",
+        [(b"image", "image/png")],
+        image_paths=["图片/20261121/abc123.png"],
+    )
+
+    assert content[0]["type"] == "image_url"
+    assert content[1]["text"] == "Workspace path for this image: 图片/20261121/abc123.png"
+    assert content[-1]["text"] == "请讲解"
+
+
+def test_bot_mention_matches_by_name_even_when_open_id_differs() -> None:
+    inbound = FeishuInboundMessage(
+        chat_id="chat",
+        message_id="msg",
+        sender_open_id="ou",
+        text="@_user_1 讲一下这题",
+        chat_type="group",
+        mentions=[{"name": "小小娇", "open_id": "ou_some_other_id"}],
+    )
+
+    assert has_bot_mention(inbound, bot_open_id="ou_f1914", bot_name="小小娇") is True
+    assert has_bot_mention(inbound, bot_open_id="ou_f1914") is False
+
+
+def test_bot_mention_accepts_multiple_configured_names() -> None:
+    inbound = FeishuInboundMessage(
+        chat_id="chat",
+        message_id="msg",
+        sender_open_id="ou",
+        text="@_user_1 hi",
+        chat_type="group",
+        mentions=[{"name": "小小娇助手版", "open_id": "ou_unknown"}],
+    )
+
+    assert has_bot_mention(
+        inbound, bot_open_id="ou_f1914", bot_names=("小小娇", "小小娇助手版")
+    ) is True
+    assert has_bot_mention(inbound, bot_open_id="ou_f1914", bot_names=("小小娇",)) is False
+
+
+def test_parse_feishu_event_extracts_at_tag_from_rich_content() -> None:
+    rich = {
+        "content": [
+            [
+                {"tag": "at", "user_id": "ou_f1914b1d3909c8e409e6b3c55573015a", "user_name": "小小娇", "text": "@小小娇"},
+                {"tag": "text", "text": "讲一下这题"},
+            ]
+        ]
+    }
+    event = SimpleNamespace(
+        event=SimpleNamespace(
+            message=SimpleNamespace(
+                chat_id="chat",
+                message_id="msg",
+                chat_type="group",
+                content=json.dumps(rich),
+                mentions=[],
+            ),
+            sender=SimpleNamespace(sender_id=SimpleNamespace(open_id="ou_1")),
+        )
+    )
+
+    inbound = parse_feishu_event(event)
+
+    assert has_bot_mention(inbound, bot_open_id="ou_f1914b1d3909c8e409e6b3c55573015a") is True
+    assert any(m.get("name") == "小小娇" for m in inbound.mentions)
+
+
+def _real_sdk_mention(open_id: str, name: str, key: str = "@_user_1"):
+    """Build a genuine lark MentionEvent, whose `id` is a UserId *object*."""
+    from lark_oapi.api.im.v1.model.mention_event import MentionEvent
+    from lark_oapi.api.im.v1.model.user_id import UserId
+
+    mention = MentionEvent()
+    mention.key = key
+    mention.id = UserId.builder().open_id(open_id).build()
+    mention.name = name
+    mention.mentioned_type = "bot"
+    return mention
+
+
+def _event_with_mentions(mentions, text: str = "@_user_1 你好"):
+    return SimpleNamespace(
+        event=SimpleNamespace(
+            message=SimpleNamespace(
+                chat_id="oc_group",
+                message_id="om_mention",
+                chat_type="group",
+                content=json.dumps({"text": text}),
+                mentions=mentions,
+                create_time="1763725470000",
+                root_id=None,
+            ),
+            sender=SimpleNamespace(sender_id=SimpleNamespace(open_id="ou_user"), name="小馨"),
+        )
+    )
+
+
+def test_parse_feishu_event_handles_real_sdk_mention_event_object() -> None:
+    """Regression: MentionEvent.id is a UserId object, not a string.
+
+    Keeping that object made json.dumps raise in the message store, which
+    silently dropped every @-mention message before it reached the logs.
+    """
+    inbound = parse_feishu_event(_event_with_mentions([_real_sdk_mention("ou_bot", "小小娇")]))
+
+    assert inbound.mentions
+    for mention in inbound.mentions:
+        for value in mention.values():
+            assert value is None or isinstance(value, (str, int, float, bool))
+    assert inbound.mentions[0]["open_id"] == "ou_bot"
+    assert has_bot_mention(inbound, bot_open_id="ou_bot") is True
+    assert clean_mention_text(inbound.text, inbound.mentions) == "你好"
+    json.dumps(inbound.mentions, ensure_ascii=False)  # must not raise
+
+
+def test_message_store_persists_sdk_mention_payload(tmp_path) -> None:
+    inbound = parse_feishu_event(_event_with_mentions([_real_sdk_mention("ou_bot", "小小娇")]))
+    store = FeishuMessageStore(tmp_path / "messages.sqlite3", image_dir=tmp_path / "图片")
+
+    inserted, _ = store.add_message(
+        message_id=inbound.message_id,
+        chat_id=inbound.chat_id,
+        sender_open_id=inbound.sender_open_id,
+        sender_name=inbound.sender_name,
+        text=inbound.text,
+        root_id=inbound.root_id,
+        chat_type=inbound.chat_type,
+        mentions=inbound.mentions,
+        files=inbound.files,
+        created_at=inbound.created_at,
+    )
+
+    assert inserted is True
+    stored = store.list_unconsumed(inbound.chat_id)[-1]
+    assert stored.mentions[0]["open_id"] == "ou_bot"
+
+
+def test_inbound_failure_callback_surfaces_exceptions(caplog) -> None:
+    """A failed handle_inbound must leave a trace instead of vanishing."""
+    import concurrent.futures
+    import logging
+
+    from superassist.channels.feishu import _log_inbound_failure
+
+    future: concurrent.futures.Future = concurrent.futures.Future()
+    future.set_exception(RuntimeError("boom"))
+    with caplog.at_level(logging.ERROR, logger="superassist.channels.feishu"):
+        _log_inbound_failure(future)
+
+    assert any("Feishu inbound handling failed" in record.getMessage() for record in caplog.records)
+
+
+def test_real_sdk_mention_event_reaches_runtime_end_to_end(tmp_path) -> None:
+    """The exact production path: raw MentionEvent -> store -> gate -> runtime."""
+    received = []
+
+    class Runtime:
+        def __init__(self, _reporter):
+            self.memory_queue = SimpleNamespace(flush=lambda: None)
+
+        def run_streaming(self, message, *, user_id, thread_id, message_content=None):
+            received.append((message, user_id, thread_id))
+            return AgentRunResult(thread_id=thread_id, answer="done", metadata={})
+
+    async def go():
+        channel = FeishuChannel(
+            _settings(tmp_path, SUPERASSIST_FEISHU_ACTIVATION_DEBOUNCE_SECONDS=0),
+            runtime_factory=lambda reporter: Runtime(reporter),
+        )
+
+        async def create(_chat_id, _text):
+            return "card"
+
+        async def update(_message_id, _text):
+            return None
+
+        channel._create_card = create
+        channel._update_card = update
+
+        event = _event_with_mentions(
+            [_real_sdk_mention("ou_bot", "小小娇")], text="@_user_1 讲一下这题"
+        )
+        await channel.handle_inbound(parse_feishu_event(event))
+
+        assert len(received) == 1
+        assert "讲一下这题" in received[0][0]
+        # The message was consumed by the runtime, so query the inbox directly.
+        assert channel.message_store.latest_seq("oc_group") == 1
+        with sqlite3.connect(channel.message_store.path) as conn:
+            mentions_json = conn.execute(
+                "SELECT mentions_json FROM feishu_messages WHERE message_id = ?",
+                ("om_mention",),
+            ).fetchone()[0]
+        assert json.loads(mentions_json)[0]["open_id"] == "ou_bot"
 
     _run(go())

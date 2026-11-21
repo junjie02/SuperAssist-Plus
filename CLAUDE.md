@@ -92,7 +92,7 @@ The WebSocket handler forwards `{message, thread_id, rag_mode}` to Python `/inte
 
 ### Middleware-First Agent
 
-[src/superassist/agent/factory.py](src/superassist/agent/factory.py) creates one LangChain `create_agent`; there is no outer lead-agent `StateGraph`. Hook ordering is behavioral API because `before_*` runs in registration order and `after_*` runs in reverse.
+[src/superassist/agent/factory.py](src/superassist/agent/factory.py) creates the ordinary LangChain `create_agent`. When `rag_mode` and `SUPERASSIST_AGENTIC_RAG_ENABLED` are both true, `AgentRuntime` routes the turn through `rag/agentic_graph.py`, an explicit outer LangGraph state machine; ordinary chat and the legacy RAG feature-flag path still use the middleware chain. Hook ordering remains behavioral API because `before_*` runs in registration order and `after_*` runs in reverse.
 
 Base chain:
 
@@ -106,7 +106,7 @@ Base chain:
 8. `MemoryWriterMiddleware`
 9. `FinalTextMiddleware`
 
-RAG mode inserts `RagRetrievalMiddleware` after memory recall and registers `RagAttributionMiddleware` after `FinalTextMiddleware`; reverse `after_agent` dispatch makes attribution run first so final-text extraction captures the attributed answer. Keep [src/CLAUDE.md](src/CLAUDE.md) synchronized when changing this order.
+The legacy RAG path inserts `RagRetrievalMiddleware` after memory recall and registers `RagAttributionMiddleware` after `FinalTextMiddleware`. The Agentic path disables those control responsibilities and instead runs route, plan, retrieve, grade, rewrite/backtrack, fallback, synthesize, verify, and finalize nodes; durable short/long-memory side effects run once after graph finalization. Keep [src/CLAUDE.md](src/CLAUDE.md) synchronized when changing either path.
 
 ### Long-Term Memory
 
@@ -149,6 +149,8 @@ The authenticated shell keeps Chat mounted while switching pages so WebSocket an
 
 [src/superassist/channels/feishu.py](src/superassist/channels/feishu.py) receives Feishu events over WebSocket and sends incremental interactive-card updates. Private chats use `feishu:<open_id>` identities; every member of a group shares `feishu-group:<chat_id>`, a stable group thread, Memory graph, and RAG scope. Every visible group message is first inserted idempotently into `channels/feishu_messages.sqlite3`; only an explicit mention activates the Agent. Activation waits for a configurable 1.5-second quiet window (6-second hard limit), then projects every unconsumed message through the high-water mark into one speaker-attributed `FeishuConversationBatch`. Per-scope locks queue concurrent work instead of dropping it. Image bytes are cached in the inbox at ingress, sent in chronological speaker order with optional untrusted OCR, and retained in the existing sliding in-memory context for private follow-ups. GPT-5.6 uses Responses with `use_previous_response_id=False`; configured OpenAI-compatible Claude and DeepSeek routes provide ordered failover. Streaming card updates use one coalescing worker per message and must drain before the final patch. Non-image files remain unsupported.
 
+`/clear` is a deterministic control command intercepted before Agent execution. It atomically empties the thread's `messages.jsonl`, resets summary/compaction and Skill activation metadata, invalidates only the Redis `short-memory` and `skills` keys, and advances `conversation_generation`. Ordinary turns and clear operations share local and Redis thread-state locks; stale generations cannot write short memory back. Feishu additionally clears the scope image context and advances the inbox cursor through the command. The command preserves the thread mapping, long-term Memory graph and FAISS index, RAG data, quiz/wrongbook and Shenlun files, Subagent/ACP task records, account data, and unrelated thread metadata. Group clear requires an explicit bot mention because the thread is shared by every member.
+
 ### WeCom
 
 [src/superassist/channels/wecom.py](src/superassist/channels/wecom.py) uses the official WeCom intelligent-robot WebSocket SDK, but delegates Agent execution to the existing Python `/internal/chat` SSE endpoint through [ai_engine_client.py](src/superassist/channels/ai_engine_client.py). Keep this process boundary: constructing another runtime in the channel would create unsafe concurrent writers for local Hybrid RAG indexes. Private chats are isolated by sender; every member of a group chat shares the group thread, Memory identity, and RAG state. Explicit sender/group-to-browser mappings can attach either scope to uploaded knowledge. See [WECOM.md](src/superassist/channels/WECOM.md) for setup and operations.
@@ -177,7 +179,7 @@ channels/feishu_messages.sqlite3 durable Feishu inbox, image payloads, and consu
 channels/wecom_threads.json     WeCom chat/sender-to-thread and RAG mapping
 channels/wecom_rpa_state.json   desktop RPA visible-message replay guard
 study/shenlun/sessions/         authoritative latest quiz session per thread
-study/shenlun/current/          read-only public/private current-quiz resources exposed as quiz://current/*
+study/shenlun/current/          read-only current quiz and wrongbook resources exposed as quiz://current/*; writes use daily_quiz_update wrongbook_add
 huggingface/                    embedding model cache
 workspace/                      file/shell tool sandbox
 ```

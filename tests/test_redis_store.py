@@ -165,6 +165,40 @@ def test_redis_runtime_state_supports_ttl_caches_and_rate_limit(tmp_path) -> Non
     assert [store.allow_request("u1")[0] for _ in range(3)] == [True, True, False]
 
 
+def test_redis_short_state_generation_rejects_stale_cache_and_clears_only_target_keys(tmp_path) -> None:
+    client = FakeRedis()
+    store = RedisRuntimeStore(_settings(tmp_path), client=client)
+    store.save_skill_activations("t1", {"skill-a": 123.0}, ttl_seconds=300, generation=2)
+    store.save_short_memory(
+        "t1",
+        {"summary": "old", "records": [], "conversation_generation": 2},
+    )
+    store.save_recall("u1", "hello", {"important": True})
+    store.save_task({"task_id": "task-1", "status": "running"})
+
+    assert store.load_skill_activations("t1", generation=1) == {}
+    assert store.load_short_memory("t1", generation=1) is None
+    assert store.load_skill_activations("t1", generation=2) == {"skill-a": 123.0}
+
+    store.clear_thread_short_state("t1")
+
+    assert store.load_skill_activations("t1", generation=2) == {}
+    assert store.load_short_memory("t1", generation=2) is None
+    assert store.load_recall("u1", "hello") == {"important": True}
+    assert store.get_task("task-1") == {"task_id": "task-1", "status": "running"}
+
+
+def test_optional_redis_lock_fails_open_to_local_state_when_redis_is_unavailable(tmp_path) -> None:
+    class BrokenRedis(FakeRedis):
+        def set(self, key, value, nx=False, ex=None):
+            raise ConnectionError("redis unavailable")
+
+    store = RedisRuntimeStore(_settings(tmp_path), client=BrokenRedis())
+
+    with store.lock("thread-state", "t1") as acquired:
+        assert acquired is True
+
+
 def test_redis_runtime_state_persists_tasks_cards_and_image_references(tmp_path) -> None:
     store = RedisRuntimeStore(_settings(tmp_path), client=FakeRedis())
     task = {"task_id": "task-1", "status": "completed", "result": "ok"}

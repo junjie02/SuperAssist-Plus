@@ -27,6 +27,26 @@ def team_task(agent: str, description: str, prompt: str, wait: bool = True) -> s
     return run_team_task(agent=agent, description=description, prompt=prompt, wait=wait)
 
 
+@tool("team_task_status")
+def team_task_status(task_id: str) -> str:
+    """Read the durable status of a previously queued team task."""
+    supervisor = get_team_supervisor()
+    if supervisor is None or not supervisor.enabled:
+        return "Error: Agent teams are disabled. Enable them in agent_team.toml."
+    thread_id = current_team_thread_id()
+    if not thread_id:
+        return "Error: team_task_status requires an active SuperAssist thread context."
+    try:
+        result = supervisor.poll(task_id, thread_id=thread_id)
+    except (LedgerTamperError, TeamSupervisorError) as exc:
+        return f"Error: {exc}"
+    if result.status in {"queued", "running"}:
+        return f"Team task {result.task_id} is {result.status}."
+    if result.status == "failed":
+        return f"Team task {result.task_id} failed: {result.result}"
+    return f"Team task {result.task_id} completed. Result: {result.result}"
+
+
 def run_team_task(agent: str, description: str, prompt: str, wait: bool = True) -> str:
     return _run_team_task_traced(
         agent=agent,
@@ -70,4 +90,6 @@ def _run_team_task_traced(agent: str, description: str, prompt: str, wait: bool 
     except Exception as exc:
         logger.exception("Unexpected team task failure")
         return f"Error: team_task failed with {type(exc).__name__}: {exc}"
+    if result.status == "queued":
+        return f"Team task queued via {result.agent}. Task ID: {result.task_id}. Use team_task_status to poll it."
     return f"Team task succeeded via {result.agent}. Result: {result.result}"

@@ -79,3 +79,10 @@ MuSiQue/dataset/output/*
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Local agent session notes (kept out of the repo)
+.workbuddy/
+
+# Local test scratch directories
+.pytest-basetemp/
+.test-tmp/

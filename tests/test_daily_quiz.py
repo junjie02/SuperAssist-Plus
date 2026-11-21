@@ -231,6 +231,28 @@ def test_delegated_question_count_becomes_session_validation_contract(tmp_path) 
     )
 
 
+def test_quiz_tool_recovers_stringified_questions_array(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    thread_store = FeishuThreadStore(settings.feishu_thread_store_path)
+    thread_id = thread_store.get_or_create_thread_id(
+        chat_id="chat_1",
+        topic_id="topic_1",
+        user_id="user_1",
+    )
+    tool = make_daily_quiz_tool(settings)
+    DailyQuizStore(settings).start_session(
+        "chat_1",
+        thread_id,
+        datetime.now(ZoneInfo("Asia/Shanghai")),
+    )
+
+    with team_thread_context(thread_id):
+        result = tool.invoke({"action": "draft", "questions": json.dumps(_questions(), ensure_ascii=False)})
+
+    assert "Draft saved and structurally validated" in result
+
+
+
 def test_main_agent_tool_loads_grading_context_from_an_ordinary_answer_turn(tmp_path) -> None:
     settings = _settings(tmp_path)
     store = DailyQuizStore(settings)
@@ -253,10 +275,124 @@ def test_main_agent_tool_loads_grading_context_from_an_ordinary_answer_turn(tmp_
         "answers",
         "results",
         "overall_feedback",
+        "wrong_question",
     }
     assert "prepare_generation" in schema["properties"]["action"]["enum"]
     assert "public_view" in schema["properties"]["action"]["enum"]
     assert "grading_context" in schema["properties"]["action"]["enum"]
+    assert "wrongbook_add" in schema["properties"]["action"]["enum"]
+
+
+def test_main_agent_tool_adds_and_deduplicates_wrongbook_entries_by_feishu_chat(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    thread_store = FeishuThreadStore(settings.feishu_thread_store_path)
+    thread_id = thread_store.get_or_create_thread_id(
+        chat_id="chat_1",
+        topic_id="topic_1",
+        user_id="user_1",
+    )
+    other_thread_id = thread_store.get_or_create_thread_id(
+        chat_id="chat_2",
+        topic_id="topic_2",
+        user_id="user_1",
+    )
+    tool = make_daily_quiz_tool(settings)
+    wrong_question = {
+        "question": "发展新质生产力的核心标志是什么？",
+        "options": {
+            "A": "单纯扩大投资规模",
+            "B": "全要素生产率大幅提升",
+            "C": "减少科技创新投入",
+            "D": "依赖传统增长路径",
+        },
+        "correct_option": "B",
+        "selected_option": "A",
+        "explanation": "新质生产力以全要素生产率大幅提升为核心标志。",
+        "weakness": "混淆生产要素投入规模与生产效率提升。",
+        "feedback": "A 只强调投入规模，没有体现质态跃迁。",
+        "source_date": "2026-08-19",
+        "source_title": "政治理论练习",
+        "evidence": "新质生产力以全要素生产率大幅提升为核心标志。",
+    }
+
+    with team_thread_context(thread_id):
+        first = tool.invoke({"action": "wrongbook_add", "wrong_question": wrong_question})
+        second = tool.invoke(
+            {
+                "action": "wrongbook_add",
+                "wrong_question": {
+                    **wrong_question,
+                    "question": "发展新质生产力的核心标志是什么",
+                    "selected_option": "C",
+                },
+            }
+        )
+    with team_thread_context(other_thread_id):
+        other = tool.invoke(
+            {
+                "action": "wrongbook_add",
+                "wrong_question": {
+                    **wrong_question,
+                    "question": "中国式现代化的中国特色包括什么？",
+                },
+            }
+        )
+
+    assert "Wrongbook entry added" in first
+    assert "Wrongbook entry updated" in second
+    assert "Wrongbook entry added" in other
+    chat_data = []
+    for chat_dir in (settings.daily_quiz_data_dir / "chats").iterdir():
+        data = json.loads((chat_dir / "wrong_questions.json").read_text(encoding="utf-8"))
+        markdown = (chat_dir / "错题本.md").read_text(encoding="utf-8")
+        chat_data.append(data)
+        assert all(item["question"] in markdown for item in data["items"])
+    by_chat = {data["chat_id"]: data["items"] for data in chat_data}
+    assert len(by_chat["chat_1"]) == 1
+    assert by_chat["chat_1"][0]["wrong_count"] == 2
+    assert by_chat["chat_1"][0]["last_selected_option"] == "C"
+    assert len(by_chat["chat_2"]) == 1
+    assert by_chat["chat_2"][0]["wrong_count"] == 1
+
+
+def test_wrongbook_add_rejects_incomplete_or_unmapped_requests(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    tool = make_daily_quiz_tool(settings)
+
+    with team_thread_context("unmapped_thread"):
+        unmapped = tool.invoke({"action": "wrongbook_add", "wrong_question": {}})
+
+    thread_id = FeishuThreadStore(settings.feishu_thread_store_path).get_or_create_thread_id(
+        chat_id="chat_1",
+        topic_id="topic_1",
+        user_id="user_1",
+    )
+    with team_thread_context(thread_id):
+        incomplete = tool.invoke(
+            {
+                "action": "wrongbook_add",
+                "wrong_question": {
+                    "question": "题目",
+                    "correct_option": "B",
+                },
+            }
+        )
+        not_wrong = tool.invoke(
+            {
+                "action": "wrongbook_add",
+                "wrong_question": {
+                    "question": "题目",
+                    "correct_option": "B",
+                    "selected_option": "B",
+                    "explanation": "解析",
+                    "weakness": "薄弱点",
+                },
+            }
+        )
+
+    assert "no Feishu conversation is mapped" in unmapped
+    assert "requires question, explanation, and weakness" in incomplete
+    assert "must differ from correct_option" in not_wrong
 
 
 def test_current_quiz_resources_are_thread_scoped_read_only_and_private_after_submission(
@@ -280,6 +416,10 @@ def test_current_quiz_resources_are_thread_scoped_read_only_and_private_after_su
             read_file.invoke({"path": "quiz://current/private"})
         with pytest.raises(PermissionError, match="read-only"):
             write_file.invoke({"path": "quiz://current/public", "content": "replace"})
+        wrongbook = read_file.invoke({"path": "quiz://current/wrongbook"})
+        assert "政治理论错题本" in wrongbook
+        with pytest.raises(PermissionError, match="read-only"):
+            write_file.invoke({"path": "quiz://current/wrongbook", "content": "replace"})
 
         assert store.build_grading_prompt("thread_1", ["A", "C"])
         private = json.loads(read_file.invoke({"path": "quiz://current/private"}))
@@ -289,6 +429,19 @@ def test_current_quiz_resources_are_thread_scoped_read_only_and_private_after_su
     with team_thread_context("thread_2"):
         with pytest.raises(FileNotFoundError, match="No quiz"):
             read_file.invoke({"path": "quiz://current/public"})
+        with pytest.raises(FileNotFoundError, match="No quiz"):
+            read_file.invoke({"path": "quiz://current/wrongbook"})
+
+
+def test_current_context_exposes_read_only_wrongbook_resource(tmp_path) -> None:
+    store = DailyQuizStore(_settings(tmp_path))
+    _prepare(store, datetime.now(ZoneInfo("Asia/Shanghai")))
+
+    context = store.current_context("thread_1")
+
+    assert context["wrongbook_resource"] == "quiz://current/wrongbook"
+    assert context["wrongbook_count"] == 0
+    assert context["active_wrongbook_count"] == 0
 
 
 def test_ten_question_set_requires_exact_count_and_review_before_activation(tmp_path) -> None:

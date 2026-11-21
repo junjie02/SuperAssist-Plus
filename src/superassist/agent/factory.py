@@ -120,6 +120,15 @@ def build_agent(
         from superassist.channels.daily_quiz import make_daily_quiz_tool
 
         tools.append(make_daily_quiz_tool(settings))
+    if settings.enable_tools and settings.subagents_enabled:
+        from superassist.tools.shenlun_grading import make_shenlun_grading_tool
+
+        tools.append(
+            make_shenlun_grading_tool(
+                settings,
+                run_event_reporter=run_event_reporter,
+            )
+        )
     if rag_mode:
         from superassist.tools.web import web_fetch, web_search
 

@@ -22,6 +22,7 @@ from superassist.memory.embedding import Embedder, get_embedder
 from superassist.rag.chunking import chunk_document, lexical_terms, lexical_text, truncate_tokens
 from superassist.rag.context import RagRetrievalResult
 from superassist.rag.documents import SUPPORTED_EXTENSIONS, extract_document, safe_filename
+from superassist.rag.reranking import Reranker, get_reranker
 
 logger = logging.getLogger(__name__)
 
@@ -29,16 +30,18 @@ logger = logging.getLogger(__name__)
 class HybridRAGService:
     """Index uploaded files as original chunks and retrieve them with Dense + BM25 RRF."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, reranker: Reranker | None = None) -> None:
         self.settings = settings
         self.base_dir = settings.rag_dir.resolve()
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self._embedder: Embedder = get_embedder(settings)
         self._embedder.embed("Hybrid RAG embedding dimension probe")
+        self._reranker = reranker
         self._manifest_lock = threading.RLock()
         self._user_locks_guard = threading.Lock()
         self._user_locks: dict[str, threading.RLock] = {}
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="superassist-rag-index")
+        self._retrieval_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="superassist-rag-search")
 
     @property
     def supported_extensions(self) -> list[str]:
@@ -118,7 +121,14 @@ class HybridRAGService:
         future.add_done_callback(lambda completed: self._log_background_error(completed, document_id))
         return {"id": document_id, "status": "deleting"}
 
-    def retrieve(self, user_id: str, query: str, mode: str = "hybrid") -> RagRetrievalResult:
+    def retrieve(
+        self,
+        user_id: str,
+        query: str,
+        mode: str = "hybrid",
+        *,
+        rerank: bool | None = None,
+    ) -> RagRetrievalResult:
         mode = mode if mode in {"hybrid", "dense", "bm25"} else "hybrid"
         query = str(query or "").strip()
         if not query:
@@ -128,13 +138,46 @@ class HybridRAGService:
 
         with self._user_lock(user_id):
             self._ensure_store(user_id)
-            dense = self._dense_search(user_id, query, self.settings.rag_candidate_top_k) if mode != "bm25" else []
-            sparse = self._bm25_search(user_id, query, self.settings.rag_candidate_top_k) if mode != "dense" else []
+            if mode == "hybrid":
+                dense_future = self._retrieval_executor.submit(
+                    self._dense_search,
+                    user_id,
+                    query,
+                    self.settings.rag_candidate_top_k,
+                )
+                sparse_future = self._retrieval_executor.submit(
+                    self._bm25_search,
+                    user_id,
+                    query,
+                    self.settings.rag_candidate_top_k,
+                )
+                dense = dense_future.result()
+                sparse = sparse_future.result()
+            else:
+                dense = self._dense_search(user_id, query, self.settings.rag_candidate_top_k) if mode == "dense" else []
+                sparse = self._bm25_search(user_id, query, self.settings.rag_candidate_top_k) if mode == "bm25" else []
             fused = _rrf_fuse(dense, sparse, self.settings.rag_rrf_k, mode)
+            should_rerank = mode == "hybrid" and (
+                self.settings.rag_reranker_enabled if rerank is None else rerank
+            )
+            if should_rerank:
+                pool_size = max(self.settings.rag_chunk_top_k, self.settings.rag_reranker_candidate_top_k)
+                fused = fused[:pool_size]
             candidate_ids = [chunk_id for chunk_id, _score, _dense_rank, _bm25_rank in fused]
             rows = self._load_chunks(user_id, candidate_ids)
 
         by_id = {str(row["id"]): row for row in rows}
+        reranker_scores: dict[str, float] = {}
+        if should_rerank:
+            try:
+                fused, reranker_scores = _rerank_fused_candidates(
+                    query,
+                    fused,
+                    by_id,
+                    self._reranker or get_reranker(self.settings),
+                )
+            except Exception:  # noqa: BLE001 - reranking must not make retrieval unavailable
+                logger.exception("Cross-encoder reranking failed; retaining RRF order")
         hits: list[dict[str, Any]] = []
         seen_hashes: set[str] = set()
         context_parts: list[str] = []
@@ -171,6 +214,7 @@ class HybridRAGService:
                     "dense_rank": dense_rank,
                     "bm25_rank": bm25_rank,
                     "rrf_score": score,
+                    "reranker_score": reranker_scores.get(chunk_id),
                 }
             )
 
@@ -189,6 +233,7 @@ class HybridRAGService:
 
     def close(self) -> None:
         self._executor.shutdown(wait=True, cancel_futures=False)
+        self._retrieval_executor.shutdown(wait=True, cancel_futures=False)
 
     def _index_document(self, user_id: str, document_id: str) -> None:
         try:
@@ -510,6 +555,46 @@ def _token_count(text: str) -> int:
     from superassist.rag.chunking import count_tokens
 
     return count_tokens(text)
+
+
+def _rerank_fused_candidates(
+    query: str,
+    fused: list[tuple[str, float, int | None, int | None]],
+    rows_by_id: dict[str, Any],
+    reranker: Reranker,
+) -> tuple[list[tuple[str, float, int | None, int | None]], dict[str, float]]:
+    available = [item for item in fused if item[0] in rows_by_id]
+    texts = [_reranker_document_text(item[0], rows_by_id[item[0]]) for item in available]
+    scores = reranker.score(query, texts)
+    if len(scores) != len(available):
+        raise RuntimeError(f"Reranker returned {len(scores)} scores for {len(available)} candidates")
+    score_by_id = {item[0]: float(score) for item, score in zip(available, scores, strict=True)}
+    ranked = sorted(
+        available,
+        key=lambda item: (-score_by_id[item[0]], -item[1], item[0]),
+    )
+    return ranked, score_by_id
+
+
+def _reranker_document_text(chunk_id: str, row: Any) -> str:
+    """Build one query-document pair without duplicating index metadata.
+
+    Some evaluation indexes store ``text`` as ``title + abstract`` while also
+    populating ``heading`` with the title and ``document_name`` with the corpus
+    ID. Passing all three fields verbatim biases a reranker toward IDs/titles.
+    Production uploads still retain a meaningful file name and section heading.
+    """
+    document_name = str(row["document_name"] or "").strip()
+    heading = str(row["heading"] or "").strip()
+    text = str(row["text"] or "").strip()
+    parts: list[str] = []
+    if document_name and document_name != str(chunk_id):
+        parts.append(document_name)
+    if heading and not (text == heading or text.startswith(f"{heading}\n")):
+        parts.append(heading)
+    if text:
+        parts.append(text)
+    return "\n".join(parts)
 
 
 def _utc_now() -> str:

@@ -174,17 +174,44 @@ def _parse_skill_file(skill_file: Path, relative_path: Path) -> Skill | None:
 
 
 def _parse_frontmatter(content: str) -> dict[str, str]:
+    """Parse simple YAML frontmatter, incl. folded/literal block scalars (``>`` / ``|``)."""
     lines = content.splitlines()
     if not lines or lines[0].strip() != "---":
         return {}
     metadata: dict[str, str] = {}
-    for line in lines[1:]:
-        if line.strip() == "---":
+    index = 1
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        if stripped == "---":
             break
-        if ":" not in line:
+        if not stripped or ":" not in line or line[:1].isspace():
+            index += 1
             continue
         key, value = line.split(":", 1)
-        metadata[key.strip()] = value.strip().strip('"').strip("'")
+        key = key.strip()
+        value = value.strip()
+        if value.startswith((">", "|")):
+            block: list[str] = []
+            index += 1
+            while index < len(lines):
+                following = lines[index]
+                if following.strip() == "---" or (
+                    following.strip() and not following[:1].isspace()
+                ):
+                    break
+                if following.strip():
+                    block.append(following.strip())
+                elif block:
+                    block.append("")
+                index += 1
+            if value.startswith("|"):
+                metadata[key] = "\n".join(block).strip()
+            else:
+                metadata[key] = " ".join(part for part in block if part).strip()
+            continue
+        metadata[key] = value.strip('"').strip("'")
+        index += 1
     return metadata
 
 
