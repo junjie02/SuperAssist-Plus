@@ -10,7 +10,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-DOCUMENT_MAX_CHARS = 24_000
+# 0 means "no limit": the whole document is extracted. The workspace is on disk,
+# so there is no reason to throw text away here. The only real limit is how much
+# of it gets injected into the model context, which is configured separately.
+DOCUMENT_MAX_CHARS = 0
 
 TEXT_SUFFIXES = frozenset(
     {
@@ -65,10 +68,11 @@ def document_kind(path: str | Path) -> str:
 
 
 def extract_document_text(path: str | Path, *, max_chars: int = DOCUMENT_MAX_CHARS) -> str:
-    """Extract readable text from a document, truncated to ``max_chars``.
+    """Extract readable text from a document.
 
-    Returns an empty string when the format is unsupported or extraction fails;
-    callers are expected to surface the file path instead of an exception.
+    ``max_chars=0`` (the default) keeps the whole document. Returns an empty
+    string when the format is unsupported or extraction fails; callers are
+    expected to surface the file path instead of an exception.
     """
 
     target = Path(path)
@@ -89,9 +93,50 @@ def extract_document_text(path: str | Path, *, max_chars: int = DOCUMENT_MAX_CHA
     except Exception:  # noqa: BLE001 - a broken document must not break the turn
         return ""
     text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-    if len(text) > max_chars:
+    if max_chars and len(text) > max_chars:
         text = text[:max_chars].rstrip() + "\n\n[内容已截断]"
     return text
+
+
+def document_text_path(path: str | Path) -> Path:
+    """Sidecar path that stores the extracted plain text of a document."""
+
+    return Path(path).with_name(f"{Path(path).name}.txt")
+
+
+def write_document_text_sidecar(path: str | Path) -> Path | None:
+    """Persist the full extracted text next to the original document.
+
+    Keeping a ``.txt`` twin means later turns (and ``read_file``/``grep``) can
+    read the whole document without re-parsing PDF/Office bytes.
+    """
+
+    target = Path(path)
+    if document_kind(target) not in {"pdf", "docx", "spreadsheet", "text"}:
+        return None
+    text = extract_document_text(target)
+    if not text:
+        return None
+    sidecar = document_text_path(target)
+    try:
+        sidecar.write_text(text, encoding="utf-8")
+    except OSError:
+        return None
+    return sidecar
+
+
+def read_document_text(path: str | Path) -> str:
+    """Return document text, preferring the sidecar written at ingest time."""
+
+    sidecar = document_text_path(path)
+    if sidecar.is_file():
+        try:
+            text = sidecar.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        if text.strip():
+            return text
+    return extract_document_text(path)
 
 
 def _extract_pdf(path: Path) -> str:
@@ -135,9 +180,6 @@ def _extract_spreadsheet(path: Path) -> str:
                 cells = ["" if cell is None else str(cell) for cell in row]
                 if any(cell.strip() for cell in cells):
                     rows.append(" | ".join(cells))
-                if len(rows) >= 400:
-                    rows.append("... [工作表已截断]")
-                    break
             if rows:
                 blocks.append(f"[工作表 {sheet.title}]\n" + "\n".join(rows))
     finally:
@@ -159,5 +201,8 @@ __all__ = [
     "DOCUMENT_MAX_CHARS",
     "SUPPORTED_DOCUMENT_SUFFIXES",
     "document_kind",
+    "document_text_path",
     "extract_document_text",
+    "read_document_text",
+    "write_document_text_sidecar",
 ]

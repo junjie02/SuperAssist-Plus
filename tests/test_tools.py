@@ -344,3 +344,42 @@ def test_outbound_file_state_reducer_dedupes_by_path() -> None:
     )
 
     assert [item["path"] for item in merged] == ["文件/a.txt", "文件/b.pdf"]
+
+
+def test_extract_document_text_keeps_whole_file_by_default(tmp_path: Path) -> None:
+    from superassist.tools.documents import extract_document_text
+
+    body = "".join(f"第{i}段 政治理论学习要点\n" for i in range(4000))
+    target = tmp_path / "long.txt"
+    target.write_text(body, encoding="utf-8")
+
+    text = extract_document_text(target)
+
+    assert len(text) > 60_000
+    assert text == body.strip()
+    assert "内容已截断" not in text
+
+
+def test_document_sidecar_holds_full_text_and_read_file_prefers_it(tmp_path: Path, monkeypatch) -> None:
+    from superassist.tools.documents import document_text_path, read_document_text
+    from superassist.tools.files import read_file
+
+    body = "第一行\n第二行\n" * 3000
+    target = tmp_path / "笔记.txt"
+    target.write_text(body, encoding="utf-8")
+    sidecar = document_text_path(target)
+    sidecar.write_text("sidecar 全文", encoding="utf-8")
+
+    assert read_document_text(target) == "sidecar 全文"
+
+    settings = Settings(
+        SUPERASSIST_DATA_DIR=tmp_path / "data",
+        SUPERASSIST_EMBEDDING_PROVIDER="hash",
+    )
+    monkeypatch.setattr("superassist.tools.files.get_settings", lambda: settings)
+    workspace = settings.resolved_tool_workspace_dir
+    workspace.mkdir(parents=True, exist_ok=True)
+    copy_target = workspace / "笔记.txt"
+    copy_target.write_text(body, encoding="utf-8")
+
+    assert read_file.invoke({"path": "笔记.txt"}) == body

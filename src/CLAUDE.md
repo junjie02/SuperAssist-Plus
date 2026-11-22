@@ -247,6 +247,7 @@
 | `feishu_image_ocr_enabled` | `True` | 是否运行本地 RapidOCR；OCR 失败不阻止原图进入主模型。 |
 | `feishu_image_ocr_max_chars` | `12000` | 多图 OCR 注入当前轮文本历史的总字符上限。 |
 | `feishu_image_processing_concurrency` | `2` | 图片下载和逐图 OCR 的有界并发数，范围 1-8。 |
+| `file_context_max_chars` | `0` | 入站文档正文注入 prompt 的字符上限；`0` 表示全量注入（`<name>.txt` sidecar 始终保存全文）。 |
 | `feishu_image_context_ttl_seconds` | `180` | 最新一组原图跨消息保留的滑动 TTL；有效后续消息刷新计时。 |
 
 **企业微信**

@@ -254,6 +254,14 @@ class Settings(BaseSettings):
         le=8,
         alias="SUPERASSIST_FEISHU_IMAGE_PROCESSING_CONCURRENCY",
     )
+    # How much of an inbound document's extracted text is injected into the
+    # prompt. 0 (default) injects the whole document; the full text also lives on
+    # disk as a ``<name>.txt`` sidecar, so nothing is lost either way.
+    file_context_max_chars: int = Field(
+        default=0,
+        ge=0,
+        alias="SUPERASSIST_FILE_CONTEXT_MAX_CHARS",
+    )
     feishu_image_context_ttl_seconds: int = Field(
         default=180,
         ge=1,

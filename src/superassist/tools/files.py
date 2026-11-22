@@ -92,11 +92,11 @@ def read_file(path: str, start_line: int | None = None, end_line: int | None = N
         return f"Error: File not found: {path}"
     if not target.is_file():
         return f"Error: Path is not a file: {path}"
-    from superassist.tools.documents import document_kind, extract_document_text
+    from superassist.tools.documents import document_kind, read_document_text
 
     kind = document_kind(target)
     if kind in {"pdf", "docx", "spreadsheet"}:
-        text = extract_document_text(target, max_chars=60_000)
+        text = read_document_text(target)
         if not text:
             return (
                 f"Error: 无法从 {path} 抽取文本（可能是扫描版 PDF 或旧版 Office 格式）。"
@@ -107,7 +107,7 @@ def read_file(path: str, start_line: int | None = None, end_line: int | None = N
     if start_line is not None and end_line is not None:
         lines = content.splitlines()
         content = "\n".join(lines[max(0, start_line - 1) : max(0, end_line)])
-    return content[:50000]
+    return content
 
 
 @tool("write_file")

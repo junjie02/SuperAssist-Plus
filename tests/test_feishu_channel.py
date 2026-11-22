@@ -2438,3 +2438,66 @@ def test_bot_identity_display_name_becomes_an_alias(tmp_path, monkeypatch) -> No
         mentions=[{"name": "小小娇助手版", "id": "", "id_type": "open_id"}],
     )
     assert channel._has_bot_mention(inbound) is True
+
+
+def test_batch_injects_whole_document_text_by_default(tmp_path) -> None:
+    from superassist.channels.feishu import build_feishu_conversation_batch
+    from superassist.channels.store import FeishuStoredMessage
+
+    body = "\n".join(f"第{i}行 入党思想汇报正文" for i in range(2000))
+    message = FeishuStoredMessage(
+        seq=1,
+        message_id="msg_file",
+        chat_id="chat",
+        sender_open_id="ou",
+        sender_name="小馨",
+        text="[file]",
+        root_id=None,
+        chat_type="group",
+        mentions=[{"name": "@bot", "id": "ou_bot", "id_type": "open_id"}],
+        files=[
+            {
+                "file_key": "fk_1",
+                "name": "思想汇报.pdf",
+                "path": "文件/20260101/思想汇报.pdf",
+                "kind": "pdf",
+                "size": "1234",
+                "text": body,
+            }
+        ],
+        created_at="2026-11-22T10:00:00+08:00",
+    )
+
+    batch = build_feishu_conversation_batch([message], trigger_message_ids={"msg_file"})
+
+    assert "以上为前" not in batch
+    assert "第1999行" in batch
+
+
+def test_batch_honours_explicit_file_context_cap() -> None:
+    from superassist.channels.feishu import build_feishu_conversation_batch
+    from superassist.channels.store import FeishuStoredMessage
+
+    body = "\n".join(f"第{i}行" for i in range(1000))
+    message = FeishuStoredMessage(
+        seq=1,
+        message_id="msg_file",
+        chat_id="chat",
+        sender_open_id="ou",
+        sender_name="小馨",
+        text="[file]",
+        root_id=None,
+        chat_type="group",
+        mentions=[],
+        files=[{"file_key": "fk_1", "name": "a.txt", "path": "文件/a.txt", "kind": "text", "text": body}],
+        created_at="2026-11-22T10:00:00+08:00",
+    )
+
+    batch = build_feishu_conversation_batch(
+        [message],
+        trigger_message_ids={"msg_file"},
+        file_context_max_chars=100,
+    )
+
+    assert "以上为前 100 字" in batch
+    assert "第999行" not in batch

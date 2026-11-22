@@ -41,7 +41,12 @@ from superassist.llm import supports_reasoning_effort
 from superassist.memory.embedding import get_embedder
 from superassist.models import AgentRunEvent
 from superassist.redis_store import get_redis_store
-from superassist.tools.documents import document_kind, extract_document_text
+from superassist.tools.documents import (
+    document_kind,
+    document_text_path,
+    extract_document_text,
+    read_document_text,
+)
 from superassist.tools.images import MAX_ORIGINAL_BYTES, download_image_url, load_generated_image
 
 from .daily_brief import (
@@ -78,9 +83,9 @@ FILE_DOWNLOAD_FAILED_MESSAGE = (
 )
 FILE_TOO_LARGE_MESSAGE = "文件过大，暂时只支持 30 MB 以内的文件。"
 MAX_FEISHU_FILE_BYTES = 30 * 1024 * 1024
-# How much of an inbound document's text is replayed into every conversation
-# batch; the full text stays readable with read_file.
-FILE_CONTEXT_MAX_CHARS = 6000
+# How much of an inbound document's text is replayed into a conversation batch.
+# 0 means the whole document; the full text is also on disk as a .txt sidecar.
+FILE_CONTEXT_MAX_CHARS = 0
 STREAM_UPDATE_INTERVAL_SECONDS = 0.3
 IMAGE_DOWNLOAD_FAILED_MESSAGE = (
     "图片读取或格式转换失败。请确认飞书 im:resource 权限已生效，"
@@ -849,6 +854,7 @@ class FeishuChannel:
             messages,
             omitted_images=omitted_images,
             trigger_message_ids={trigger.message_id},
+            file_context_max_chars=self.settings.file_context_max_chars,
         )
         message_content: str | list[dict[str, Any]] = runtime_text
         if batch_images:
@@ -945,7 +951,7 @@ class FeishuChannel:
             text = ""
             if kind != "binary":
                 absolute = self.settings.resolved_tool_workspace_dir / relative_path
-                text = await asyncio.to_thread(extract_document_text, absolute)
+                text = await asyncio.to_thread(_extract_inbound_file_text, absolute)
             prepared.append(
                 {
                     "file_key": file_key,
@@ -2308,6 +2314,23 @@ def _safe_file_name(name: str) -> str:
     return cleaned
 
 
+def _extract_inbound_file_text(path: Path) -> str:
+    """Return the whole document text and mirror it to a ``<name>.txt`` sidecar.
+
+    Extraction is never truncated here; only the amount injected into the prompt
+    is bounded (``SUPERASSIST_FILE_CONTEXT_MAX_CHARS``).
+    """
+
+    text = extract_document_text(path)
+    if not text:
+        return ""
+    try:
+        document_text_path(path).write_text(text, encoding="utf-8")
+    except OSError:
+        logger.warning("Could not write document text sidecar for %s", path.name)
+    return text
+
+
 def default_image_only_request(image_count: int) -> str:
     image_label = "一张图片" if image_count == 1 else f"{max(1, image_count)} 张图片"
     return (
@@ -2348,6 +2371,7 @@ def build_feishu_conversation_batch(
     ocr_text: str = "",
     omitted_images: int = 0,
     trigger_message_ids: set[str] | None = None,
+    file_context_max_chars: int = FILE_CONTEXT_MAX_CHARS,
 ) -> str:
     if not messages:
         return '<FeishuConversationBatch messages="0" />'
@@ -2366,6 +2390,7 @@ def build_feishu_conversation_batch(
         ),
     ]
     image_index = 0
+    file_chars_total = 0
     for message in messages:
         sender_name = normalize_sender_name(message.sender_name)
         attrs = (
@@ -2403,15 +2428,17 @@ def build_feishu_conversation_batch(
                         "that mentions you, or ask them to paste the key text.</file>"
                     )
                 elif text:
-                    clipped = text[:FILE_CONTEXT_MAX_CHARS]
+                    file_chars_total += len(text)
+                    truncated = bool(file_context_max_chars) and len(text) > file_context_max_chars
+                    clipped = text[:file_context_max_chars] if truncated else text
                     lines.append(
                         f'    <file name="{name}" path="{path}" kind="{kind}" bytes="{size}" status="extracted">'
                     )
                     for text_line in clipped.split("\n"):
                         lines.append(f"      {escape(text_line)}")
-                    if len(text) > FILE_CONTEXT_MAX_CHARS:
+                    if truncated:
                         lines.append(
-                            f"      [以上为前 {FILE_CONTEXT_MAX_CHARS} 字，全文可用 read_file 读取 {raw_path}]"
+                            f"      [以上为前 {file_context_max_chars} 字，全文可用 read_file 读取 {raw_path}]"
                         )
                     lines.append("    </file>")
                 else:
@@ -2422,6 +2449,12 @@ def build_feishu_conversation_batch(
                         "paste the key text or resend as PDF/DOCX/TXT.</file>"
                     )
         lines.append("  </message>")
+    if not file_context_max_chars and file_chars_total > 120_000:
+        logger.warning(
+            "Conversation batch carries %d characters of document text (no cap configured); "
+            "set SUPERASSIST_FILE_CONTEXT_MAX_CHARS to bound it if requests get too large.",
+            file_chars_total,
+        )
     if omitted_images:
         lines.append(
             f'  <ImageLimit omitted="{omitted_images}">Some images exceeded the configured direct-image limit.</ImageLimit>'
