@@ -44,6 +44,7 @@ class SuperAssistState(AgentState):
     metadata: NotRequired[dict[str, Any]]
     image_search_results: NotRequired[Annotated[dict[str, dict[str, Any]], _merge_dicts]]
     outbound_images: NotRequired[Annotated[list[dict[str, Any]], _merge_unique_images]]
+    outbound_files: NotRequired[Annotated[list[dict[str, Any]], _merge_unique_files]]
 
 
 def _merge_dicts(
@@ -63,6 +64,18 @@ def _merge_unique_images(
         if candidate_id:
             merged[candidate_id] = item
     return list(merged.values())[:3]
+
+
+def _merge_unique_files(
+    current: list[dict[str, Any]] | None,
+    update: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for item in [*(current or []), *(update or [])]:
+        path = str(item.get("path") or "")
+        if path:
+            merged[path] = item
+    return list(merged.values())[:5]
 
 
 __all__ = ["SuperAssistState"]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from langchain_core.tools import BaseTool
 
-from superassist.tools.files import delete_path, list_files, read_file, write_file
+from superassist.tools.files import delete_path, list_files, read_file, send_file, write_file
 from superassist.tools.images import generate_image, image_search, inspect_image, present_images
 from superassist.tools.ocr import ocr_image
 from superassist.tools.shell import shell as shell_tool
@@ -22,6 +22,7 @@ def default_tools(
         read_file,
         write_file,
         delete_path,
+        send_file,
         web_search,
         web_fetch,
         shell_tool,

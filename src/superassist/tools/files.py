@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from typing import Annotated, Any
 
-from langchain_core.tools import tool
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import InjectedToolCallId, tool
+from langgraph.types import Command
 
 from superassist.config import get_settings
 from superassist.skills import resolve_skill_virtual_path
+
+MAX_SEND_FILE_BYTES = 30 * 1024 * 1024
 
 
 def _workspace_root() -> Path:
@@ -72,7 +77,9 @@ def list_files(path: str = ".", max_depth: int = 2) -> str:
 
 @tool("read_file")
 def read_file(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
-    """Read a UTF-8 text file from the tool workspace or a listed read-only virtual resource.
+    """Read a file from the tool workspace or a listed read-only virtual resource.
+
+    PDF, DOCX and XLSX files are converted to plain text automatically.
 
     Args:
         path: Relative path inside the tool workspace, a skill path, or a listed quiz:// resource.
@@ -85,6 +92,17 @@ def read_file(path: str, start_line: int | None = None, end_line: int | None = N
         return f"Error: File not found: {path}"
     if not target.is_file():
         return f"Error: Path is not a file: {path}"
+    from superassist.tools.documents import document_kind, extract_document_text
+
+    kind = document_kind(target)
+    if kind in {"pdf", "docx", "spreadsheet"}:
+        text = extract_document_text(target, max_chars=60_000)
+        if not text:
+            return (
+                f"Error: 无法从 {path} 抽取文本（可能是扫描版 PDF 或旧版 Office 格式）。"
+                "请改用 OCR 或让用户粘贴关键内容。"
+            )
+        return text
     content = target.read_text(encoding="utf-8", errors="replace")
     if start_line is not None and end_line is not None:
         lines = content.splitlines()
@@ -130,3 +148,54 @@ def delete_path(path: str, recursive: bool = False) -> str:
     else:
         target.unlink()
     return "OK"
+
+
+@tool("send_file")
+def send_file(
+    path: str,
+    *,
+    tool_call_id: Annotated[str, InjectedToolCallId],
+) -> Command[Any]:
+    """Send a file from the tool workspace to the user as a chat attachment.
+
+    Use this after creating or editing a document so the user receives the real
+    file, not just a description of it.
+
+    Args:
+        path: Workspace-relative path of the file to send, e.g. ``文件/20261122/报告.docx``.
+    """
+
+    try:
+        target = _resolve_workspace_path(path)
+    except PermissionError as exc:
+        return _tool_reply(tool_call_id, f"Error: {exc}", status="error")
+    if not target.is_file():
+        return _tool_reply(tool_call_id, f"Error: File not found: {path}", status="error")
+    size = target.stat().st_size
+    if size <= 0:
+        return _tool_reply(tool_call_id, f"Error: File is empty: {path}", status="error")
+    if size > MAX_SEND_FILE_BYTES:
+        return _tool_reply(
+            tool_call_id,
+            f"Error: File is larger than {MAX_SEND_FILE_BYTES // (1024 * 1024)} MB: {path}",
+            status="error",
+        )
+    relative = str(target.relative_to(_workspace_root())).replace("\\", "/")
+    entry = {"path": relative, "name": target.name, "size": size}
+    return Command(
+        update={
+            "outbound_files": [entry],
+            "messages": [
+                ToolMessage(
+                    content=f"Queued {relative} for delivery to the user. Mention it in your answer.",
+                    tool_call_id=tool_call_id,
+                )
+            ],
+        }
+    )
+
+
+def _tool_reply(tool_call_id: str, message: str, *, status: str = "success") -> Command[Any]:
+    return Command(
+        update={"messages": [ToolMessage(content=message, tool_call_id=tool_call_id, status=status)]}
+    )

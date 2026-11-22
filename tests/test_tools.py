@@ -273,3 +273,74 @@ def test_orientation_candidates_run_all_angles_in_worker_threads(monkeypatch) ->
 
     assert [candidate.angle for candidate in candidates] == [0, 90, 180, 270]
     assert all(name.startswith("ocr-angle") for _, name in seen)
+
+
+def test_send_file_tool_queues_workspace_file(tmp_path: Path, monkeypatch) -> None:
+    from superassist.tools.files import send_file
+
+    settings = Settings(
+        SUPERASSIST_DATA_DIR=tmp_path / "data",
+        SUPERASSIST_EMBEDDING_PROVIDER="hash",
+    )
+    monkeypatch.setattr("superassist.tools.files.get_settings", lambda: settings)
+    workspace = settings.resolved_tool_workspace_dir
+    target = workspace / "文件" / "20260101" / "汇报.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text("hello", encoding="utf-8")
+
+    command = send_file.invoke(
+        {
+            "name": "send_file",
+            "args": {"path": "文件/20260101/汇报.txt"},
+            "id": "call_1",
+            "type": "tool_call",
+        }
+    )
+
+    assert command.update["outbound_files"] == [
+        {"path": "文件/20260101/汇报.txt", "name": "汇报.txt", "size": 5}
+    ]
+
+
+def test_send_file_tool_rejects_paths_outside_workspace(tmp_path: Path, monkeypatch) -> None:
+    from superassist.tools.files import send_file
+
+    settings = Settings(
+        SUPERASSIST_DATA_DIR=tmp_path / "data",
+        SUPERASSIST_EMBEDDING_PROVIDER="hash",
+    )
+    monkeypatch.setattr("superassist.tools.files.get_settings", lambda: settings)
+
+    command = send_file.invoke(
+        {
+            "name": "send_file",
+            "args": {"path": "../../secret.txt"},
+            "id": "call_2",
+            "type": "tool_call",
+        }
+    )
+
+    assert "outbound_files" not in command.update
+    assert "outside the tool workspace" in command.update["messages"][0].content
+
+
+def test_extract_document_text_reads_plain_text_and_truncates(tmp_path: Path) -> None:
+    from superassist.tools.documents import extract_document_text
+
+    target = tmp_path / "note.md"
+    target.write_text("第一行\n第二行", encoding="utf-8")
+
+    assert extract_document_text(target) == "第一行\n第二行"
+    assert extract_document_text(target, max_chars=3).startswith("第一行")
+    assert "内容已截断" in extract_document_text(target, max_chars=3)
+
+
+def test_outbound_file_state_reducer_dedupes_by_path() -> None:
+    from superassist.agent.state import _merge_unique_files
+
+    merged = _merge_unique_files(
+        [{"path": "文件/a.txt", "name": "a.txt"}],
+        [{"path": "文件/a.txt", "name": "a.txt"}, {"path": "文件/b.pdf", "name": "b.pdf"}],
+    )
+
+    assert [item["path"] for item in merged] == ["文件/a.txt", "文件/b.pdf"]

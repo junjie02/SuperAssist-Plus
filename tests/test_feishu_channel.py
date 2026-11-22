@@ -2293,3 +2293,148 @@ def test_real_sdk_mention_event_reaches_runtime_end_to_end(tmp_path) -> None:
         assert json.loads(mentions_json)[0]["open_id"] == "ou_bot"
 
     _run(go())
+
+
+def test_parse_file_content_keeps_file_name() -> None:
+    text, files = parse_feishu_content({"file_key": "fk_1", "file_name": "入党思想汇报.pdf"})
+
+    assert text == "[file]"
+    assert files == [{"file_key": "fk_1", "name": "入党思想汇报.pdf"}]
+
+
+def test_inbound_file_is_saved_to_workspace_and_extracted(tmp_path, monkeypatch) -> None:
+    channel = FeishuChannel(_settings(tmp_path))
+    inbound = FeishuInboundMessage(
+        "chat", "msg_file", "ou", "@bot 看看这个",
+        chat_type="group",
+        files=[{"file_key": "fk_1", "name": "笔记.txt"}],
+    )
+
+    async def fake_download(message_id: str, file_key: str) -> bytes:
+        return "第一行\n第二行".encode("utf-8")
+
+    monkeypatch.setattr(channel, "_download_file", fake_download)
+
+    prepared = _run(channel._prepare_inbound_files(inbound, inbound.files))
+
+    assert len(prepared) == 1
+    item = prepared[0]
+    assert item["name"] == "笔记.txt"
+    assert item["kind"] == "text"
+    assert item["text"] == "第一行\n第二行"
+    assert item["path"].startswith("文件/")
+    assert item["path"].endswith("笔记.txt")
+    saved = channel.settings.resolved_tool_workspace_dir / item["path"]
+    assert saved.read_text(encoding="utf-8") == "第一行\n第二行"
+
+
+def test_batch_text_renders_extracted_file(tmp_path) -> None:
+    from superassist.channels.feishu import build_feishu_conversation_batch
+    from superassist.channels.store import FeishuStoredMessage
+
+    message = FeishuStoredMessage(
+        seq=1,
+        message_id="msg_file",
+        chat_id="chat",
+        sender_open_id="ou",
+        sender_name="小馨",
+        text="[file]",
+        root_id=None,
+        chat_type="group",
+        mentions=[{"name": "@bot", "id": "ou_bot", "id_type": "open_id"}],
+        files=[
+            {
+                "file_key": "fk_1",
+                "name": "入党思想汇报.pdf",
+                "path": "文件/20260101/入党思想汇报.pdf",
+                "kind": "pdf",
+                "size": "1234",
+                "text": "政治理论知识点",
+            }
+        ],
+        created_at="2026-11-22T10:00:00+08:00",
+    )
+
+    batch = build_feishu_conversation_batch([message], trigger_message_ids={"msg_file"})
+
+    assert 'status="extracted"' in batch
+    assert 'path="文件/20260101/入党思想汇报.pdf"' in batch
+    assert "政治理论知识点" in batch
+
+
+def test_deliver_outbound_files_uploads_and_sends(tmp_path) -> None:
+    from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+
+    channel = FeishuChannel(_settings(tmp_path))
+    workspace = channel.settings.resolved_tool_workspace_dir
+    target = workspace / "文件" / "20260101" / "汇报.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text("hello", encoding="utf-8")
+
+    uploads: list[object] = []
+    sent: list[object] = []
+
+    def create_file(request):
+        uploads.append(request)
+        return SimpleNamespace(success=lambda: True, data=SimpleNamespace(file_key="fk_out"))
+
+    def create_message(request):
+        sent.append(request)
+        return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_out"))
+
+    channel._api_client = SimpleNamespace(
+        im=SimpleNamespace(
+            v1=SimpleNamespace(
+                file=SimpleNamespace(create=create_file),
+                message=SimpleNamespace(create=create_message, reply=create_message),
+            )
+        )
+    )
+    channel._CreateMessageRequest = CreateMessageRequest
+    channel._CreateMessageRequestBody = CreateMessageRequestBody
+
+    inbound = FeishuInboundMessage("chat", "", "ou", "done", chat_type="group")
+    _run(
+        channel._deliver_outbound_files(
+            inbound,
+            [{"path": "文件/20260101/汇报.txt", "name": "汇报.txt", "size": 5}],
+        )
+    )
+
+    assert len(uploads) == 1
+    assert len(sent) == 1
+
+
+def test_bot_identity_display_name_becomes_an_alias(tmp_path, monkeypatch) -> None:
+    import lark_oapi.channel as lark_channel
+
+    channel = FeishuChannel(
+        Settings(
+            SUPERASSIST_DATA_DIR=tmp_path,
+            SUPERASSIST_API_KEY="",
+            SUPERASSIST_EMBEDDING_PROVIDER="hash",
+            SUPERASSIST_FEISHU_APP_ID="",
+            SUPERASSIST_FEISHU_APP_SECRET="",
+            SUPERASSIST_FEISHU_BOT_OPEN_ID="",
+            SUPERASSIST_FEISHU_BOT_NAME="小小娇",
+        )
+    )
+    channel._api_client = SimpleNamespace(config=object())
+
+    async def fake_identity(_config):
+        return SimpleNamespace(open_id="ou_live", name="小小娇助手版")
+
+    monkeypatch.setattr(lark_channel, "fetch_bot_identity", fake_identity, raising=False)
+
+    _run(channel._resolve_bot_identity())
+
+    assert "小小娇助手版" in channel._bot_alias_names
+    inbound = FeishuInboundMessage(
+        "chat",
+        "msg",
+        "ou",
+        "@bot hi",
+        chat_type="group",
+        mentions=[{"name": "小小娇助手版", "id": "", "id_type": "open_id"}],
+    )
+    assert channel._has_bot_mention(inbound) is True

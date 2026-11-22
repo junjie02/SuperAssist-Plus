@@ -495,6 +495,7 @@ class AgentRuntime:
             "tool_events": [],
             "image_search_results": {},
             "outbound_images": [],
+            "outbound_files": [],
             "rag_mode": self.rag_mode,
             "rag_context": "",
             "rag_sources": [],
@@ -610,6 +611,9 @@ class AgentRuntime:
         outbound_images = list(final_state.get("outbound_images") or [])
         if outbound_images:
             metadata["outbound_images"] = outbound_images
+        outbound_files = list(final_state.get("outbound_files") or [])
+        if outbound_files:
+            metadata["outbound_files"] = outbound_files
         return AgentRunResult(thread_id=thread_id, answer=answer, metadata=metadata)
 
     @staticmethod

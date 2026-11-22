@@ -98,6 +98,15 @@ class FeishuMessageStore:
                 raise RuntimeError(f"Feishu message was not persisted: {message_id}")
             return inserted, int(row[0])
 
+    def update_message_files(self, message_id: str, files: list[dict[str, Any]]) -> None:
+        """Replace the stored file metadata once a download/extract pass is done."""
+
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE feishu_messages SET files_json = ? WHERE message_id = ?",
+                (_safe_json(files), message_id),
+            )
+
     def list_unconsumed(self, chat_id: str, *, through_seq: int | None = None) -> list[FeishuStoredMessage]:
         with self._lock, self._connect() as conn:
             cursor_row = conn.execute(

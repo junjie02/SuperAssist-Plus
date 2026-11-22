@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -40,6 +41,7 @@ from superassist.llm import supports_reasoning_effort
 from superassist.memory.embedding import get_embedder
 from superassist.models import AgentRunEvent
 from superassist.redis_store import get_redis_store
+from superassist.tools.documents import document_kind, extract_document_text
 from superassist.tools.images import MAX_ORIGINAL_BYTES, download_image_url, load_generated_image
 
 from .daily_brief import (
@@ -67,7 +69,18 @@ SHENLUN_GRADING_EVENT_TYPES = {
     "grading_batch_completed",
 }
 
-UNSUPPORTED_FILE_MESSAGE = "当前飞书入口第一版仅支持文本指令，文件和图片暂未接入。"
+UNSUPPORTED_FILE_MESSAGE = (
+    "这个文件类型暂时读不了（已保存到工作区）。目前支持 PDF、Word、Excel、CSV 和纯文本；"
+    "如果是旧版 .doc/.xls，请另存为 .docx/.xlsx 后再发一次。"
+)
+FILE_DOWNLOAD_FAILED_MESSAGE = (
+    "文件下载失败。请确认飞书 im:resource 权限已生效，或把文件重新发送一次。"
+)
+FILE_TOO_LARGE_MESSAGE = "文件过大，暂时只支持 30 MB 以内的文件。"
+MAX_FEISHU_FILE_BYTES = 30 * 1024 * 1024
+# How much of an inbound document's text is replayed into every conversation
+# batch; the full text stays readable with read_file.
+FILE_CONTEXT_MAX_CHARS = 6000
 STREAM_UPDATE_INTERVAL_SECONDS = 0.3
 IMAGE_DOWNLOAD_FAILED_MESSAGE = (
     "图片读取或格式转换失败。请确认飞书 im:resource 权限已生效，"
@@ -362,7 +375,14 @@ class FeishuChannel:
             identity = None
         if identity and identity.open_id:
             self._bot_open_id = identity.open_id
-            self._bot_name = self._bot_name or (identity.name or "")
+            identity_name = str(getattr(identity, "name", "") or "").strip()
+            self._bot_name = self._bot_name or identity_name
+            if identity_name:
+                # Feishu resolves @ using the live display name, which may differ
+                # from the configured alias (e.g. "小小娇助手版" vs "小小娇").
+                self._bot_alias_names = tuple(
+                    dict.fromkeys([*self._bot_alias_names, identity_name])
+                )
             logger.info("Resolved Feishu bot open_id=%s", self._bot_open_id)
         else:
             logger.warning(
@@ -442,6 +462,7 @@ class FeishuChannel:
             return
 
         await self._cache_inbound_images(inbound)
+        await self._cache_inbound_files(inbound)
         pending = self._pending_activations.get(scope_key)
         if self._redis.activation_times(scope_key) is not None:
             self._redis.touch_activation(
@@ -634,10 +655,29 @@ class FeishuChannel:
     ) -> bool:
         active_image_context = self._get_image_context(scope_key)
         images = [item for item in inbound.files if item.get("image_key")]
-        other_files = [item for item in inbound.files if not item.get("image_key")]
-        if other_files:
-            await self._send_or_patch(inbound, UNSUPPORTED_FILE_MESSAGE, final=True)
-            return True
+        documents = [item for item in inbound.files if item.get("file_key")]
+        if any(not item.get("path") for item in documents):
+            await self._send_or_patch(inbound, "Reading file...", final=False)
+            try:
+                documents = await self._prepare_inbound_files(inbound, documents)
+            except FileTooLargeError:
+                await self._send_or_patch(inbound, FILE_TOO_LARGE_MESSAGE, final=True)
+                return True
+            except FileDownloadError:
+                logger.exception(
+                    "Failed to download Feishu file message_suffix=%s",
+                    inbound.message_id[-8:] if inbound.message_id else "unknown",
+                )
+                await self._send_or_patch(inbound, FILE_DOWNLOAD_FAILED_MESSAGE, final=True)
+                return True
+            images = [item for item in inbound.files if item.get("image_key")]
+            self.message_store.update_message_files(inbound.message_id, [*images, *documents])
+            inbound.files[:] = [*images, *documents]
+        if documents:
+            if all(item.get("kind") == "binary" for item in documents):
+                await self._send_or_patch(inbound, UNSUPPORTED_FILE_MESSAGE, final=True)
+                return True
+            clean_text = strip_file_placeholders(clean_text)
         image_payloads: list[tuple[bytes, str]] = []
         if images:
             await self._send_or_patch(inbound, "Reading image...", final=False)
@@ -653,7 +693,7 @@ class FeishuChannel:
                 return False
         elif active_image_context is not None:
             image_payloads = list(active_image_context.payloads)
-        if not clean_text and not image_payloads:
+        if not clean_text and not image_payloads and not documents:
             return True
         try:
             return await self._handle_scoped_message(
@@ -863,6 +903,104 @@ class FeishuChannel:
         except Exception as exc:
             raise ImageDownloadError from exc
 
+    async def _cache_inbound_files(self, inbound: FeishuInboundMessage) -> None:
+        """Download and extract files at ingress so "send file, then @" works."""
+
+        documents = [
+            item for item in inbound.files if item.get("file_key") and not item.get("path")
+        ]
+        if not documents:
+            return
+        try:
+            prepared = await self._prepare_inbound_files(inbound, documents)
+        except (FileTooLargeError, FileDownloadError):
+            logger.warning(
+                "Could not cache Feishu file at ingress message_suffix=%s",
+                inbound.message_id[-8:] if inbound.message_id else "unknown",
+            )
+            return
+        images = [item for item in inbound.files if item.get("image_key")]
+        merged = [*images, *prepared]
+        self.message_store.update_message_files(inbound.message_id, merged)
+        inbound.files[:] = merged
+
+    async def _prepare_inbound_files(
+        self,
+        inbound: FeishuInboundMessage,
+        documents: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        """Download each inbound file, mirror it to the workspace and extract text."""
+
+        prepared: list[dict[str, str]] = []
+        for item in documents:
+            if item.get("path"):
+                prepared.append(dict(item))
+                continue
+            file_key = str(item.get("file_key") or "")
+            raw_name = str(item.get("name") or "").strip() or f"{file_key[-10:] or 'file'}.bin"
+            name = _safe_file_name(raw_name)
+            data = await self._download_file(inbound.message_id, file_key)
+            relative_path = await asyncio.to_thread(self._save_inbound_file, name, data)
+            kind = document_kind(relative_path)
+            text = ""
+            if kind != "binary":
+                absolute = self.settings.resolved_tool_workspace_dir / relative_path
+                text = await asyncio.to_thread(extract_document_text, absolute)
+            prepared.append(
+                {
+                    "file_key": file_key,
+                    "name": name,
+                    "path": relative_path,
+                    "kind": kind,
+                    "size": str(len(data)),
+                    "text": text,
+                }
+            )
+            logger.info(
+                "Ingested Feishu file message_suffix=%s kind=%s bytes=%d chars=%d",
+                inbound.message_id[-8:] if inbound.message_id else "unknown",
+                kind,
+                len(data),
+                len(text),
+            )
+        return prepared
+
+    async def _download_file(self, message_id: str, file_key: str) -> bytes:
+        try:
+            if not self._api_client or not self._GetMessageResourceRequest:
+                raise RuntimeError("Feishu file client is not initialized")
+            request = (
+                self._GetMessageResourceRequest.builder()
+                .message_id(message_id)
+                .file_key(file_key)
+                .type("file")
+                .build()
+            )
+            response = await asyncio.to_thread(self._api_client.im.v1.message_resource.get, request)
+            if not response.success() or not response.file:
+                raise RuntimeError(
+                    f"Feishu file download failed with code={getattr(response, 'code', None)}"
+                )
+            data = response.file.read(MAX_FEISHU_FILE_BYTES + 1)
+            if len(data) > MAX_FEISHU_FILE_BYTES:
+                raise FileTooLargeError
+            return data
+        except FileTooLargeError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - surface as a typed download failure
+            raise FileDownloadError from exc
+
+    def _save_inbound_file(self, name: str, data: bytes) -> str:
+        root = self.settings.resolved_tool_workspace_dir
+        target_dir = root / "文件" / datetime.now().strftime("%Y%m%d")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / name
+        if target.exists():
+            digest = hashlib.sha256(data).hexdigest()[:8]
+            target = target_dir / f"{Path(name).stem}-{digest}{Path(name).suffix}"
+        target.write_bytes(data)
+        return str(target.relative_to(root)).replace("\\", "/")
+
     async def _handle_scoped_message(
         self,
         inbound: FeishuInboundMessage,
@@ -1043,6 +1181,7 @@ class FeishuChannel:
                     images=tuple(outbound_images),
                 )
             card_id = await self._send_or_patch(inbound, final_view, final=True)
+            await self._deliver_outbound_files(inbound, result.metadata.get("outbound_files"))
             active_quiz = self.daily_quiz_store.active_session(thread_id)
             if (
                 card_id
@@ -1409,10 +1548,11 @@ class FeishuChannel:
         try:
             raw_message = getattr(getattr(event, "event", None), "message", None)
             logger.info(
-                "Feishu event received msg_type=%s chat_type=%s has_mentions=%s",
-                getattr(raw_message, "msg_type", "unknown"),
+                "Feishu event received msg_type=%s chat_type=%s has_mentions=%s content_prefix=%r",
+                getattr(raw_message, "message_type", None) or getattr(raw_message, "msg_type", "unknown"),
                 getattr(raw_message, "chat_type", "unknown"),
                 bool(getattr(raw_message, "mentions", None)),
+                str(getattr(raw_message, "content", "") or "")[:160],
             )
         except Exception:  # noqa: BLE001 - diagnostics must never block handling
             pass
@@ -1580,6 +1720,67 @@ class FeishuChannel:
             inbound,
             "image",
             json.dumps({"image_key": image_key}, ensure_ascii=False),
+        )
+
+    async def _deliver_outbound_files(self, inbound: FeishuInboundMessage, raw_files: Any) -> None:
+        """Upload and send files the agent queued with the ``send_file`` tool."""
+
+        items = [item for item in (raw_files or []) if isinstance(item, dict)][:5]
+        workspace = self.settings.resolved_tool_workspace_dir.resolve()
+        for item in items:
+            relative = str(item.get("path") or "").strip()
+            if not relative:
+                continue
+            try:
+                target = (workspace / relative).resolve()
+                target.relative_to(workspace)
+                if not target.is_file():
+                    raise FileNotFoundError(relative)
+                file_key = await self._upload_file(target, str(item.get("name") or target.name))
+                await self._send_file_message(inbound, file_key)
+                logger.info(
+                    "Sent Feishu file name=%s bytes=%d", target.name, target.stat().st_size
+                )
+            except Exception as exc:  # noqa: BLE001 - the text answer already went out
+                logger.warning(
+                    "Failed to send Feishu file path=%s error_type=%s",
+                    relative,
+                    type(exc).__name__,
+                )
+                await self._send_plain_message(
+                    inbound,
+                    "text",
+                    json.dumps(
+                        {"text": f"文件已保存在工作区：{relative}（上传到飞书失败，可直接取用该路径）"},
+                        ensure_ascii=False,
+                    ),
+                )
+
+    async def _upload_file(self, path: Path, name: str) -> str:
+        if not self._api_client:
+            raise RuntimeError("Feishu file client is not initialized")
+        from lark_oapi.api.im.v1 import CreateFileRequest, CreateFileRequestBody
+
+        request = CreateFileRequest.builder().request_body(
+            CreateFileRequestBody.builder()
+            .file_type(_feishu_file_type(name))
+            .file_name(name)
+            .file(io.BytesIO(path.read_bytes()))
+            .build()
+        ).build()
+        response = await asyncio.to_thread(self._api_client.im.v1.file.create, request)
+        if not response.success():
+            raise RuntimeError(f"Feishu file upload failed with code={getattr(response, 'code', None)}")
+        file_key = str(getattr(getattr(response, "data", None), "file_key", "") or "")
+        if not file_key:
+            raise RuntimeError("Feishu file upload returned no file_key")
+        return file_key
+
+    async def _send_file_message(self, inbound: FeishuInboundMessage, file_key: str) -> str | None:
+        return await self._send_plain_message(
+            inbound,
+            "file",
+            json.dumps({"file_key": file_key}, ensure_ascii=False),
         )
 
     async def _send_plain_message(
@@ -1944,7 +2145,10 @@ def parse_feishu_content(content: dict[str, Any]) -> tuple[str, list[dict[str, s
     if isinstance(content.get("text"), str):
         return content["text"], files
     if isinstance(content.get("file_key"), str):
-        files.append({"file_key": content["file_key"]})
+        item = {"file_key": content["file_key"]}
+        if isinstance(content.get("file_name"), str):
+            item["name"] = content["file_name"]
+        files.append(item)
         return "[file]", files
     if isinstance(content.get("image_key"), str):
         files.append({"image_key": content["image_key"]})
@@ -1967,7 +2171,10 @@ def parse_feishu_content(content: dict[str, Any]) -> tuple[str, list[dict[str, s
                 files.append({"image_key": element["image_key"]})
                 parts.append("[image]")
             elif tag in {"file", "media"} and isinstance(element.get("file_key"), str):
-                files.append({"file_key": element["file_key"]})
+                item = {"file_key": element["file_key"]}
+                if isinstance(element.get("file_name"), str):
+                    item["name"] = element["file_name"]
+                files.append(item)
                 parts.append("[file]")
         if parts:
             text_paragraphs.append(" ".join(parts))
@@ -2069,6 +2276,38 @@ def strip_file_placeholders(text: str) -> str:
     return re.sub(r"\[(?:image|file)\]", " ", text, flags=re.IGNORECASE).strip()
 
 
+def _feishu_file_type(name: str) -> str:
+    """Map a file extension to the file_type Feishu's upload API expects."""
+
+    suffix = Path(name).suffix.lower()
+    if suffix == ".pdf":
+        return "pdf"
+    if suffix in {".doc", ".docx"}:
+        return "doc"
+    if suffix in {".xls", ".xlsx", ".xlsm", ".csv"}:
+        return "xls"
+    if suffix in {".ppt", ".pptx"}:
+        return "ppt"
+    if suffix == ".mp4":
+        return "mp4"
+    if suffix == ".opus":
+        return "opus"
+    return "stream"
+
+
+def _safe_file_name(name: str) -> str:
+    """Keep user-supplied file names usable on disk without allowing traversal."""
+
+    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", str(name or "")).strip().strip(".")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    if not cleaned:
+        return "file"
+    if len(cleaned) > 120:
+        stem, suffix = Path(cleaned).stem[:100], Path(cleaned).suffix[:12]
+        cleaned = f"{stem}{suffix}"
+    return cleaned
+
+
 def default_image_only_request(image_count: int) -> str:
     image_label = "一张图片" if image_count == 1 else f"{max(1, image_count)} 张图片"
     return (
@@ -2151,7 +2390,37 @@ def build_feishu_conversation_batch(
                 image_index += 1
                 lines.append(f'    <image index="{image_index}" status="attached" />')
             elif item.get("file_key"):
-                lines.append('    <file status="unsupported" />')
+                raw_path = str(item.get("path") or "")
+                name = escape(str(item.get("name") or Path(raw_path).name or "file"))
+                path = escape(raw_path, quote=True)
+                kind = escape(str(item.get("kind") or "binary"))
+                size = escape(str(item.get("size") or "0"))
+                text = str(item.get("text") or "").strip()
+                if not raw_path:
+                    lines.append(
+                        f'    <file name="{name}" kind="{kind}" bytes="{size}" status="not-downloaded">'
+                        "This file was not downloaded yet. Tell the user to resend it in the message "
+                        "that mentions you, or ask them to paste the key text.</file>"
+                    )
+                elif text:
+                    clipped = text[:FILE_CONTEXT_MAX_CHARS]
+                    lines.append(
+                        f'    <file name="{name}" path="{path}" kind="{kind}" bytes="{size}" status="extracted">'
+                    )
+                    for text_line in clipped.split("\n"):
+                        lines.append(f"      {escape(text_line)}")
+                    if len(text) > FILE_CONTEXT_MAX_CHARS:
+                        lines.append(
+                            f"      [以上为前 {FILE_CONTEXT_MAX_CHARS} 字，全文可用 read_file 读取 {raw_path}]"
+                        )
+                    lines.append("    </file>")
+                else:
+                    lines.append(
+                        f'    <file name="{name}" path="{path}" kind="{kind}" bytes="{size}" '
+                        'status="text-unavailable">Content could not be extracted (scanned PDF or legacy '
+                        "Office format). Tell the user the file was received and saved, and ask them to "
+                        "paste the key text or resend as PDF/DOCX/TXT.</file>"
+                    )
         lines.append("  </message>")
     if omitted_images:
         lines.append(
@@ -2338,6 +2607,14 @@ class ImageTooLargeError(ValueError):
 
 
 class ImageDownloadError(RuntimeError):
+    pass
+
+
+class FileTooLargeError(ValueError):
+    pass
+
+
+class FileDownloadError(RuntimeError):
     pass
 
 
